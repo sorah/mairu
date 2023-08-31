@@ -65,6 +65,15 @@ impl crate::proto::agent_server::Agent for Agent {
     }
 
     #[tracing::instrument]
+    async fn list_sessions(
+        &self,
+        _request: tonic::Request<ListSessionsRequest>,
+    ) -> Result<tonic::Response<ListSessionsResponse>, tonic::Status> {
+        let sessions = self.token_manager.list();
+        Ok(tonic::Response::new(ListSessionsResponse { sessions }))
+    }
+
+    #[tracing::instrument]
     async fn initiate_oauth_code(
         &self,
         request: tonic::Request<InitiateOAuthCodeRequest>,

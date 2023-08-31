@@ -13,6 +13,7 @@ message Session {
 service Agent {
   rpc PingAgent(PingAgentRequest) returns (PingAgentResponse);
   rpc GetServer(GetServerRequest) returns (GetServerResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc InitiateOauthCode(InitiateOAuthCodeRequest) returns (InitiateOAuthCodeResponse);
   rpc CompleteOauthCode(CompleteOAuthCodeRequest) returns (CompleteOAuthCodeResponse);
 }

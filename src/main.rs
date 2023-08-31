@@ -22,6 +22,7 @@ fn main() -> Result<(), anyhow::Error> {
     match &cli.command {
         Commands::Agent(args) => mairu::cmd::agent::run(args),
         Commands::Login(args) => mairu::cmd::login::run(args),
+        Commands::ListSessions => mairu::cmd::list_sessions::run(),
         _ => anyhow::bail!("Unknown command"), // TODO: remove this line
     }
 }
