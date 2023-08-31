@@ -31,7 +31,8 @@ impl AuthFlowManager {
     pub fn store(&self, flow: AuthFlow) {
         let mut list = self.list.lock().unwrap();
         if list.len() == MAX_ITEMS {
-            list.pop_front();
+            let item = list.pop_front();
+            tracing::warn!(discarded_flow = ?item, "Too many ongoing authentication flows, discarding the oldest one");
         }
         list.push_back(flow);
     }
