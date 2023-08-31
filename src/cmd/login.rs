@@ -25,6 +25,8 @@ pub async fn run(args: &LoginArgs) -> Result<(), anyhow::Error> {
         .oauth_grant_type
         .unwrap_or_else(|| oauth.default_grant_type());
 
+    tracing::debug!(oauth_grant_type = ?oauth_grant_type, server = ?server, "Using OAuth");
+
     match oauth_grant_type {
         crate::config::OAuthGrantType::Code => do_oauth_code(agent, server).await,
     }
@@ -44,6 +46,7 @@ pub async fn do_oauth_code(
         })
         .await?
         .into_inner();
+    tracing::debug!(session = ?session, "Initiated OAuth 2.0 authorization code flow");
 
     let product = env!("CARGO_PKG_NAME");
     let server_id = server.id();

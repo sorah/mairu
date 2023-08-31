@@ -37,7 +37,7 @@ impl std::fmt::Debug for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Agent")
             .field("id", &self.id)
-            .field("url", &self.url)
+            .field("url", &self.url.as_str())
             .field("config_path", &self.config_path)
             .finish()
     }
