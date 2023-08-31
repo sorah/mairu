@@ -96,13 +96,14 @@ impl crate::proto::agent_server::Agent for Agent {
 
         let response = (&flow).into();
 
+        tracing::debug!(flow = ?flow, "Initiated OAuth 2.0 Authorization Code flow");
         self.auth_flow_manager
             .store(crate::auth_flow_manager::AuthFlow::OAuthCode(flow));
 
         return Ok(tonic::Response::new(response));
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
     async fn complete_oauth_code(
         &self,
         request: tonic::Request<CompleteOAuthCodeRequest>,
@@ -117,6 +118,8 @@ impl crate::proto::agent_server::Agent for Agent {
                 "flow handle is not for the grant type",
             ));
         };
+
+        tracing::debug!(flow = ?flow0.as_ref(), "Completing OAuth 2.0 Authorization Code flow...");
 
         let token = match flow.complete(request.into_inner()).await {
             Ok(t) => t,

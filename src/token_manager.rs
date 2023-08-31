@@ -78,7 +78,7 @@ impl TokenManager {
         // Update if a token for the same server exists
         if let Some(i) = find_item_for_update(&items, &token) {
             let item = items.get_mut(i).unwrap();
-            tracing::debug!(token = ?token, id = ?item.id, "Updating the existing item");
+            tracing::info!(token = ?token, id = ?item.id, "Storing updated token");
             item.token = std::sync::Arc::new(token);
             return Ok(());
         }

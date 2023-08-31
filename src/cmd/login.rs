@@ -58,5 +58,6 @@ pub async fn do_oauth_code(
     eprintln!(":: {product} :: ");
 
     crate::oauth_code::listen_for_callback(listener, session, &agent).await?;
+    tracing::info!("Logged in");
     Ok(())
 }

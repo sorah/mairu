@@ -1,5 +1,6 @@
 pub const MAX_ITEMS: usize = 15;
 
+#[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum AuthFlow {
     Nop,

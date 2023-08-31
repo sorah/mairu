@@ -66,7 +66,7 @@ async fn try_bind_or_check_liveness(
             }
             // Attempt to connect and say hello.
             if let Err(e2) = crate::agent::connect_to_agent_with_path(&path).await {
-                tracing::info!(err = ?e2, path = ?path, "Failed to connect to the existing agent");
+                tracing::info!(err = ?e2, path = ?path, "Attempting to replace the stale socket file as failing to connect to the existing agent");
                 tokio::fs::remove_file(&path).await?;
                 tracing::debug!(err = ?e2, path = ?path, "removed stale socket file");
                 return try_bind_or_check_liveness(path, true).await;
