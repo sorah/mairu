@@ -23,7 +23,7 @@ impl std::fmt::Debug for Agent {
 
 #[tonic::async_trait]
 impl crate::proto::agent_server::Agent for Agent {
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
     async fn ping_agent(
         &self,
         _request: tonic::Request<PingAgentRequest>,
@@ -33,7 +33,7 @@ impl crate::proto::agent_server::Agent for Agent {
         }))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
     async fn get_server(
         &self,
         request: tonic::Request<GetServerRequest>,
@@ -64,7 +64,7 @@ impl crate::proto::agent_server::Agent for Agent {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
     async fn assume_role(
         &self,
         request: tonic::Request<AssumeRoleRequest>,
@@ -85,7 +85,7 @@ impl crate::proto::agent_server::Agent for Agent {
 
         if request.get_ref().cached {
             if let Some(cache) = session.credential_cache.get(role) {
-                tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?cache.credentials.access_key_id, "Vending credentials from cache");
+                tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?cache.credentials.access_key_id, ext = ?cache.credentials.mairu, "Vending credentials from cache");
                 return Ok(tonic::Response::new(cache.credentials.as_ref().into()));
             }
         }
@@ -96,6 +96,7 @@ impl crate::proto::agent_server::Agent for Agent {
                 if request.get_ref().cached {
                     session.credential_cache.store(role.to_owned(), &r);
                 }
+                tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?r.access_key_id, ext = ?r.mairu, "Vending credentials from server");
                 Ok(tonic::Response::new((&r).into()))
             }
             Err(crate::Error::ApiError {
@@ -122,7 +123,7 @@ impl crate::proto::agent_server::Agent for Agent {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
     async fn list_sessions(
         &self,
         _request: tonic::Request<ListSessionsRequest>,
@@ -136,7 +137,7 @@ impl crate::proto::agent_server::Agent for Agent {
         Ok(tonic::Response::new(ListSessionsResponse { sessions }))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
     async fn initiate_oauth_code(
         &self,
         request: tonic::Request<InitiateOAuthCodeRequest>,
