@@ -1,0 +1,64 @@
+syntax = "proto3";
+package mairu;
+
+import "google/protobuf/timestamp.proto";
+
+message Session {
+  uint32 id = 1;
+  string server_id = 2;
+  string server_url = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+service Agent {
+  rpc PingAgent(PingAgentRequest) returns (PingAgentResponse);
+  rpc GetServer(GetServerRequest) returns (GetServerResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc InitiateOauthCode(InitiateOAuthCodeRequest) returns (InitiateOAuthCodeResponse);
+  rpc CompleteOauthCode(CompleteOAuthCodeRequest) returns (CompleteOAuthCodeResponse);
+}
+
+message PingAgentRequest {
+}
+message PingAgentResponse {
+  string version = 1;
+}
+
+message GetServerRequest {
+  string query = 1;
+  bool no_cache = 2;
+}
+message GetServerResponse {
+  string json = 1;
+  bool cached = 2;
+}
+
+
+message ListSessionsRequest {
+}
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+}
+
+message RemoveSessionRequest {
+  string query = 1;
+}
+message RemoveSessionResponse {
+}
+
+message InitiateOAuthCodeRequest {
+  string server_id = 1;
+  string redirect_url = 2;
+}
+message InitiateOAuthCodeResponse {
+  string handle = 1;
+  string authorize_url = 2;
+}
+
+message CompleteOAuthCodeRequest {
+  string handle = 1;
+  string code = 2;
+  string state = 3;
+}
+message CompleteOAuthCodeResponse {
+}
