@@ -93,7 +93,9 @@ impl crate::proto::agent_server::Agent for Agent {
         let client = crate::client::Client::from(session.token.as_ref());
         match client.assume_role(role).await {
             Ok(r) => {
-                session.credential_cache.store(role.to_owned(), &r);
+                if request.get_ref().cached {
+                    session.credential_cache.store(role.to_owned(), &r);
+                }
                 Ok(tonic::Response::new((&r).into()))
             }
             Err(crate::Error::ApiError {
