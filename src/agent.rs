@@ -40,8 +40,8 @@ impl crate::proto::agent_server::Agent for Agent {
     ) -> Result<tonic::Response<GetServerResponse>, tonic::Status> {
         let query = &request.get_ref().query;
         if !request.get_ref().no_cache {
-            if let Ok(token) = self.session_manager.get(query) {
-                let json = serde_json::to_string(&token.server)
+            if let Ok(session) = self.session_manager.get(query) {
+                let json = serde_json::to_string(&session.token.server)
                     .map_err(|e| tonic::Status::internal(e.to_string()))?;
                 return Ok(tonic::Response::new(GetServerResponse {
                     json,
@@ -69,7 +69,12 @@ impl crate::proto::agent_server::Agent for Agent {
         &self,
         _request: tonic::Request<ListSessionsRequest>,
     ) -> Result<tonic::Response<ListSessionsResponse>, tonic::Status> {
-        let sessions = self.session_manager.list();
+        let sessions = self
+            .session_manager
+            .list()
+            .iter()
+            .map(|x| x.into())
+            .collect();
         Ok(tonic::Response::new(ListSessionsResponse { sessions }))
     }
 
