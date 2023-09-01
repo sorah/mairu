@@ -1,11 +1,11 @@
 #[derive(Debug)]
-struct TokenManagerItem {
+struct Session {
     id: u32,
     token: std::sync::Arc<crate::token::ServerToken>,
 }
 
-impl From<&TokenManagerItem> for crate::proto::Session {
-    fn from(item: &TokenManagerItem) -> crate::proto::Session {
+impl From<&Session> for crate::proto::Session {
+    fn from(item: &Session) -> crate::proto::Session {
         crate::proto::Session {
             id: item.id,
             server_id: item.token.server.id().to_owned(),
@@ -19,14 +19,14 @@ impl From<&TokenManagerItem> for crate::proto::Session {
 }
 
 #[derive(Clone)]
-pub struct TokenManager {
-    items: std::sync::Arc<std::sync::RwLock<Vec<TokenManagerItem>>>,
+pub struct SessionManager {
+    items: std::sync::Arc<std::sync::RwLock<Vec<Session>>>,
     next_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 const MAX_ITEMS: u64 = 4294967295; // u32::MAX
 
-impl TokenManager {
+impl SessionManager {
     pub fn new() -> Self {
         Self {
             items: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -99,7 +99,7 @@ impl TokenManager {
         }
 
         tracing::info!(token = ?token, "Storing new token");
-        items.push(TokenManagerItem {
+        items.push(Session {
             id: self
                 .next_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -129,16 +129,13 @@ impl TokenManager {
     }
 }
 
-impl Default for TokenManager {
+impl Default for SessionManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-fn find_item_for_update(
-    items: &[TokenManagerItem],
-    token: &crate::token::ServerToken,
-) -> Option<usize> {
+fn find_item_for_update(items: &[Session], token: &crate::token::ServerToken) -> Option<usize> {
     for (i, item) in items.iter().enumerate() {
         if item.token.server.config_path == token.server.config_path
             && item.token.server.id() == token.server.id()

@@ -3,14 +3,14 @@ use crate::proto::*;
 #[derive(Default)]
 pub struct Agent {
     auth_flow_manager: crate::auth_flow_manager::AuthFlowManager,
-    token_manager: crate::token_manager::TokenManager,
+    session_manager: crate::session_manager::SessionManager,
 }
 
 impl Agent {
     pub fn new() -> Self {
         Self {
             auth_flow_manager: crate::auth_flow_manager::AuthFlowManager::new(),
-            token_manager: crate::token_manager::TokenManager::new(),
+            session_manager: crate::session_manager::SessionManager::new(),
         }
     }
 }
@@ -40,7 +40,7 @@ impl crate::proto::agent_server::Agent for Agent {
     ) -> Result<tonic::Response<GetServerResponse>, tonic::Status> {
         let query = &request.get_ref().query;
         if !request.get_ref().no_cache {
-            if let Ok(token) = self.token_manager.get(query) {
+            if let Ok(token) = self.session_manager.get(query) {
                 let json = serde_json::to_string(&token.server)
                     .map_err(|e| tonic::Status::internal(e.to_string()))?;
                 return Ok(tonic::Response::new(GetServerResponse {
@@ -69,7 +69,7 @@ impl crate::proto::agent_server::Agent for Agent {
         &self,
         _request: tonic::Request<ListSessionsRequest>,
     ) -> Result<tonic::Response<ListSessionsResponse>, tonic::Status> {
-        let sessions = self.token_manager.list();
+        let sessions = self.session_manager.list();
         Ok(tonic::Response::new(ListSessionsResponse { sessions }))
     }
 
@@ -143,7 +143,7 @@ impl crate::proto::agent_server::Agent for Agent {
         };
         flow0.mark_as_done(); // authorization codes cannot be reused, so mark as done now (whlist
                               // later lines may fail)
-        self.token_manager
+        self.session_manager
             .add(token)
             .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
 
