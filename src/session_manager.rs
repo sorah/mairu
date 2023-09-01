@@ -2,6 +2,7 @@
 pub struct Session {
     pub id: u32,
     pub token: std::sync::Arc<crate::token::ServerToken>,
+    pub credential_cache: crate::credential_cache::CredentialCache,
 }
 
 impl From<&Session> for crate::proto::Session {
@@ -80,6 +81,7 @@ impl SessionManager {
             let item = items.get_mut(i).unwrap();
             tracing::info!(token = ?token, id = ?item.id, "Storing updated token");
             item.token = std::sync::Arc::new(token);
+            item.credential_cache.clear();
             return Ok(());
         }
 
@@ -104,6 +106,7 @@ impl SessionManager {
                 .next_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             token: std::sync::Arc::new(token),
+            credential_cache: crate::credential_cache::CredentialCache::new(),
         });
 
         Ok(())

@@ -45,12 +45,12 @@ impl Client {
             .await?;
 
         if let Err(e) = resp.error_for_status_ref() {
-            let e1 = crate::Error::ApiError(
-                url.to_string(),
-                resp.text().await.unwrap_or_default(),
-                e.status().unwrap(),
-            );
-            tracing::error!(req = ?req, url = %url, server_id = &self.server_id, err0 = ?e, err = ?e1, "assume-role response was not ok");
+            let e1 = crate::Error::ApiError {
+                url: url.clone(),
+                status_code: e.status().unwrap(),
+                message: resp.text().await.unwrap_or_default(),
+            };
+            tracing::error!(req = ?req, url = %url, server_id = &self.server_id, err0 = ?e, err = %e1, "assume-role response was not ok");
             return Err(e1);
         }
 
@@ -67,20 +67,35 @@ struct AssumeRoleRequest<'a> {
 }
 
 /// https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html
-#[derive(Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct AssumeRoleResponse {
     pub version: i64,
     pub access_key_id: String,
     pub secret_access_key: secrecy::SecretString,
-    pub session_token: String,
+    pub session_token: Option<String>,
     pub expiration: chrono::DateTime<chrono::Utc>,
 
     #[serde(default)]
     pub mairu: AssumeRoleResponseMairuExt,
 }
 
-#[derive(Default, Debug, serde::Deserialize)]
+impl From<&AssumeRoleResponse> for crate::proto::AssumeRoleResponse {
+    fn from(aws: &AssumeRoleResponse) -> crate::proto::AssumeRoleResponse {
+        use secrecy::ExposeSecret;
+        crate::proto::AssumeRoleResponse {
+            credentials: Some(crate::proto::Credentials {
+                version: aws.version,
+                access_key_id: aws.access_key_id.clone(),
+                secret_access_key: aws.secret_access_key.expose_secret().to_owned(),
+                session_token: aws.session_token.clone().unwrap_or_default(),
+                expiration: Some(std::time::SystemTime::from(aws.expiration).into()),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct AssumeRoleResponseMairuExt {
     #[serde(default)]

@@ -39,8 +39,16 @@ pub enum Error {
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
 
-    #[error("ApiError({0}): {1}; {2:}")]
-    ApiError(String, String, reqwest::StatusCode),
+    #[error("ApiError({url}): {message}; {status_code:}")]
+    ApiError {
+        url: url::Url,
+        status_code: reqwest::StatusCode,
+        message: String,
+    },
+
+    /// Failure, but we don't want to emit error to stderr/out anymore. Used in cmd
+    #[error("")]
+    FailureButSilentlyExit,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
