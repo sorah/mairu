@@ -10,10 +10,20 @@ message Session {
   google.protobuf.Timestamp expires_at = 4;
 }
 
+message Credentials {
+  int64 version = 1;
+  string access_key_id = 2;
+  string secret_access_key = 3;
+  string session_token = 4;
+  google.protobuf.Timestamp expiration = 5;
+}
+
 service Agent {
   rpc PingAgent(PingAgentRequest) returns (PingAgentResponse);
   rpc GetServer(GetServerRequest) returns (GetServerResponse);
+  rpc AssumeRole(AssumeRoleRequest) returns (AssumeRoleResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // rpc RemoveSession(RemoveSessionRequest) returns (RemoveSessionResponse)
   rpc InitiateOauthCode(InitiateOAuthCodeRequest) returns (InitiateOAuthCodeResponse);
   rpc CompleteOauthCode(CompleteOAuthCodeRequest) returns (CompleteOAuthCodeResponse);
 }
@@ -33,6 +43,14 @@ message GetServerResponse {
   bool cached = 2;
 }
 
+message AssumeRoleRequest {
+  string server_id = 1;
+  string role = 2;
+  bool cached = 3;
+}
+message AssumeRoleResponse {
+  Credentials credentials = 1;
+}
 
 message ListSessionsRequest {
 }

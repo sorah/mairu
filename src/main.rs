@@ -11,19 +11,27 @@ struct Cli {
 enum Commands {
     Agent(mairu::cmd::agent::AgentArgs),
     Login(mairu::cmd::login::LoginArgs),
+    CredentialProcess(mairu::cmd::credential_process::CredentialProcessArgs),
     ListSessions,
 }
 
-fn main() -> Result<(), anyhow::Error> {
+fn main() -> Result<std::process::ExitCode, anyhow::Error> {
     use clap::Parser;
     let cli = Cli::parse();
 
     enable_tracing(true); // TODO: move to cmd::*
-    match &cli.command {
+    let retval = match &cli.command {
         Commands::Agent(args) => mairu::cmd::agent::run(args),
         Commands::Login(args) => mairu::cmd::login::run(args),
+        Commands::CredentialProcess(args) => mairu::cmd::credential_process::run(args),
         Commands::ListSessions => mairu::cmd::list_sessions::run(),
-        _ => anyhow::bail!("Unknown command"), // TODO: remove this line
+    };
+    match retval {
+        Ok(_) => Ok(std::process::ExitCode::SUCCESS),
+        Err(e) => match e.downcast_ref::<mairu::Error>() {
+            Some(mairu::Error::FailureButSilentlyExit) => Ok(std::process::ExitCode::FAILURE),
+            _ => Err(e),
+        },
     }
 }
 

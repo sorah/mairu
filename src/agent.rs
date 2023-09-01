@@ -23,7 +23,7 @@ impl std::fmt::Debug for Agent {
 
 #[tonic::async_trait]
 impl crate::proto::agent_server::Agent for Agent {
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
     async fn ping_agent(
         &self,
         _request: tonic::Request<PingAgentRequest>,
@@ -33,15 +33,15 @@ impl crate::proto::agent_server::Agent for Agent {
         }))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
     async fn get_server(
         &self,
         request: tonic::Request<GetServerRequest>,
     ) -> Result<tonic::Response<GetServerResponse>, tonic::Status> {
         let query = &request.get_ref().query;
         if !request.get_ref().no_cache {
-            if let Ok(token) = self.session_manager.get(query) {
-                let json = serde_json::to_string(&token.server)
+            if let Ok(session) = self.session_manager.get(query) {
+                let json = serde_json::to_string(&session.token.server)
                     .map_err(|e| tonic::Status::internal(e.to_string()))?;
                 return Ok(tonic::Response::new(GetServerResponse {
                     json,
@@ -64,16 +64,80 @@ impl crate::proto::agent_server::Agent for Agent {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
+    async fn assume_role(
+        &self,
+        request: tonic::Request<AssumeRoleRequest>,
+    ) -> Result<tonic::Response<AssumeRoleResponse>, tonic::Status> {
+        let query = &request.get_ref().server_id;
+        let role = &request.get_ref().role;
+        let Ok(session) = self.session_manager.get(query) else {
+            if let Err(e) = crate::config::Server::find_from_fs(query).await {
+                tracing::warn!(server_id = ?query, role = ?role, err = ?e, "requested server doesn't exist or is invalid");
+                return Err(tonic::Status::not_found(
+                    "requested server doesn't exist or is invalid",
+                ));
+            } else {
+                tracing::warn!(server_id = ?query, role = ?role, "session doesn't exist, require authentication");
+                return Err(tonic::Status::unauthenticated("authentication needed"));
+            }
+        };
+
+        if request.get_ref().cached {
+            if let Some(cache) = session.credential_cache.get(role) {
+                tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?cache.credentials.access_key_id, ext = ?cache.credentials.mairu, "Vending credentials from cache");
+                return Ok(tonic::Response::new(cache.credentials.as_ref().into()));
+            }
+        }
+        tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Obtaining credentials from server");
+        let client = crate::client::Client::from(session.token.as_ref());
+        match client.assume_role(role).await {
+            Ok(r) => {
+                if request.get_ref().cached {
+                    session.credential_cache.store(role.to_owned(), &r);
+                }
+                tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?r.access_key_id, ext = ?r.mairu, "Vending credentials from server");
+                Ok(tonic::Response::new((&r).into()))
+            }
+            Err(crate::Error::ApiError {
+                url: _url,
+                status_code,
+                message,
+            }) => match status_code {
+                reqwest::StatusCode::BAD_REQUEST => Err(tonic::Status::invalid_argument(message)),
+                reqwest::StatusCode::UNAUTHORIZED => Err(tonic::Status::unauthenticated(message)),
+                reqwest::StatusCode::FORBIDDEN => Err(tonic::Status::permission_denied(message)),
+                reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                    Err(tonic::Status::resource_exhausted(message))
+                }
+                reqwest::StatusCode::NOT_FOUND => Err(tonic::Status::not_found(message)),
+                _ => Err(tonic::Status::unknown(format!(
+                    "{}: {}",
+                    status_code, message
+                ))),
+            },
+            Err(e) => {
+                tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, err = ?e, "assume-role API returned error");
+                Err(tonic::Status::unknown(e.to_string()))
+            }
+        }
+    }
+
+    #[tracing::instrument(skip_all)]
     async fn list_sessions(
         &self,
         _request: tonic::Request<ListSessionsRequest>,
     ) -> Result<tonic::Response<ListSessionsResponse>, tonic::Status> {
-        let sessions = self.session_manager.list();
+        let sessions = self
+            .session_manager
+            .list()
+            .iter()
+            .map(|x| x.into())
+            .collect();
         Ok(tonic::Response::new(ListSessionsResponse { sessions }))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
     async fn initiate_oauth_code(
         &self,
         request: tonic::Request<InitiateOAuthCodeRequest>,

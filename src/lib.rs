@@ -11,6 +11,8 @@ pub mod utils;
 pub mod oauth_code;
 
 pub mod auth_flow_manager;
+pub mod client;
+pub mod credential_cache;
 pub mod session_manager;
 
 pub mod agent;

@@ -1,7 +1,8 @@
-#[derive(Debug)]
-struct Session {
-    id: u32,
-    token: std::sync::Arc<crate::token::ServerToken>,
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub id: u32,
+    pub token: std::sync::Arc<crate::token::ServerToken>,
+    pub credential_cache: crate::credential_cache::CredentialCache,
 }
 
 impl From<&Session> for crate::proto::Session {
@@ -34,23 +35,23 @@ impl SessionManager {
         }
     }
 
-    pub fn list(&self) -> Vec<crate::proto::Session> {
+    pub fn list(&self) -> Vec<Session> {
         let items = self.items.read().unwrap();
         let mut result = Vec::with_capacity(items.len());
         for item in items.iter() {
-            result.push(item.into());
+            result.push(item.clone());
         }
         result
     }
 
-    pub fn get(&self, query: &str) -> crate::Result<std::sync::Arc<crate::token::ServerToken>> {
+    pub fn get(&self, query: &str) -> crate::Result<Session> {
         tracing::trace!(query = ?query, "Attempting to get");
         let items = self.items.read().unwrap();
         let mut candidate = None;
         for (i, item) in items.iter().enumerate() {
             if query == item.token.server.id() {
                 tracing::info!(token = ?item.token, "Providing a token");
-                return Ok(item.token.clone());
+                return Ok(item.clone());
             }
             if query == item.token.server.url.as_str() {
                 if candidate.is_some() {
@@ -64,7 +65,7 @@ impl SessionManager {
         }
         if let Some(i) = candidate {
             tracing::info!(token = ?items[i].token, "Providing a token");
-            return Ok(items[i].token.clone());
+            return Ok(items[i].clone());
         }
         Err(crate::Error::UserError(
             "specified server not found".to_owned(),
@@ -80,6 +81,7 @@ impl SessionManager {
             let item = items.get_mut(i).unwrap();
             tracing::info!(token = ?token, id = ?item.id, "Storing updated token");
             item.token = std::sync::Arc::new(token);
+            item.credential_cache.clear();
             return Ok(());
         }
 
@@ -104,6 +106,7 @@ impl SessionManager {
                 .next_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             token: std::sync::Arc::new(token),
+            credential_cache: crate::credential_cache::CredentialCache::new(),
         });
 
         Ok(())
