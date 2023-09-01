@@ -35,6 +35,12 @@ pub enum Error {
 
     #[error(transparent)]
     TonicStatusError(#[from] tonic::Status),
+
+    #[error(transparent)]
+    ReqwestError(#[from] reqwest::Error),
+
+    #[error("ApiError({0}): {1}; {2:}")]
+    ApiError(String, String, reqwest::StatusCode),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

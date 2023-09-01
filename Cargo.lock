@@ -824,6 +824,7 @@ dependencies = [
  "libc",
  "nix",
  "oauth2",
+ "once_cell",
  "prost",
  "prost-types",
  "rand",
