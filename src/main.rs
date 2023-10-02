@@ -13,6 +13,7 @@ enum Commands {
     Login(mairu::cmd::login::LoginArgs),
     CredentialProcess(mairu::cmd::credential_process::CredentialProcessArgs),
     ListSessions,
+    Exec(mairu::cmd::exec::ExecArgs),
 }
 
 fn main() -> Result<std::process::ExitCode, anyhow::Error> {
@@ -25,11 +26,13 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::Login(args) => mairu::cmd::login::run(args),
         Commands::CredentialProcess(args) => mairu::cmd::credential_process::run(args),
         Commands::ListSessions => mairu::cmd::list_sessions::run(),
+        Commands::Exec(args) => mairu::cmd::exec::run(args),
     };
     match retval {
         Ok(_) => Ok(std::process::ExitCode::SUCCESS),
         Err(e) => match e.downcast_ref::<mairu::Error>() {
             Some(mairu::Error::FailureButSilentlyExit) => Ok(std::process::ExitCode::FAILURE),
+            Some(mairu::Error::SilentlyExitWithCode(c)) => Ok(*c),
             _ => Err(e),
         },
     }

@@ -1,3 +1,6 @@
+/// Client for Mairu API (Credentials Vendor HTTP API)
+///
+/// Note: See agent.rs for mairu agent client
 pub struct Client {
     pub server_id: String,
     pub url: url::Url,

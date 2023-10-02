@@ -1,6 +1,7 @@
 mod error;
 pub use error::{Error, Result};
 
+pub mod ext_axum;
 pub mod ext_oauth2;
 
 pub mod config;
@@ -16,5 +17,6 @@ pub mod credential_cache;
 pub mod session_manager;
 
 pub mod agent;
+pub mod ecs_server;
 
 pub mod cmd;
