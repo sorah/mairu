@@ -11,14 +11,14 @@ pub struct ExecArgs {
     #[arg(long, short, default_value = "ecs")]
     mode: crate::config::ProviderMode,
 
-    #[arg(long, default_value_t = true)]
-    login: bool,
+    #[arg(long, default_value_t = false)]
+    no_login: bool,
 
     #[arg(long)]
     oauth_grant_type: Option<crate::config::OAuthGrantType>,
 
-    #[arg(long, default_value_t = true)]
-    preflight_check: bool,
+    #[arg(long, default_value_t = false)]
+    no_preflight_check: bool,
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<std::ffi::OsString>,
@@ -37,7 +37,7 @@ async fn preflight_check(
     agent: &mut crate::agent::AgentConn,
     args: &ExecArgs,
 ) -> Result<(), anyhow::Error> {
-    if !args.preflight_check {
+    if args.no_preflight_check {
         return Ok(());
     }
 
@@ -75,7 +75,7 @@ async fn preflight_check(
 
 #[tracing::instrument(skip_all)]
 async fn login(agent: &mut crate::agent::AgentConn, args: &ExecArgs) -> Result<(), anyhow::Error> {
-    if args.login {
+    if !args.no_login {
         let login_args = crate::cmd::login::LoginArgs {
             oauth_grant_type: args.oauth_grant_type,
             server_name: args.server.clone(),
