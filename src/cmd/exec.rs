@@ -51,7 +51,8 @@ async fn preflight_check(
 
     match resp {
         Ok(r) => {
-            tracing::debug!(args = ?args, credentials = ?r, "preflight check succeeded");
+            let aki = r.into_inner().credentials.map(|c| c.access_key_id.clone());
+            tracing::debug!(args = ?args, aws_access_key_id = ?aki, "preflight check succeeded");
             Ok(())
         }
         Err(e) => {
