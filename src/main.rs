@@ -20,7 +20,12 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
     use clap::Parser;
     let cli = Cli::parse();
 
-    enable_tracing(true); // TODO: move to cmd::*
+    match &cli.command {
+        Commands::Agent(_) => enable_tracing(true),
+        Commands::Exec(_) => enable_tracing(true),
+        Commands::CredentialProcess(_) => enable_tracing(true),
+        _ => enable_tracing(false),
+    }
     let retval = match &cli.command {
         Commands::Agent(args) => mairu::cmd::agent::run(args),
         Commands::Login(args) => mairu::cmd::login::run(args),
