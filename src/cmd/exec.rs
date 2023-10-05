@@ -1,4 +1,4 @@
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Clone)]
 pub struct ExecArgs {
     role: String,
 
@@ -124,7 +124,7 @@ async fn ecs_provider_start(
             role: args.role.clone(),
             cached: !args.no_cache,
         },
-        crate::ecs_server::NoUserFeedback,
+        ExecEcsUserFeedback::from(args),
     );
     {
         use secrecy::ExposeSecret;
@@ -146,6 +146,42 @@ async fn ecs_provider_start(
         tracing::debug!("ECS Server down");
     });
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ExecEcsUserFeedback {
+    role: String,
+    server: String,
+}
+
+impl From<&ExecArgs> for ExecEcsUserFeedback {
+    fn from(a: &ExecArgs) -> Self {
+        Self {
+            role: a.role.clone(),
+            server: a.server.clone(),
+        }
+    }
+}
+
+impl crate::ecs_server::UserFeedbackDelegate for ExecEcsUserFeedback {
+    fn on_error(&self, err: &crate::ecs_server::BackendRequestError) {
+        let product = env!("CARGO_PKG_NAME");
+        let server = &self.server;
+        let role = &self.role;
+        let e = err.ui_message();
+        match &err {
+            crate::ecs_server::BackendRequestError::Forbidden(_) => {
+                eprintln!(":: {product} :: Forbidden while retrieving AWS credentials of {role} from {server}; {e}. To login again, run: $ {product} login {server}");
+            }
+            crate::ecs_server::BackendRequestError::Unauthorized(_) => {
+                eprintln!(":: {product} :: Login required to {server} for AWS credentials of {role}; {e}. Run: $ {product} login {server}");
+                eprintln!(":: {product} :: To continue, run: $ {product} login {server}");
+            }
+            crate::ecs_server::BackendRequestError::Unknown(_) => {
+                eprintln!(":: {product} :: Unknown error occured when retrieving AWS credentials for {role} from {server}; {e}. To reauthenticate, run: $ {product} login {server}");
+            }
+        }
+    }
 }
 
 #[tracing::instrument(skip_all)]

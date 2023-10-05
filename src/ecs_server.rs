@@ -97,6 +97,21 @@ pub enum BackendRequestError {
     Unknown(crate::Error),
 }
 
+impl BackendRequestError {
+    pub fn ui_message(&self) -> String {
+        match self {
+            BackendRequestError::Forbidden(crate::Error::TonicStatusError(e)) => {
+                format!("{:?}, {}", e.code(), e.message())
+            }
+            BackendRequestError::Unauthorized(crate::Error::TonicStatusError(e)) => {
+                format!("{:?}, {}", e.code(), e.message())
+            }
+            BackendRequestError::Unknown(e) => e.to_string(),
+            _ => self.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentBackend {
     pub agent: crate::agent::AgentConn,
@@ -125,16 +140,14 @@ impl Backend for AgentBackend {
 }
 
 pub trait UserFeedbackDelegate: Send + Sync + Clone + std::fmt::Debug {
-    fn unauthorized(&self, err: &BackendRequestError);
-    fn forbidden(&self, err: &BackendRequestError);
+    fn on_error(&self, err: &BackendRequestError);
 }
 
 #[derive(Debug, Clone)]
 pub struct NoUserFeedback;
 
 impl UserFeedbackDelegate for NoUserFeedback {
-    fn unauthorized(&self, _err: &BackendRequestError) {}
-    fn forbidden(&self, _err: &BackendRequestError) {}
+    fn on_error(&self, _err: &BackendRequestError) {}
 }
 
 pub async fn bind_tcp(port: Option<u16>) -> crate::Result<(tokio::net::TcpListener, url::Url)> {
@@ -185,16 +198,17 @@ async fn handle_get_credentials<B: Backend, U: UserFeedbackDelegate>(
             let code = match &be {
                 BackendRequestError::Unauthorized(e) => {
                     tracing::warn!(err = ?e, err_human = %e, server = ?server, "credential request was denied (unauthorized)");
-                    server.feedback.unauthorized(&be);
+                    server.feedback.on_error(&be);
                     axum::http::StatusCode::SERVICE_UNAVAILABLE
                 }
                 BackendRequestError::Forbidden(e) => {
                     tracing::warn!(err = ?e, err_human = %e, server = ?server, "credential request was denied (forbidden)");
-                    server.feedback.forbidden(&be);
+                    server.feedback.on_error(&be);
                     axum::http::StatusCode::FORBIDDEN
                 }
                 BackendRequestError::Unknown(e) => {
-                    tracing::error!(err = ?e, err_human = %e, server = ?server, "credential request returned an unknown error");
+                    tracing::warn!(err = ?e, err_human = %e, server = ?server, "credential request returned an unknown error");
+                    server.feedback.on_error(&be);
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR
                 }
             };
