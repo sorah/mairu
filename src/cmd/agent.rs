@@ -10,12 +10,13 @@ pub struct AgentArgs {
 pub fn run(args: &AgentArgs) -> Result<(), anyhow::Error> {
     let path = crate::config::socket_path();
 
-    if args.daemonize {
-        daemonize()?;
-    }
     protect_process();
 
-    serve(path, args)
+    if args.daemonize {
+        serve_on_path_daemon(path)
+    } else {
+        serve_on_path(path)
+    }
 }
 
 fn daemonize() -> Result<(), anyhow::Error> {
@@ -61,13 +62,30 @@ fn macos_pt_deny_attach() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::main]
-pub async fn serve(path: std::path::PathBuf, _args: &AgentArgs) -> Result<(), anyhow::Error> {
-    let uds = try_bind_or_check_liveness(&path, false).await?;
-    let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
-
-    let agent = crate::agent::Agent::new();
-
+pub async fn serve_on_path(path: std::path::PathBuf) -> Result<(), anyhow::Error> {
     tracing::info!(path = ?path, "Server starting");
+    let uds = try_bind_or_check_liveness(&path, false).await?;
+    serve(uds).await
+}
+
+pub fn serve_on_path_daemon(path: std::path::PathBuf) -> Result<(), anyhow::Error> {
+    tracing::debug!(path = ?path, "Server starting as a daemon");
+    let uds = try_bind_or_check_liveness_std(&path)?;
+    tracing::info!(path = ?path, "Agent starting as a daemon");
+    daemonize()?;
+    serve_on_path_daemon2(uds)
+}
+
+#[tokio::main]
+pub async fn serve_on_path_daemon2(
+    uds: std::os::unix::net::UnixListener,
+) -> Result<(), anyhow::Error> {
+    serve(tokio::net::UnixListener::from_std(uds)?).await
+}
+
+pub async fn serve(uds: tokio::net::UnixListener) -> Result<(), anyhow::Error> {
+    let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
+    let agent = crate::agent::Agent::new();
 
     tonic::transport::Server::builder()
         .add_service(crate::proto::agent_server::AgentServer::new(agent))
@@ -90,16 +108,41 @@ async fn try_bind_or_check_liveness(
                 return Err(e.into());
             }
             // Attempt to connect and say hello.
-            if let Err(e2) = crate::agent::connect_to_agent_with_path(&path).await {
-                tracing::info!(err = ?e2, path = ?path, "Attempting to replace the stale socket file as failing to connect to the existing agent");
-                tokio::fs::remove_file(&path).await?;
-                tracing::debug!(err = ?e2, path = ?path, "removed stale socket file");
-                return try_bind_or_check_liveness(path, true).await;
-            }
-            tracing::error!(err = ?e, path = ?path, "There is already running agent on the same socket path");
-            anyhow::bail!("There is already running agent on the same socket path");
+            check_liveness(path).await?;
+            try_bind_or_check_liveness(path, true).await
         }
     }
+}
+
+fn try_bind_or_check_liveness_std(
+    path: &std::path::PathBuf,
+) -> Result<std::os::unix::net::UnixListener, anyhow::Error> {
+    match std::os::unix::net::UnixListener::bind(path) {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::AddrInUse {
+                return Err(e.into());
+            }
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(check_liveness(path))?;
+
+            Ok(std::os::unix::net::UnixListener::bind(path)?)
+        }
+    }
+}
+
+async fn check_liveness(path: &std::path::PathBuf) -> Result<(), anyhow::Error> {
+    if let Err(e) = crate::agent::connect_to_agent_with_path(&path).await {
+        tracing::info!(err = ?e, path = ?path, "Attempting to replace the stale socket file as failing to connect to the existing agent");
+        tokio::fs::remove_file(&path).await?;
+        tracing::debug!(err = ?e, path = ?path, "removed stale socket file");
+        return Ok(());
+    }
+    anyhow::bail!("There is already running agent on the same socket path");
 }
 
 pub async fn connect_or_start() -> Result<crate::agent::AgentConn, anyhow::Error> {
