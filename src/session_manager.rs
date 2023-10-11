@@ -50,7 +50,7 @@ impl SessionManager {
         let mut candidate = None;
         for (i, item) in items.iter().enumerate() {
             if query == item.token.server.id() {
-                tracing::info!(token = ?item.token, "Providing a token");
+                tracing::trace!(token = ?item.token, "Providing a token");
                 return Ok(item.clone());
             }
             if query == item.token.server.url.as_str() {
@@ -64,7 +64,7 @@ impl SessionManager {
             }
         }
         if let Some(i) = candidate {
-            tracing::info!(token = ?items[i].token, "Providing a token");
+            tracing::trace!(token = ?items[i].token, "Providing a token");
             return Ok(items[i].clone());
         }
         Err(crate::Error::UserError(

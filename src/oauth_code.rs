@@ -31,8 +31,10 @@ impl OAuthCodeFlow {
             .add_scopes(oauth.scope.iter().map(|x| oauth2::Scope::new(x.to_owned())))
             .set_pkce_challenge(pkce_challenge);
         let (authorize_url, csrf_token) = request.url();
+        let handle = crate::utils::generate_flow_handle();
+        tracing::info!(server = ?server, handle = ?handle, "Initiating OAuth 2.0 Authorization Code flow");
         Ok(Self {
-            handle: crate::utils::generate_flow_handle(),
+            handle,
             server: server.to_owned(),
             redirect_url: redirect_url.clone(),
             authorize_url,
@@ -46,6 +48,7 @@ impl OAuthCodeFlow {
         completion: crate::proto::CompleteOAuthCodeRequest,
     ) -> crate::Result<crate::token::ServerToken> {
         use secrecy::ExposeSecret;
+        tracing::info!(flow = ?self, "Completing OAuth 2.0 Authorization Code flow");
 
         let client = oauth2_client_from_server(&self.server)?
             .set_redirect_uri(oauth2::RedirectUrl::from_url(self.redirect_url.clone()));
