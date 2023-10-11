@@ -1,15 +1,21 @@
 #[derive(clap::Args)]
 pub struct LoginArgs {
     #[arg(long)]
-    oauth_grant_type: Option<crate::config::OAuthGrantType>,
+    pub oauth_grant_type: Option<crate::config::OAuthGrantType>,
 
-    server_name: String,
+    pub server_name: String,
 }
 
 #[tokio::main]
 pub async fn run(args: &LoginArgs) -> Result<(), anyhow::Error> {
     let mut agent = crate::cmd::agent::connect_or_start().await?;
+    login(&mut agent, args).await
+}
 
+pub async fn login(
+    agent: &mut crate::agent::AgentConn,
+    args: &LoginArgs,
+) -> Result<(), anyhow::Error> {
     let server: crate::config::Server = agent
         .get_server(tonic::Request::new(crate::proto::GetServerRequest {
             query: args.server_name.clone(),
@@ -33,7 +39,7 @@ pub async fn run(args: &LoginArgs) -> Result<(), anyhow::Error> {
 }
 
 pub async fn do_oauth_code(
-    mut agent: crate::agent::AgentConn,
+    agent: &mut crate::agent::AgentConn,
     server: crate::config::Server,
 ) -> Result<(), anyhow::Error> {
     let (_oauth, code_grant) = server.try_oauth_code_grant()?;
@@ -60,7 +66,7 @@ pub async fn do_oauth_code(
     eprintln!(":: {product} :: ");
     eprintln!(":: {product} :: ");
 
-    crate::oauth_code::listen_for_callback(listener, session, &agent).await?;
+    crate::oauth_code::listen_for_callback(listener, session, agent).await?;
     tracing::info!("Logged in");
     Ok(())
 }

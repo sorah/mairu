@@ -221,3 +221,21 @@ pub struct ServerCodeGrant {
 pub struct ServerDeviceGrant {
     pub device_authorization_endpoint: Option<url::Url>,
 }
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMode {
+    Ecs,
+    Static,
+}
+
+impl std::str::FromStr for ProviderMode {
+    type Err = crate::Error;
+    fn from_str(s: &str) -> Result<ProviderMode, crate::Error> {
+        match s {
+            "ecs" => Ok(ProviderMode::Ecs),
+            "static" => Ok(ProviderMode::Static),
+            _ => Err(crate::Error::UserError("unknown mode".to_owned())),
+        }
+    }
+}

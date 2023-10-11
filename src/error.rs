@@ -49,6 +49,10 @@ pub enum Error {
     /// Failure, but we don't want to emit error to stderr/out anymore. Used in cmd
     #[error("")]
     FailureButSilentlyExit,
+
+    /// Failure, but we don't want to emit error to stderr/out anymore. Used in cmd
+    #[error("")]
+    SilentlyExitWithCode(std::process::ExitCode),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
