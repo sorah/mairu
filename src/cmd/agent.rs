@@ -8,14 +8,33 @@ pub struct AgentArgs {
 }
 
 pub fn run(args: &AgentArgs) -> Result<(), anyhow::Error> {
+    let path = crate::config::socket_path();
+
+    if args.daemonize {
+        daemonize()?;
+    }
     protect_process();
 
-    let path = crate::config::socket_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     serve(path, args)
+}
+
+fn daemonize() -> Result<(), anyhow::Error> {
+    let d = daemonize::Daemonize::new().working_directory(crate::config::runtime_dir());
+
+    match d.execute() {
+        daemonize::Outcome::Parent(Ok(o)) => {
+            return Err(
+                crate::Error::SilentlyExitWithCode(std::process::ExitCode::from(
+                    o.first_child_exit_code as u8,
+                ))
+                .into(),
+            );
+        }
+        daemonize::Outcome::Parent(Err(e)) => return Err(e.into()),
+        daemonize::Outcome::Child(Ok(_)) => {}
+        daemonize::Outcome::Child(Err(e)) => return Err(e.into()),
+    }
+    Ok(())
 }
 
 fn protect_process() {
@@ -84,5 +103,49 @@ async fn try_bind_or_check_liveness(
 }
 
 pub async fn connect_or_start() -> Result<crate::agent::AgentConn, anyhow::Error> {
-    Ok(crate::agent::connect_to_agent().await?)
+    let liveness = crate::agent::connect_to_agent().await;
+    match liveness {
+        Ok(c) => return Ok(c),
+        Err(e) => {
+            if std::env::var_os("MAIRU_NO_AUTO_AGENT").is_some() {
+                return Err(e.into());
+            }
+            tracing::info!("Starting the agent");
+            tracing::debug!(err = ?e, "Starting the agent");
+        }
+    }
+
+    spawn_agent().await?;
+
+    let fut = attempt_connect_to_agent_loop();
+    let timeout = tokio::time::timeout(std::time::Duration::from_secs(20), fut);
+    match timeout.await {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(_)) => unreachable!(),
+        Err(_) => {
+            anyhow::bail!("Failed to launch and connect to the agent");
+        }
+    }
+}
+
+async fn attempt_connect_to_agent_loop() -> Result<crate::agent::AgentConn, anyhow::Error> {
+    loop {
+        match crate::agent::connect_to_agent().await {
+            Ok(c) => return Ok(c),
+            Err(e) => tracing::debug!(err = ?e, "Waiting for agent to start"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+pub async fn spawn_agent() -> Result<(), anyhow::Error> {
+    let arg0 = process_path::get_executable_path().expect("Can't get executable path");
+    tokio::process::Command::new(arg0)
+        .args(["agent", "--log-to-file", "--daemonize"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(false)
+        .status()
+        .await?;
+    Ok(())
 }

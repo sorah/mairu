@@ -81,7 +81,9 @@ fn enable_log(kind: LogType) {
             if std::env::var_os("RUST_LOG").is_none() {
                 std::env::set_var("RUST_LOG", "mairu=info");
             }
-            let w = tracing_appender::rolling::hourly(mairu::config::log_dir(), "mairu.log");
+            let log_dir = mairu::config::log_dir_mkpath().expect("can't create log directory");
+            nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o077).unwrap());
+            let w = tracing_appender::rolling::daily(log_dir, "mairu.log");
             tracing_subscriber::fmt()
                 .with_writer(w)
                 .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

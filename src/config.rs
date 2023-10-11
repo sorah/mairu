@@ -35,11 +35,20 @@ pub fn runtime_dir() -> std::path::PathBuf {
         Err(_) => config_dir().join("run"),
     }
 }
+pub fn runtime_dir_mkpath() -> std::io::Result<std::path::PathBuf> {
+    let dir = runtime_dir();
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
 
 pub fn socket_path() -> std::path::PathBuf {
     std::env::var("MAIRU_AGENT_SOCK")
         .map(|x| x.into())
-        .unwrap_or_else(|_| runtime_dir().join(format!("{}-agent.sock", env!("CARGO_PKG_NAME"))))
+        .unwrap_or_else(|_| {
+            runtime_dir_mkpath()
+                .unwrap()
+                .join(format!("{}-agent.sock", env!("CARGO_PKG_NAME")))
+        })
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
