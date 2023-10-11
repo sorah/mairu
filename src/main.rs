@@ -1,6 +1,6 @@
 #[derive(clap::Parser)]
 #[clap(author, version, long_about = None)]
-#[clap(about = "Mairu TODO")]
+#[clap(about = "Mairu TODO:")]
 #[clap(propagate_version = true)]
 struct Cli {
     #[clap(subcommand)]
@@ -21,10 +21,16 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Agent(_) => enable_tracing(true),
-        Commands::Exec(_) => enable_tracing(true),
-        Commands::CredentialProcess(_) => enable_tracing(true),
-        _ => enable_tracing(false),
+        Commands::Agent(a) => {
+            if a.log_to_file {
+                enable_log(LogType::File)
+            } else {
+                enable_log(LogType::Custom);
+            }
+        }
+        Commands::Exec(_) => enable_log(LogType::Custom),
+        Commands::CredentialProcess(_) => enable_log(LogType::Custom),
+        _ => enable_log(LogType::Default),
     }
     let retval = match &cli.command {
         Commands::Agent(args) => mairu::cmd::agent::run(args),
@@ -43,20 +49,49 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
     }
 }
 
-fn enable_tracing(stderr: bool) {
+enum LogType {
+    Default,
+    Custom,
+    File,
+}
+
+fn enable_log(kind: LogType) {
+    let rust_log = std::env::var_os("RUST_LOG");
+
+    #[cfg(not(debug_assertions))]
+    std::env::remove_var("RUST_LOG");
+
     if let Ok(l) = std::env::var("MAIRU_LOG") {
         std::env::set_var("RUST_LOG", l);
     }
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "mairu=info");
+    match kind {
+        LogType::Default => {
+            if std::env::var_os("RUST_LOG").is_none() {
+                std::env::set_var("RUST_LOG", "mairu=info");
+            }
+            tracing_subscriber::fmt::init();
+        }
+        LogType::Custom => {
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .init();
+        }
+        LogType::File => {
+            if std::env::var_os("RUST_LOG").is_none() {
+                std::env::set_var("RUST_LOG", "mairu=info");
+            }
+            let w = tracing_appender::rolling::hourly(mairu::config::log_dir(), "mairu.log");
+            tracing_subscriber::fmt()
+                .with_writer(w)
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .init();
+        }
     }
 
-    if stderr {
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .init();
+    if let Some(v) = rust_log {
+        std::env::set_var("RUST_LOG", v);
     } else {
-        tracing_subscriber::fmt::init();
+        std::env::remove_var("RUST_LOG");
     }
 }

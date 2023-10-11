@@ -10,6 +10,25 @@ pub fn config_dir() -> std::path::PathBuf {
         .join(env!("CARGO_PKG_NAME"))
 }
 
+pub fn log_dir() -> std::path::PathBuf {
+    match std::env::var("XDG_STATE_HOME") {
+        Ok(d) => std::path::PathBuf::from(d),
+        Err(_) => std::path::PathBuf::from(
+            std::env::var("HOME").expect("No $HOME environment variable present"),
+        )
+        .join(".local")
+        .join("state"),
+    }
+    .join(env!("CARGO_PKG_NAME"))
+    .join("log")
+}
+
+pub fn log_dir_mkpath() -> std::io::Result<std::path::PathBuf> {
+    let dir = log_dir();
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 pub fn runtime_dir() -> std::path::PathBuf {
     match std::env::var("XDG_RUNTIME_DIR") {
         Ok(d) => std::path::PathBuf::from(d).join(env!("CARGO_PKG_NAME")),

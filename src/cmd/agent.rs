@@ -1,5 +1,11 @@
 #[derive(clap::Args)]
-pub struct AgentArgs {}
+pub struct AgentArgs {
+    #[arg(long, default_value_t = false)]
+    daemonize: bool,
+
+    #[arg(long, default_value_t = false)]
+    pub log_to_file: bool,
+}
 
 pub fn run(args: &AgentArgs) -> Result<(), anyhow::Error> {
     protect_process();

@@ -37,6 +37,7 @@ tokio-stream = { version = "0.1.14", features = ["net"] }
 tonic = "0.9.2"
 tower = { version = "0.4.13", features = ["tracing"] }
 tracing = { version = "0.1.37", features = ["attributes"] }
+tracing-appender = "0.2.2"
 tracing-subscriber = { version = "0.3.17", features = ["fmt", "env-filter", "local-time", "json", "time"] }
 url = { version = "2.4.1", features = ["serde"] }
 zeroize = { version = "1.6.0", features = ["std", "aarch64", "zeroize_derive", "serde", "derive"] }
