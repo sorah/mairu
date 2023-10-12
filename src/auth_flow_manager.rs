@@ -18,18 +18,18 @@ impl AuthFlow {
 
 #[derive(Clone)]
 pub struct AuthFlowManager {
-    list: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<AuthFlow>>>,
+    list: std::sync::Arc<parking_lot::Mutex<std::collections::VecDeque<AuthFlow>>>,
 }
 
 impl AuthFlowManager {
     pub fn new() -> Self {
         Self {
-            list: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            list: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
     pub fn store(&self, flow: AuthFlow) {
-        let mut list = self.list.lock().unwrap();
+        let mut list = self.list.lock();
         if list.len() == MAX_ITEMS {
             let item = list.pop_front();
             tracing::warn!(discarded_flow = ?item, "Too many ongoing authentication flows, discarding the oldest one");
@@ -40,7 +40,7 @@ impl AuthFlowManager {
     pub fn retrieve<'a>(&'a self, handle: &str) -> Option<AuthFlowRetrieval<'a>> {
         let mut cand = None;
         {
-            let mut list = self.list.lock().unwrap();
+            let mut list = self.list.lock();
             for (i, flow) in list.iter().enumerate() {
                 if flow.handle() == handle {
                     cand = Some(list.swap_remove_front(i).unwrap());
