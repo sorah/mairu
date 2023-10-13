@@ -1,34 +1,23 @@
 pub struct Singleflight<T>
 where
     T: Clone + Send + 'static,
-    //    F: std::future::Future<Output = T> + Send + 'static,
 {
     tasks: std::sync::Arc<
         parking_lot::RwLock<std::collections::HashMap<String, std::sync::Weak<Task<T>>>>,
     >,
 }
 
-//#[pin_project::pin_project]
 struct Task<T>
 where
     T: Clone + Send + 'static,
-    //    F: std::future::Future<Output = T> + Send + 'static,
 {
     notify: tokio::sync::Notify,
     result: once_cell::race::OnceBox<parking_lot::Mutex<T>>,
-    // #[pin]
-    // result: async_once_cell::Lazy<
-    //     parking_lot::Mutex<T>,
-    //     //std::pin::Pin<Box<dyn std::future::Future<Output = parking_lot::Mutex<T>>>>,
-    //     //FutureCapturingIntoMutex<std::pin::Pin<Box<F>>>,
-    //     FutureCapturingIntoMutex<T>,
-    // >,
 }
 
 impl<T> Default for Singleflight<T>
 where
     T: Clone + Send + 'static,
-    //    F: std::future::Future<Output = T> + Send + 'static,
 {
     fn default() -> Self {
         Singleflight::new()
@@ -38,7 +27,6 @@ where
 impl<T> Clone for Singleflight<T>
 where
     T: Clone + Send + 'static,
-    //    F: std::future::Future<Output = T> + Send + 'static,
 {
     fn clone(&self) -> Self {
         Singleflight {
@@ -50,7 +38,6 @@ where
 impl<T> Singleflight<T>
 where
     T: Clone + Send + 'static,
-    //    F: std::future::Future<Output = T> + Send + 'static,
 {
     pub fn new() -> Singleflight<T> {
         Singleflight {
@@ -87,12 +74,7 @@ where
                 }
 
                 // Ensure the given future to complete
-                tokio::spawn(ensure_completion(
-                    //self.clone(),
-                    //key.to_owned(),
-                    task.clone(),
-                    fut,
-                ));
+                tokio::spawn(ensure_completion(task.clone(), fut));
 
                 task
             }
@@ -131,12 +113,8 @@ where
     }
 }
 
-async fn ensure_completion<T>(
-    //    group: Singleflight<T, F>,
-    //    k: String,
-    task: std::sync::Arc<Task<T>>,
-    fut: FutureCapturingIntoMutex<T>,
-) where
+async fn ensure_completion<T>(task: std::sync::Arc<Task<T>>, fut: FutureCapturingIntoMutex<T>)
+where
     T: Clone + Send,
 {
     let value = fut.await;
