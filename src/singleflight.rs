@@ -74,7 +74,10 @@ where
                 }
 
                 // Ensure the given future to complete
-                tokio::spawn(ensure_completion(task.clone(), fut));
+                let handle = tokio::spawn(ensure_completion(task.clone(), fut));
+                tokio::spawn(panic_protection(task.clone(), handle));
+                //                    .await
+                //                   .unwrap();
 
                 task
             }
@@ -85,7 +88,10 @@ where
             return value.clone();
         }
         wait.await;
-        let v = task.result.get().expect("value was empty");
+        let v = task
+            .result
+            .get()
+            .expect("value was empty - perhaps task has panicked");
         let value = v.lock();
         value.clone()
     }
@@ -120,9 +126,23 @@ where
     let value = fut.await;
     let r = task.result.set(Box::new(value));
     if r.is_err() {
-        panic!("value was full")
+        panic!("value was full");
     }
     task.notify.notify_waiters();
+}
+
+async fn panic_protection<T>(task: std::sync::Arc<Task<T>>, handle: tokio::task::JoinHandle<()>)
+where
+    T: Clone + Send + 'static,
+{
+    let result = handle.await;
+    if let Err(e) = result {
+        task.notify.notify_waiters();
+        if e.is_panic() {
+            std::panic::resume_unwind(e.into_panic());
+        }
+        panic!("task aborted");
+    }
 }
 
 #[cfg(test)]
@@ -139,8 +159,29 @@ mod tests {
     async fn multi() {
         let group = Singleflight::new();
         let result0 = group.request("aa".to_string(), || async { Some(42) }).await;
-        let result1 = group.request("aa".to_string(), || async { panic!() }).await;
+        let result1 = group.request("aa".to_string(), || async { Some(43) }).await;
         assert_eq!(result0.unwrap(), 42);
-        assert_eq!(result1.unwrap(), 42);
+        assert_eq!(result1.unwrap(), 43);
     }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn panic() {
+        let group = Singleflight::<()>::new();
+        group.request("aa".to_string(), || async { panic!() }).await;
+    }
+
+    //    #[tokio::test]
+    //    async fn collapsing() {
+    //        let group = Singleflight::new();
+    //        let notify = tokio::sync::Notify::new();
+    //        let wait = notify.notified();
+    //
+    //        let fut0 = group.request("a".to_string(), move || async move {
+    //            wait.await;
+    //            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    //            42
+    //        });
+    //        let fut1 = group.request("a".to_string(), || async { 0 });
+    //    }
 }
