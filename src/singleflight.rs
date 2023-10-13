@@ -1,51 +1,42 @@
-pub struct Singleflight<T, F>
+pub struct Singleflight<T>
 where
     T: Clone + Send + 'static,
-    F: std::future::Future<Output = T> + Send + 'static,
+    //    F: std::future::Future<Output = T> + Send + 'static,
 {
-    tasks: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, Task<T, F>>>>,
-}
-
-#[derive(Clone)]
-struct Task<T, F>
-where
-    T: Clone + Send + 'static,
-    F: std::future::Future<Output = T> + Send + 'static,
-{
-    inner: std::sync::Weak<TaskInner<T, F>>,
-}
-
-struct TaskInner<T, F>
-where
-    T: Clone + Send + 'static,
-    F: std::future::Future<Output = T> + Send + 'static,
-{
-    result: std::pin::Pin<
-        Box<
-            async_once_cell::Lazy<
-                parking_lot::Mutex<T>,
-                //std::pin::Pin<Box<dyn std::future::Future<Output = parking_lot::Mutex<T>>>>,
-                //FutureCapturingIntoMutex<std::pin::Pin<Box<F>>>,
-                FutureCapturingIntoMutex<F>,
-            >,
-        >,
+    tasks: std::sync::Arc<
+        parking_lot::RwLock<std::collections::HashMap<String, std::sync::Weak<Task<T>>>>,
     >,
 }
 
-impl<T, F> Default for Singleflight<T, F>
+#[pin_project::pin_project]
+struct Task<T>
 where
     T: Clone + Send + 'static,
-    F: std::future::Future<Output = T> + Send + 'static,
+    //    F: std::future::Future<Output = T> + Send + 'static,
+{
+    #[pin]
+    result: async_once_cell::Lazy<
+        parking_lot::Mutex<T>,
+        //std::pin::Pin<Box<dyn std::future::Future<Output = parking_lot::Mutex<T>>>>,
+        //FutureCapturingIntoMutex<std::pin::Pin<Box<F>>>,
+        FutureCapturingIntoMutex<T>,
+    >,
+}
+
+impl<T> Default for Singleflight<T>
+where
+    T: Clone + Send + 'static,
+    //    F: std::future::Future<Output = T> + Send + 'static,
 {
     fn default() -> Self {
         Singleflight::new()
     }
 }
 
-impl<T, F> Clone for Singleflight<T, F>
+impl<T> Clone for Singleflight<T>
 where
     T: Clone + Send + 'static,
-    F: std::future::Future<Output = T> + Send + 'static,
+    //    F: std::future::Future<Output = T> + Send + 'static,
 {
     fn clone(&self) -> Self {
         Singleflight {
@@ -54,21 +45,25 @@ where
     }
 }
 
-impl<T, F> Singleflight<T, F>
+impl<T> Singleflight<T>
 where
     T: Clone + Send + 'static,
-    F: std::future::Future<Output = T> + Send + 'static,
+    //    F: std::future::Future<Output = T> + Send + 'static,
 {
-    pub fn new() -> Singleflight<T, F> {
+    pub fn new() -> Singleflight<T> {
         Singleflight {
             tasks: Default::default(),
         }
     }
 
-    pub async fn request(&self, key: String, fut: F) -> T {
+    pub async fn request<W, F>(&self, key: String, work: W) -> T
+    where
+        W: FnOnce() -> F,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
         let tasks = self.tasks.upgradable_read();
         let maybe_task = match tasks.get(&key) {
-            Some(t) => t.inner.upgrade(),
+            Some(t) => t.upgrade(),
             None => None,
         };
 
@@ -78,15 +73,12 @@ where
                 task
             }
             None => {
-                let lazy = Box::pin(async_once_cell::Lazy::new(FutureCapturingIntoMutex(fut)));
-                let task = std::sync::Arc::new(TaskInner { result: lazy });
+                let lazy = async_once_cell::Lazy::new(FutureCapturingIntoMutex(Box::pin(work())));
+                let task = std::sync::Arc::new(Task { result: lazy });
 
                 {
                     let mut tasks = parking_lot::RwLockUpgradableReadGuard::upgrade(tasks);
-                    let task_outer = Task {
-                        inner: std::sync::Arc::downgrade(&task),
-                    };
-                    tasks.insert(key.to_owned(), task_outer);
+                    tasks.insert(key.to_owned(), std::sync::Arc::downgrade(&task));
                 }
 
                 // Ensure the given future to complete
@@ -106,21 +98,21 @@ where
     }
 }
 
-#[pin_project::pin_project]
-struct FutureCapturingIntoMutex<F: std::future::Future + Send>(#[pin] F);
+struct FutureCapturingIntoMutex<T: Clone + Send + 'static>(
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>,
+);
 
-impl<F> std::future::Future for FutureCapturingIntoMutex<F>
+impl<T> std::future::Future for FutureCapturingIntoMutex<T>
 where
-    F: std::future::Future + Send,
+    T: Clone + Send + 'static,
 {
-    type Output = parking_lot::Mutex<F::Output>;
+    type Output = parking_lot::Mutex<T>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let this = self.project();
-        let up: std::pin::Pin<&mut F> = this.0;
+        let up = self.0.as_mut();
         match up.poll(cx) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(v) => std::task::Poll::Ready(parking_lot::Mutex::new(v)),
@@ -128,18 +120,16 @@ where
     }
 }
 
-async fn ensure_completion<T, F>(
+async fn ensure_completion<T>(
     //    group: Singleflight<T, F>,
     //    k: String,
-    t: std::sync::Arc<TaskInner<T, F>>,
+    task: std::sync::Arc<Task<T>>,
 ) where
     T: Clone + Send,
-    F: std::future::Future<Output = T> + Send,
 {
-    let r = &t.result.as_ref();
-    r.get().await;
-    //    let mut tasks = group.tasks.write();
-    //    tasks.remove(&k);
+    let t = task.as_ref();
+    tokio::pin!(t);
+    t.await;
 }
 
 #[cfg(test)]
