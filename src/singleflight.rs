@@ -76,8 +76,6 @@ where
                 // Ensure the given future to complete
                 let handle = tokio::spawn(ensure_completion(task.clone(), fut));
                 tokio::spawn(panic_protection(task.clone(), handle));
-                //                    .await
-                //                   .unwrap();
 
                 task
             }
@@ -171,17 +169,29 @@ mod tests {
         group.request("aa".to_string(), || async { panic!() }).await;
     }
 
-    //    #[tokio::test]
-    //    async fn collapsing() {
-    //        let group = Singleflight::new();
-    //        let notify = tokio::sync::Notify::new();
-    //        let wait = notify.notified();
-    //
-    //        let fut0 = group.request("a".to_string(), move || async move {
-    //            wait.await;
-    //            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    //            42
-    //        });
-    //        let fut1 = group.request("a".to_string(), || async { 0 });
-    //    }
+    #[tokio::test]
+    async fn collapsing() {
+        console_subscriber::init();
+        let group = Singleflight::new();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let fut0 = group.request("a".to_string(), || {
+            eprintln!("hi3");
+            async move {
+                rx.await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                42
+            }
+        });
+        let fut1 = group.request("a".to_string(), || async { 0 });
+
+        tx.send(());
+        let (r0, r1) = tokio::join!(fut0, fut1);
+        assert_eq!(r0, 42);
+        assert_eq!(r1, 42);
+
+        //let fut2 = group.request("a".to_string(), || async { 1 });
+        //assert_eq!(fut2.await, 1);
+    }
 }
