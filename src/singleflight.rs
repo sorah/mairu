@@ -8,19 +8,21 @@ where
     >,
 }
 
-#[pin_project::pin_project]
+//#[pin_project::pin_project]
 struct Task<T>
 where
     T: Clone + Send + 'static,
     //    F: std::future::Future<Output = T> + Send + 'static,
 {
-    #[pin]
-    result: async_once_cell::Lazy<
-        parking_lot::Mutex<T>,
-        //std::pin::Pin<Box<dyn std::future::Future<Output = parking_lot::Mutex<T>>>>,
-        //FutureCapturingIntoMutex<std::pin::Pin<Box<F>>>,
-        FutureCapturingIntoMutex<T>,
-    >,
+    notify: tokio::sync::Notify,
+    result: once_cell::race::OnceBox<parking_lot::Mutex<T>>,
+    // #[pin]
+    // result: async_once_cell::Lazy<
+    //     parking_lot::Mutex<T>,
+    //     //std::pin::Pin<Box<dyn std::future::Future<Output = parking_lot::Mutex<T>>>>,
+    //     //FutureCapturingIntoMutex<std::pin::Pin<Box<F>>>,
+    //     FutureCapturingIntoMutex<T>,
+    // >,
 }
 
 impl<T> Default for Singleflight<T>
@@ -73,8 +75,11 @@ where
                 task
             }
             None => {
-                let lazy = async_once_cell::Lazy::new(FutureCapturingIntoMutex(Box::pin(work())));
-                let task = std::sync::Arc::new(Task { result: lazy });
+                let fut = FutureCapturingIntoMutex(Box::pin(work()));
+                let task = std::sync::Arc::new(Task {
+                    notify: tokio::sync::Notify::new(),
+                    result: once_cell::race::OnceBox::new(),
+                });
 
                 {
                     let mut tasks = parking_lot::RwLockUpgradableReadGuard::upgrade(tasks);
@@ -86,15 +91,21 @@ where
                     //self.clone(),
                     //key.to_owned(),
                     task.clone(),
+                    fut,
                 ));
 
                 task
             }
         };
-        let r = task.result.as_ref();
-        let val = r.get().await;
-        let lock = val.get_ref().lock();
-        lock.clone()
+        let wait = task.notify.notified();
+        if let Some(v) = task.result.get() {
+            let value = v.lock();
+            return value.clone();
+        }
+        wait.await;
+        let v = task.result.get().expect("value was empty");
+        let value = v.lock();
+        value.clone()
     }
 }
 
@@ -109,7 +120,7 @@ where
     type Output = parking_lot::Mutex<T>;
 
     fn poll(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let up = self.0.as_mut();
@@ -124,12 +135,16 @@ async fn ensure_completion<T>(
     //    group: Singleflight<T, F>,
     //    k: String,
     task: std::sync::Arc<Task<T>>,
+    fut: FutureCapturingIntoMutex<T>,
 ) where
     T: Clone + Send,
 {
-    let t = task.as_ref();
-    tokio::pin!(t);
-    t.await;
+    let value = fut.await;
+    let r = task.result.set(Box::new(value));
+    if r.is_err() {
+        panic!("value was full")
+    }
+    task.notify.notify_waiters();
 }
 
 #[cfg(test)]
@@ -139,14 +154,14 @@ mod tests {
     #[tokio::test]
     async fn single() {
         let group = Singleflight::new();
-        let result = group.request("aa".to_string(), async { Some(42) }).await;
+        let result = group.request("aa".to_string(), || async { Some(42) }).await;
         assert_eq!(result.unwrap(), 42);
     }
     #[tokio::test]
     async fn multi() {
         let group = Singleflight::new();
-        let result0 = group.request("aa".to_string(), async { Some(42) }).await;
-        let result1 = group.request("aa".to_string(), async { Some(42) }).await;
+        let result0 = group.request("aa".to_string(), || async { Some(42) }).await;
+        let result1 = group.request("aa".to_string(), || async { Some(42) }).await;
         assert_eq!(result0.unwrap(), 42);
         assert_eq!(result1.unwrap(), 42);
     }
