@@ -139,7 +139,7 @@ mod tests {
     async fn multi() {
         let group = Singleflight::new();
         let result0 = group.request("aa".to_string(), || async { Some(42) }).await;
-        let result1 = group.request("aa".to_string(), || async { Some(42) }).await;
+        let result1 = group.request("aa".to_string(), || async { panic!() }).await;
         assert_eq!(result0.unwrap(), 42);
         assert_eq!(result1.unwrap(), 42);
     }
