@@ -171,7 +171,6 @@ mod tests {
 
     #[tokio::test]
     async fn collapsing() {
-        console_subscriber::init();
         let group = Singleflight::new();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -179,19 +178,21 @@ mod tests {
         let fut0 = group.request("a".to_string(), || {
             eprintln!("hi3");
             async move {
-                rx.await;
+                rx.await.ok();
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 42
             }
         });
         let fut1 = group.request("a".to_string(), || async { 0 });
+        let fut2 = group.request("b".to_string(), || async { 420 });
 
-        tx.send(());
-        let (r0, r1) = tokio::join!(fut0, fut1);
+        tx.send(()).unwrap();
+        let (r0, r1, r2) = tokio::join!(fut0, fut1, fut2);
         assert_eq!(r0, 42);
         assert_eq!(r1, 42);
+        assert_eq!(r2, 420);
 
-        //let fut2 = group.request("a".to_string(), || async { 1 });
-        //assert_eq!(fut2.await, 1);
+        let fut2 = group.request("a".to_string(), || async { 1 });
+        assert_eq!(fut2.await, 1);
     }
 }
