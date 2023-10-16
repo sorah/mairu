@@ -889,7 +889,6 @@ dependencies = [
  "oauth2",
  "once_cell",
  "parking_lot",
- "pin-project",
  "process_path",
  "prost",
  "prost-types",
