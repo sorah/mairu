@@ -1,6 +1,6 @@
 pub struct Singleflight<T>
 where
-    T: Clone + Send + 'static,
+    T: Clone + Send + std::fmt::Debug + 'static,
 {
     tasks: std::sync::Arc<
         parking_lot::RwLock<std::collections::HashMap<String, std::sync::Weak<Task<T>>>>,
@@ -9,7 +9,7 @@ where
 
 struct Task<T>
 where
-    T: Clone + Send + 'static,
+    T: Clone + Send + std::fmt::Debug + 'static,
 {
     notify: tokio::sync::Notify,
     result: once_cell::race::OnceBox<parking_lot::Mutex<T>>,
@@ -17,7 +17,7 @@ where
 
 impl<T> Default for Singleflight<T>
 where
-    T: Clone + Send + 'static,
+    T: Clone + Send + std::fmt::Debug + 'static,
 {
     fn default() -> Self {
         Singleflight::new()
@@ -26,7 +26,7 @@ where
 
 impl<T> Clone for Singleflight<T>
 where
-    T: Clone + Send + 'static,
+    T: Clone + Send + std::fmt::Debug + 'static,
 {
     fn clone(&self) -> Self {
         Singleflight {
@@ -37,7 +37,7 @@ where
 
 impl<T> Singleflight<T>
 where
-    T: Clone + Send + 'static,
+    T: Clone + Send + std::fmt::Debug + 'static,
 {
     pub fn new() -> Singleflight<T> {
         Singleflight {
@@ -59,9 +59,11 @@ where
         let task = match maybe_task {
             Some(task) => {
                 drop(tasks);
+                eprintln!("reusing task");
                 task
             }
             None => {
+                eprintln!("new task");
                 let fut = FutureCapturingIntoMutex(Box::pin(work()));
                 let task = std::sync::Arc::new(Task {
                     notify: tokio::sync::Notify::new(),
@@ -80,12 +82,16 @@ where
                 task
             }
         };
+        eprintln!("subscribing");
         let wait = task.notify.notified();
         if let Some(v) = task.result.get() {
+            eprintln!("no need to wait");
             let value = v.lock();
             return value.clone();
         }
+        eprintln!("waiting");
         wait.await;
+        eprintln!("notified");
         let v = task
             .result
             .get()
@@ -95,13 +101,13 @@ where
     }
 }
 
-struct FutureCapturingIntoMutex<T: Clone + Send + 'static>(
+struct FutureCapturingIntoMutex<T: Clone + Send + std::fmt::Debug + 'static>(
     std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>,
 );
 
 impl<T> std::future::Future for FutureCapturingIntoMutex<T>
 where
-    T: Clone + Send + 'static,
+    T: Clone + Send + std::fmt::Debug + 'static,
 {
     type Output = parking_lot::Mutex<T>;
 
@@ -110,18 +116,24 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let up = self.0.as_mut();
+        eprintln!("FutureCapturingIntoMutex is polled");
         match up.poll(cx) {
             std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(v) => std::task::Poll::Ready(parking_lot::Mutex::new(v)),
+            std::task::Poll::Ready(v) => {
+                eprintln!("FutureCapturingIntoMutex is ready");
+                std::task::Poll::Ready(parking_lot::Mutex::new(v))
+            }
         }
     }
 }
 
 async fn ensure_completion<T>(task: std::sync::Arc<Task<T>>, fut: FutureCapturingIntoMutex<T>)
 where
-    T: Clone + Send,
+    T: Clone + Send + std::fmt::Debug,
 {
+    eprintln!("spawned");
     let value = fut.await;
+    eprintln!("completed {value:?}");
     let r = task.result.set(Box::new(value));
     if r.is_err() {
         panic!("value was full");
@@ -131,7 +143,7 @@ where
 
 async fn panic_protection<T>(task: std::sync::Arc<Task<T>>, handle: tokio::task::JoinHandle<()>)
 where
-    T: Clone + Send + 'static,
+    T: Clone + Send + std::fmt::Debug + 'static,
 {
     let result = handle.await;
     if let Err(e) = result {
@@ -177,8 +189,10 @@ mod tests {
 
         eprintln!("fut0");
         let fut0 = group.request("a".to_string(), || async move {
+            eprintln!("spawned inner");
             rx.await.ok();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            eprintln!("returning value");
             42
         });
         eprintln!("fut1");
@@ -189,15 +203,20 @@ mod tests {
         eprintln!("fut3");
         let fut3 = group.request("b".to_string(), || async { 420 });
 
-        let r2 = fut2.await;
-        tx.send(()).unwrap();
-        let (r0, r1, r3) = tokio::join!(fut0, fut1, fut3);
-        assert_eq!(r0, 42);
-        assert_eq!(r1, 42);
-        assert_eq!(r2, 42);
+        let r2 = fut2.await; // As we haven't polled fut0,fut1 yet, this should complete instantly
+
+        let fut_dummy = async move {
+            eprintln!("tx.send");
+            tx.send(()).unwrap();
+            0
+        };
+        let (r0, r1, r3, _dummy) = tokio::join!(fut0, fut1, fut3, fut_dummy);
+
+        assert_eq!((r0, r1), (42, 42));
+        assert_eq!(r2, 1);
         assert_eq!(r3, 420);
 
-        let fut2 = group.request("a".to_string(), || async { 2 });
-        assert_eq!(fut2.await, 1);
+        let fut4 = group.request("a".to_string(), || async { 2 });
+        assert_eq!(fut4.await, 2);
     }
 }
