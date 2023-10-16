@@ -95,6 +95,15 @@ where
     }
 }
 
+impl<T> std::fmt::Debug for Singleflight<T>
+where
+    T: Clone + Send + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Singleflight").finish()
+    }
+}
+
 struct FutureCapturingIntoMutex<T: Clone + Send + 'static>(
     std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>,
 );
