@@ -175,24 +175,29 @@ mod tests {
 
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        let fut0 = group.request("a".to_string(), || {
-            eprintln!("hi3");
-            async move {
-                rx.await.ok();
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                42
-            }
+        eprintln!("fut0");
+        let fut0 = group.request("a".to_string(), || async move {
+            rx.await.ok();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            42
         });
+        eprintln!("fut1");
         let fut1 = group.request("a".to_string(), || async { 0 });
-        let fut2 = group.request("b".to_string(), || async { 420 });
+        eprintln!("fut2");
+        let fut2 = group.request("a".to_string(), || async { 1 });
 
+        eprintln!("fut3");
+        let fut3 = group.request("b".to_string(), || async { 420 });
+
+        let r2 = fut2.await;
         tx.send(()).unwrap();
-        let (r0, r1, r2) = tokio::join!(fut0, fut1, fut2);
+        let (r0, r1, r3) = tokio::join!(fut0, fut1, fut3);
         assert_eq!(r0, 42);
         assert_eq!(r1, 42);
-        assert_eq!(r2, 420);
+        assert_eq!(r2, 42);
+        assert_eq!(r3, 420);
 
-        let fut2 = group.request("a".to_string(), || async { 1 });
+        let fut2 = group.request("a".to_string(), || async { 2 });
         assert_eq!(fut2.await, 1);
     }
 }
