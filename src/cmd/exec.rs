@@ -41,13 +41,19 @@ async fn preflight_check(
         return Ok(());
     }
 
-    let resp = agent
-        .assume_role(crate::proto::AssumeRoleRequest {
-            server_id: args.server.clone(),
-            role: args.role.clone(),
-            cached: !args.no_cache,
-        })
-        .await;
+    let req = crate::proto::AssumeRoleRequest {
+        server_id: args.server.clone(),
+        role: args.role.clone(),
+        cached: !args.no_cache,
+    };
+    let mut resp = agent.assume_role(req.clone()).await;
+
+    if let Err(ref e) = resp {
+        if e.code() == tonic::Code::Unauthenticated {
+            login(agent, args).await?;
+        }
+        resp = agent.assume_role(req.clone()).await;
+    }
 
     match resp {
         Ok(r) => {
@@ -57,18 +63,17 @@ async fn preflight_check(
         }
         Err(e) => {
             tracing::debug!(args = ?args, err = ?e, "preflight check failed");
+            let product = env!("CARGO_PKG_NAME");
+            let server_id = &args.server;
+            let role = &args.role;
+            let code = e.code();
+            let message = e.message();
+            eprintln!(":: {product} :: ERROR, Couldn't obtain AWS credentials for {role} from {server_id} :::::::");
+            eprintln!(":: {product} :: > code={code:?}, message={message}");
             if e.code() == tonic::Code::Unauthenticated {
-                login(agent, args).await
-            } else {
-                let product = env!("CARGO_PKG_NAME");
-                let server_id = &args.server;
-                let role = &args.role;
-                let code = e.code();
-                let message = e.message();
-                eprintln!(":: {product} :: ERROR, Couldn't obtain AWS credentials for {role} from {server_id} :::::::");
-                eprintln!(":: {product} :: > code={code:?}, message={message}");
-                Err(crate::Error::FailureButSilentlyExit.into())
+                eprintln!(":: {product} :: > logged in but still error is unauthenticated");
             }
+            Err(crate::Error::FailureButSilentlyExit.into())
         }
     }
 }
