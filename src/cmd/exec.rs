@@ -29,6 +29,9 @@ pub async fn run(args: &ExecArgs) -> Result<(), anyhow::Error> {
     let mut agent = crate::cmd::agent::connect_or_start().await?;
     preflight_check(&mut agent, args).await?;
     let _provider_shutdown_tx = start_provider(&mut agent, args).await?; // keep provider running
+
+    // TODO: signal handling
+    // TODO: early credential cache refresh to workaround SDK timeouts
     execute(args).await
 }
 
