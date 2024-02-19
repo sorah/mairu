@@ -21,7 +21,7 @@ impl From<&Session> for crate::proto::Session {
 
 #[derive(Clone)]
 pub struct SessionManager {
-    items: std::sync::Arc<std::sync::RwLock<Vec<Session>>>,
+    items: std::sync::Arc<parking_lot::RwLock<Vec<Session>>>,
     next_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
@@ -30,13 +30,13 @@ const MAX_ITEMS: u64 = 4294967295; // u32::MAX
 impl SessionManager {
     pub fn new() -> Self {
         Self {
-            items: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            items: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
     pub fn list(&self) -> Vec<Session> {
-        let items = self.items.read().unwrap();
+        let items = self.items.read();
         let mut result = Vec::with_capacity(items.len());
         for item in items.iter() {
             result.push(item.clone());
@@ -46,7 +46,7 @@ impl SessionManager {
 
     pub fn get(&self, query: &str) -> crate::Result<Session> {
         tracing::trace!(query = ?query, "Attempting to get");
-        let items = self.items.read().unwrap();
+        let items = self.items.read();
         let mut candidate = None;
         for (i, item) in items.iter().enumerate() {
             if query == item.token.server.id() {
@@ -74,7 +74,7 @@ impl SessionManager {
 
     pub fn add(&self, token: crate::token::ServerToken) -> crate::Result<()> {
         tracing::trace!(token = ?token, "Attempting to add");
-        let mut items = self.items.write().unwrap();
+        let mut items = self.items.write();
 
         // Update if a token for the same server exists
         if let Some(i) = find_item_for_update(&items, &token) {
@@ -117,7 +117,7 @@ impl SessionManager {
         let id = u32::from_str(query).ok();
 
         tracing::trace!(query = ?query, "Attempting to remove");
-        let mut items = self.items.write().unwrap();
+        let mut items = self.items.write();
         for (i, item) in items.iter().enumerate() {
             if id == Some(item.id)
                 || query == item.token.server.id()

@@ -83,6 +83,8 @@ impl crate::proto::agent_server::Agent for Agent {
             }
         };
 
+        // tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
         if request.get_ref().cached {
             if let Some(cache) = session.credential_cache.get(role) {
                 tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?cache.credentials.access_key_id, ext = ?cache.credentials.mairu, "Vending credentials from cache");

@@ -22,6 +22,7 @@ where
             inner: std::sync::Arc::new(EcsServerInner {
                 bearer_token: generate_bearer_token(),
                 backend: AgentBackend { agent, request },
+                coalesce_group: crate::singleflight::Singleflight::new(),
                 feedback,
             }),
         }
@@ -50,17 +51,21 @@ where
 #[derive(Debug)]
 struct EcsServerInner<B, U>
 where
-    B: Backend,
+    B: Backend + Send + Sync + Clone + std::fmt::Debug,
     U: UserFeedbackDelegate,
 {
     bearer_token: secrecy::SecretString,
     backend: B,
     feedback: U,
+    coalesce_group: crate::singleflight::Singleflight<
+        u8,
+        std::sync::Arc<Result<crate::proto::AssumeRoleResponse, BackendRequestError>>,
+    >,
 }
 
 impl<B, U> EcsServerInner<B, U>
 where
-    B: Backend,
+    B: Backend + Send + Sync + Clone + 'static,
     U: UserFeedbackDelegate,
 {
     fn verify_token(&self, other: &secrecy::SecretString) -> crate::Result<()> {
@@ -80,11 +85,29 @@ where
 
         Err(crate::Error::AuthError("unauthorized".to_owned()))
     }
+
+    async fn request(
+        &self,
+    ) -> std::sync::Arc<Result<crate::proto::AssumeRoleResponse, BackendRequestError>> {
+        self.coalesce_group
+            .request(0, || {
+                tracing::debug!(server = ?self, "requesting credentials to backend");
+                let mut backend = self.backend.clone();
+                async move { backend.request_arc().await }
+            })
+            .await
+    }
 }
 
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync + Clone + std::fmt::Debug {
     async fn request(&mut self) -> Result<crate::proto::AssumeRoleResponse, BackendRequestError>;
+
+    async fn request_arc(
+        &mut self,
+    ) -> std::sync::Arc<Result<crate::proto::AssumeRoleResponse, BackendRequestError>> {
+        std::sync::Arc::new(self.request().await)
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -171,7 +194,7 @@ fn generate_bearer_token() -> secrecy::SecretString {
 }
 
 #[tracing::instrument(skip_all)]
-async fn handle_get_credentials<B: Backend, U: UserFeedbackDelegate>(
+async fn handle_get_credentials<B: Backend + 'static, U: UserFeedbackDelegate>(
     crate::ext_axum::ExtractBearer {
         value: bearer,
         source: _,
@@ -191,8 +214,9 @@ async fn handle_get_credentials<B: Backend, U: UserFeedbackDelegate>(
             .into_response());
     }
 
-    let mut backend = server.backend.clone();
-    match backend.request().await {
+    tracing::debug!(server = ?server, "received credentials request");
+    let resp = server.request().await;
+    match resp.as_ref() {
         Err(be) => {
             tracing::debug!(err = ?be, server = ?server, "ecs_server backend returned error during credential retrieval");
             let code = match &be {
