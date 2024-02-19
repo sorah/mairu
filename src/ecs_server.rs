@@ -77,8 +77,7 @@ where
             .expose_secret()
             .as_bytes()
             .ct_eq(other.expose_secret().as_ref())
-            .unwrap_u8()
-            == 1
+            .into()
         {
             return Ok(());
         }
