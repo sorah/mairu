@@ -12,14 +12,14 @@ tonic-build = "0.11.0"
 anyhow = { version = "1.0.80", features = ["backtrace"] }
 async-recursion = "1.0.5"
 async-trait = "0.1.77"
-axum = { version = "0.6.20", features = ["tracing", "macros", "query", "headers"] }
+axum = { version = "0.7.4", features = ["tracing", "macros", "query"] }
 base64 = "0.21.7"
 base64ct = { version = "1.6.0", features = ["alloc", "std"] }
 chrono = { version = "0.4.34", features = ["serde"] }
 clap = { version = "4.5.1", features = ["cargo", "derive"] }
 daemonize = "0.5.0"
-headers = "0.3.9"
-hyper = { version = "0.14.28", features = ["tcp", "server"] }
+headers = "0.4.0"
+hyper = { version = "1.1.0", features = ["http1", "server"] }
 libc = "0.2.153"
 nix = { version = "0.27.1", features = ["resource", "process", "ptrace", "mman", "fs"] }
 oauth2 = "4.4.2"

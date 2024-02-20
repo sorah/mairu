@@ -1,8 +1,5 @@
 /// Axum extractor for Bearer token per [RFC 6750][]
 ///
-/// A given authentication scheme in Authorization header must exactly be `Bearer` (case sensitive).
-/// This is due to https://github.com/hyperium/headers/issues/112 and is a deviation from [RFC 9110 Section 11.1.][rfc9110].
-///
 /// [RFC 6750]: https://datatracker.ietf.org/doc/html/rfc6750
 /// [rfc9110]: https://datatracker.ietf.org/doc/html/rfc9110#section-11.1
 #[derive(Debug)]
@@ -117,7 +114,6 @@ impl axum::response::IntoResponse for ExtractBearerRejection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower::Service; // for `call`
     use tower::ServiceExt; // for `oneshot` and `ready`
 
     mod extract_bearer {
@@ -137,9 +133,9 @@ mod tests {
         }
 
         async fn do_request_and_body(req: axum::http::Request<axum::body::Body>) -> String {
-            let resp = app().ready().await.unwrap().call(req).await.unwrap();
+            let resp = app().oneshot(req).await.unwrap();
             String::from_utf8(
-                hyper::body::to_bytes(resp.into_body())
+                axum::body::to_bytes(resp.into_body(), usize::MAX)
                     .await
                     .unwrap()
                     .to_vec(),
@@ -165,7 +161,7 @@ mod tests {
                 .header("Authorization", "Basic Zm9vOmJhcg==") // foo:bar
                 .body(axum::body::Body::empty())
                 .unwrap();
-            let resp = app().ready().await.unwrap().call(req).await.unwrap();
+            let resp = app().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), 400);
         }
 
@@ -185,7 +181,7 @@ mod tests {
                 .uri("/?a==")
                 .body(axum::body::Body::empty())
                 .unwrap();
-            let resp = app().ready().await.unwrap().call(req).await.unwrap();
+            let resp = app().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), 400);
         }
 
@@ -195,7 +191,7 @@ mod tests {
                 .uri("/")
                 .body(axum::body::Body::empty())
                 .unwrap();
-            let resp = app().ready().await.unwrap().call(req).await.unwrap();
+            let resp = app().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), 400);
         }
 
@@ -206,7 +202,7 @@ mod tests {
                 .header("Authorization", "Bearer hedda2")
                 .body(axum::body::Body::empty())
                 .unwrap();
-            let resp = app().ready().await.unwrap().call(req).await.unwrap();
+            let resp = app().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), 400);
         }
         #[tokio::test]
@@ -215,7 +211,7 @@ mod tests {
                 .uri("/?access_token=kueri&access_token=kueri2")
                 .body(axum::body::Body::empty())
                 .unwrap();
-            let resp = app().ready().await.unwrap().call(req).await.unwrap();
+            let resp = app().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), 400);
         }
         #[tokio::test]
@@ -225,7 +221,7 @@ mod tests {
                 .header("Authorization", "Bearer hedda")
                 .body(axum::body::Body::empty())
                 .unwrap();
-            let resp = app().ready().await.unwrap().call(req).await.unwrap();
+            let resp = app().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), 400);
         }
     }

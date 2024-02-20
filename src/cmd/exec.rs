@@ -124,7 +124,6 @@ async fn ecs_provider_start(
     args: &ExecArgs,
 ) -> Result<(), anyhow::Error> {
     let (listener, url) = crate::ecs_server::bind_tcp(None).await?;
-    let axum_server = axum::Server::from_tcp(listener.into_std()?)?;
     let server = crate::ecs_server::EcsServer::new_with_agent(
         agent.clone(),
         crate::proto::AssumeRoleRequest {
@@ -143,8 +142,7 @@ async fn ecs_provider_start(
         );
     }
     tokio::spawn(async move {
-        axum_server
-            .serve(server.router().into_make_service())
+        axum::serve(listener, server.router())
             .with_graceful_shutdown(async {
                 shutdown_rx.await.ok();
                 tracing::trace!("ECS Server shutting down");

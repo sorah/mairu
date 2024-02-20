@@ -141,6 +141,8 @@ pub async fn listen_for_callback(
     session: crate::proto::InitiateOAuthCodeResponse,
     agent: &crate::agent::AgentConn,
 ) -> crate::Result<()> {
+    use std::future::IntoFuture;
+
     // crate::token::ServerToken
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -152,12 +154,12 @@ pub async fn listen_for_callback(
         .layer(axum::extract::Extension(conn))
         .layer(axum::extract::Extension(context));
 
-    let server = axum::Server::from_tcp(listener.into_std()?)?
-        .serve(app.into_make_service())
+    let server = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             shutdown_rx.await.ok();
             tracing::trace!("Server shutting down");
-        });
+        })
+        .into_future();
 
     tracing::debug!("Server started");
 
