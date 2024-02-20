@@ -2,7 +2,11 @@
   - directory trust
   - auto install server configuration
   - $AWS_REGION
+- jump through local server to redirect_url
 - aws sso mode
 - device grant
 - docker provider mode
 - mairu_tty
+- exec
+  - warn when preflight taking time
+- signals
