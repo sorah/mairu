@@ -223,7 +223,7 @@ async fn static_provider_set(
 async fn execute(args: &ExecArgs) -> Result<(), anyhow::Error> {
     let arg0 = args
         .command
-        .get(0)
+        .first()
         .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?;
     let status = tokio::process::Command::new(arg0)
         .args(&args.command[1..])

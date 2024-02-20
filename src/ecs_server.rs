@@ -221,17 +221,17 @@ async fn handle_get_credentials<B: Backend + 'static, U: UserFeedbackDelegate>(
             let code = match &be {
                 BackendRequestError::Unauthorized(e) => {
                     tracing::warn!(err = ?e, err_human = %e, server = ?server, "credential request was denied (unauthorized)");
-                    server.feedback.on_error(&be);
+                    server.feedback.on_error(be);
                     axum::http::StatusCode::SERVICE_UNAVAILABLE
                 }
                 BackendRequestError::Forbidden(e) => {
                     tracing::warn!(err = ?e, err_human = %e, server = ?server, "credential request was denied (forbidden)");
-                    server.feedback.on_error(&be);
+                    server.feedback.on_error(be);
                     axum::http::StatusCode::FORBIDDEN
                 }
                 BackendRequestError::Unknown(e) => {
                     tracing::warn!(err = ?e, err_human = %e, server = ?server, "credential request returned an unknown error");
-                    server.feedback.on_error(&be);
+                    server.feedback.on_error(be);
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR
                 }
             };
