@@ -1,6 +1,7 @@
 - auto mode
   - directory trust
   - auto install server configuration
+  - $AWS_REGION
 - aws sso mode
 - device grant
 - docker provider mode
