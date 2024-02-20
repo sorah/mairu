@@ -22,6 +22,9 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
 
     match &cli.command {
         Commands::Agent(a) => {
+            if let Ok(l) = std::env::var("MAIRU_AGENT_LOG") {
+                std::env::set_var("MAIRU_LOG", l);
+            }
             if a.log_to_file {
                 enable_log(LogType::File)
             } else {
