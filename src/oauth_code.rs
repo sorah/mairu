@@ -190,6 +190,9 @@ struct CallbackQuery {
     state: String,
 }
 
+/// HTML <head> to supress favicon.ico request
+const HTML_PREAMBLE: &'static str = r#"<!DOCTYPE html><html><head><link rel="icon" href="data:;base64,iVBORw0KGgo="><style>body { font-family: monospace; }</style></head><body>"#;
+
 #[tracing::instrument(skip_all)]
 async fn callback(
     query: axum::extract::Query<CallbackQuery>,
@@ -197,7 +200,11 @@ async fn callback(
         std::sync::Arc<OneoffServerContext>,
     >,
     axum::extract::Extension(mut agent): axum::extract::Extension<crate::agent::AgentConn>,
-) -> axum::response::Result<(axum::http::StatusCode, String)> {
+) -> axum::response::Result<(
+    axum::http::StatusCode,
+    [(&'static str, &'static str); 1],
+    String,
+)> {
     tracing::debug!("Processing oauth2 callback");
     let completion = agent
         .complete_oauth_code(tonic::Request::new(
@@ -216,8 +223,10 @@ async fn callback(
             tracing::error!(e = ?e, "CompleteOauthCode RPC returned an error");
             return Ok((
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", "text/html; charset=utf-8")],
                 format!(
-                    "Error, agent response; status={}, message={}",
+                    "{}Error, agent response; status={}, message={}",
+                    HTML_PREAMBLE,
                     e.code(),
                     e.message()
                 ),
@@ -227,5 +236,9 @@ async fn callback(
 
     context.result_tx.send(()).await.ok();
 
-    Ok((axum::http::StatusCode::OK, "ok".to_owned()))
+    Ok((
+        axum::http::StatusCode::OK,
+        [("content-type", "text/html; charset=utf-8")],
+        format!("{}ok", HTML_PREAMBLE),
+    ))
 }
