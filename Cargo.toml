@@ -13,7 +13,7 @@ anyhow = { version = "1.0.80", features = ["backtrace"] }
 async-recursion = "1.0.5"
 async-trait = "0.1.77"
 axum = { version = "0.7.4", features = ["tracing", "macros", "query"] }
-base64 = "0.21.7"
+base64 = "0.22.1"
 base64ct = { version = "1.6.0", features = ["alloc", "std"] }
 chrono = { version = "0.4.34", features = ["serde"] }
 clap = { version = "4.5.1", features = ["cargo", "derive"] }
@@ -21,7 +21,7 @@ daemonize = "0.5.0"
 headers = "0.4.0"
 hyper = { version = "1.1.0", features = ["http1", "server"] }
 libc = "0.2.153"
-nix = { version = "0.27.1", features = ["resource", "process", "ptrace", "mman", "fs"] }
+nix = { version = "0.29.0", features = ["resource", "process", "ptrace", "mman", "fs"] }
 oauth2 = "4.4.2"
 once_cell = { version = "1.19.0", features = ["parking_lot"] }
 parking_lot = "0.12.1"
