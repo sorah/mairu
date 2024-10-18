@@ -6,7 +6,7 @@ license = "Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [build-dependencies]
-tonic-build = "0.11.0"
+tonic-build = "0.12.3"
 
 [dependencies]
 anyhow = { version = "1.0.80", features = ["backtrace"] }
@@ -20,14 +20,15 @@ clap = { version = "4.5.1", features = ["cargo", "derive"] }
 daemonize = "0.5.0"
 headers = "0.4.0"
 hyper = { version = "1.1.0", features = ["http1", "server"] }
+hyper-util = "0.1.9"
 libc = "0.2.153"
 nix = { version = "0.29.0", features = ["resource", "process", "ptrace", "mman", "fs"] }
 oauth2 = "5.0.0-rc.1"
 once_cell = { version = "1.19.0", features = ["parking_lot"] }
 parking_lot = "0.12.1"
 process_path = "0.1.4"
-prost = "0.12.3"
-prost-types = "0.12.3"
+prost = "0.13.3"
+prost-types = "0.13.3"
 rand = "0.8.5"
 reqwest = { version = "0.12.8", features = ["json"] }
 secrecy = { version = "0.10.0", features = ["serde"] }
@@ -37,8 +38,8 @@ subtle = { version = "2.5.0", features = ["core_hint_black_box"] }
 thiserror = "1.0.57"
 tokio = { version = "1.36.0", features = ["full"] }
 tokio-stream = { version = "0.1.14", features = ["net"] }
-tonic = "0.11.0"
-tower = { version = "0.4.13", features = ["tracing"] }
+tonic = "0.12.3"
+tower = { version = "0.5.1", features = ["tracing"] }
 tracing = { version = "0.1.40", features = ["attributes"] }
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.18", features = ["fmt", "env-filter", "local-time", "json", "time"] }

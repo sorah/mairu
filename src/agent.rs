@@ -229,7 +229,12 @@ pub async fn connect_to_agent_with_path(
     let path = path_.as_ref().to_path_buf();
     let ch = tonic::transport::Endpoint::try_from("http://[::]:50051")?
         .connect_with_connector(tower::service_fn(move |_| {
-            tokio::net::UnixStream::connect(path.clone())
+            let path = path.clone();
+            async {
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
+                    tokio::net::UnixStream::connect(path).await?,
+                ))
+            }
         }))
         .await?;
 
