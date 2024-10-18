@@ -105,7 +105,7 @@ pub struct AssumeRoleResponseMairuExt {
     pub no_cache: bool,
 }
 
-fn http() -> reqwest::Client {
+pub(crate) fn http() -> reqwest::Client {
     static HTTP: once_cell::sync::OnceCell<reqwest::Client> = once_cell::sync::OnceCell::new();
     HTTP.get_or_init(|| {
         reqwest::ClientBuilder::new()
@@ -114,6 +114,7 @@ fn http() -> reqwest::Client {
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION")
             ))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap()
     })

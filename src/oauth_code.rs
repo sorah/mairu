@@ -55,13 +55,12 @@ impl OAuthCodeFlow {
         if self.csrf_token.secret() != &completion.state {
             return Err(crate::Error::AuthError("csrf detected".to_owned()));
         }
-        let resp = client
+        let req = client
             .exchange_code(oauth2::AuthorizationCode::new(completion.code))
             .set_pkce_verifier(oauth2::PkceCodeVerifier::new(
                 self.pkce_verifier.expose_secret().to_owned(),
-            ))
-            .request_async(oauth2::reqwest::async_http_client)
-            .await?;
+            ));
+        let resp = req.request_async(&crate::client::http()).await?;
         Ok(crate::token::ServerToken::from_token_response(
             self.server.clone(),
             resp,
@@ -89,32 +88,41 @@ fn generate_pkce_challenge() -> (oauth2::PkceCodeChallenge, secrecy::SecretStrin
 
 fn oauth2_client_from_server(
     server: &crate::config::Server,
-) -> crate::Result<crate::ext_oauth2::SecrecyClient> {
+) -> crate::Result<
+    crate::ext_oauth2::SecrecyClient<
+        oauth2::EndpointSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointSet,
+    >,
+> {
     let (oauth, code_grant) = server.try_oauth_code_grant()?;
 
-    Ok(crate::ext_oauth2::SecrecyClient::new(
-        oauth2::ClientId::new(oauth.client_id.clone()),
-        Some(oauth2::ClientSecret::new(
-            oauth
-                .client_secret
-                .clone()
-                .ok_or_else(|| crate::Error::ConfigError(format!("Server '{}' is missing OAuth 2.0 Client Secret; Required for Authorization Code Grant", server.id())))?
-        )),
-        oauth2::AuthUrl::from_url(
+    let client = crate::ext_oauth2::SecrecyClient::new(oauth2::ClientId::new(oauth.client_id.clone()))
+        .set_client_secret(
+            oauth2::ClientSecret::new(
+                oauth
+                    .client_secret
+                    .clone()
+                    .ok_or_else(|| crate::Error::ConfigError(format!("Server '{}' is missing OAuth 2.0 Client Secret; Required for Authorization Code Grant", server.id())))?
+            )
+        )
+        .set_auth_uri(oauth2::AuthUrl::from_url(
             code_grant
                 .authorization_endpoint
                 .clone()
                 .map(Ok)
                 .unwrap_or_else(|| server.url.join("oauth/authorize"))?,
-        ),
-        Some(oauth2::TokenUrl::from_url(
-            oauth
-                .token_endpoint
-                .clone()
-                .map(Ok)
-                .unwrap_or_else(|| server.url.join("oauth/token"))?,
         ))
-    ))
+        .set_token_uri(oauth2::TokenUrl::from_url(
+                    oauth
+                        .token_endpoint
+                        .clone()
+                        .map(Ok)
+                        .unwrap_or_else(|| server.url.join("oauth/token"))?,
+        ));
+    Ok(client)
 }
 
 pub async fn bind_tcp_for_callback(

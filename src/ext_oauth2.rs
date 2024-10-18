@@ -1,10 +1,20 @@
-pub type SecrecyClient = oauth2::Client<
+pub type SecrecyClient<
+    HasAuthUrl = oauth2::EndpointNotSet,
+    HasDeviceAuthUrl = oauth2::EndpointNotSet,
+    HasIntrospectionUrl = oauth2::EndpointNotSet,
+    HasRevocationUrl = oauth2::EndpointNotSet,
+    HasTokenUrl = oauth2::EndpointNotSet,
+> = oauth2::Client<
     oauth2::basic::BasicErrorResponse,
     SecrecyTokenResponse,
-    oauth2::basic::BasicTokenType,
     oauth2::basic::BasicTokenIntrospectionResponse,
     oauth2::StandardRevocableToken,
     oauth2::basic::BasicRevocationErrorResponse,
+    HasAuthUrl,
+    HasDeviceAuthUrl,
+    HasIntrospectionUrl,
+    HasRevocationUrl,
+    HasTokenUrl,
 >;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -25,7 +35,8 @@ fn default_dummy_at() -> oauth2::AccessToken {
     oauth2::AccessToken::new("dummyaccesstokendummy".to_owned())
 }
 
-impl oauth2::TokenResponse<oauth2::basic::BasicTokenType> for SecrecyTokenResponse {
+impl oauth2::TokenResponse for SecrecyTokenResponse {
+    type TokenType = oauth2::basic::BasicTokenType;
     fn access_token(&self) -> &oauth2::AccessToken {
         &self.dummy_at
     }
