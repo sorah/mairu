@@ -82,11 +82,11 @@ where
             (Some(_), Some(_)) => Err(ExtractBearerRejection::Unambiguous),
             (Some(q), None) => Ok(ExtractBearer {
                 source: BearerSource::Query,
-                value: secrecy::SecretString::new(q.as_ref().to_owned()),
+                value: secrecy::SecretString::new(q.as_ref().to_owned().into()),
             }),
             (None, Some(h)) => Ok(ExtractBearer {
                 source: BearerSource::Header,
-                value: secrecy::SecretString::new(h.token().to_owned()),
+                value: secrecy::SecretString::new(h.token().to_owned().into()),
             }),
         }
     }
