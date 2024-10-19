@@ -35,6 +35,7 @@ pub async fn login(
 
     match oauth_grant_type {
         crate::config::OAuthGrantType::Code => do_oauth_code(agent, server).await,
+        crate::config::OAuthGrantType::AwsSso => todo!(),
     }
 }
 

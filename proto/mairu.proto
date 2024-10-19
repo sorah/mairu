@@ -26,6 +26,8 @@ service Agent {
   // rpc RemoveSession(RemoveSessionRequest) returns (RemoveSessionResponse)
   rpc InitiateOauthCode(InitiateOAuthCodeRequest) returns (InitiateOAuthCodeResponse);
   rpc CompleteOauthCode(CompleteOAuthCodeRequest) returns (CompleteOAuthCodeResponse);
+
+  rpc RefreshAwsSsoClientRegistration(RefreshAwsSsoClientRegistrationRequest) returns (RefreshAwsSsoClientRegistrationResponse);
 }
 
 message PingAgentRequest {
@@ -79,4 +81,10 @@ message CompleteOAuthCodeRequest {
   string state = 3;
 }
 message CompleteOAuthCodeResponse {
+}
+
+message RefreshAwsSsoClientRegistrationRequest {
+  string server_id = 1;
+}
+message RefreshAwsSsoClientRegistrationResponse {
 }

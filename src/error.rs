@@ -39,6 +39,9 @@ pub enum Error {
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
 
+    #[error(transparent)]
+    AwsSsooidcError(#[from] aws_sdk_ssooidc::Error),
+
     #[error("ApiError({url}): {message}; {status_code:}")]
     ApiError {
         url: url::Url,

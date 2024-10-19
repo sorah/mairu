@@ -12,6 +12,8 @@ tonic-build = "0.12.3"
 anyhow = { version = "1.0.80", features = ["backtrace"] }
 async-recursion = "1.0.5"
 async-trait = "0.1.77"
+aws-config = { version = "1.5.8", features = ["behavior-version-latest"] }
+aws-sdk-ssooidc = "1.47.0"
 axum = { version = "0.7.4", features = ["tracing", "macros", "query"] }
 base64 = "0.22.1"
 base64ct = { version = "1.6.0", features = ["alloc", "std"] }
@@ -34,6 +36,7 @@ reqwest = { version = "0.12.8", features = ["json"] }
 secrecy = { version = "0.10.0", features = ["serde"] }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.114"
+sha2 = "0.10.8"
 subtle = { version = "2.5.0", features = ["core_hint_black_box"] }
 thiserror = "1.0.57"
 tokio = { version = "1.36.0", features = ["full"] }

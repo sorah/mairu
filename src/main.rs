@@ -14,6 +14,8 @@ enum Commands {
     CredentialProcess(mairu::cmd::credential_process::CredentialProcessArgs),
     ListSessions,
     Exec(mairu::cmd::exec::ExecArgs),
+
+    SetupSso(mairu::cmd::setup_sso::SetupSsoArgs),
 }
 
 fn main() -> Result<std::process::ExitCode, anyhow::Error> {
@@ -41,6 +43,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::CredentialProcess(args) => mairu::cmd::credential_process::run(args),
         Commands::ListSessions => mairu::cmd::list_sessions::run(),
         Commands::Exec(args) => mairu::cmd::exec::run(args),
+        Commands::SetupSso(args) => mairu::cmd::setup_sso::run(args),
     };
     match retval {
         Ok(_) => Ok(std::process::ExitCode::SUCCESS),
