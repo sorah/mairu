@@ -1,72 +1,36 @@
-/// Client for Mairu API (Credentials Vendor HTTP API)
-///
-/// Note: See agent.rs for mairu agent client
-pub struct Client {
-    pub server_id: String,
-    pub url: url::Url,
-    bearer_token: secrecy::SecretString,
+pub(crate) trait CredentialVendor {
+    fn assume_role(
+        &self,
+        role: &str,
+    ) -> impl std::future::Future<Output = crate::Result<crate::client::AssumeRoleResponse>> + Send;
 }
 
-impl std::fmt::Debug for Client {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Client")
-            .field("url", &self.url.as_str())
-            .finish()
-    }
+pub(crate) enum CredentialClient {
+    Api(crate::api_client::Client),
+    AwsSso(crate::awssso_client::Client),
 }
 
-impl From<crate::token::ServerToken> for Client {
-    fn from(token: crate::token::ServerToken) -> Client {
-        Client::from(&token)
-    }
-}
-
-impl From<&crate::token::ServerToken> for Client {
-    fn from(token: &crate::token::ServerToken) -> Client {
-        Client {
-            server_id: token.server.id().to_owned(),
-            url: token.server.url.clone(),
-            bearer_token: token.access_token.clone(),
+impl CredentialVendor for CredentialClient {
+    async fn assume_role(&self, role: &str) -> crate::Result<crate::client::AssumeRoleResponse> {
+        match self {
+            CredentialClient::Api(c) => c.assume_role(role).await,
+            CredentialClient::AwsSso(c) => c.assume_role(role).await,
         }
     }
 }
 
-impl Client {
-    #[tracing::instrument]
-    pub async fn assume_role(&self, role: &str) -> crate::Result<AssumeRoleResponse> {
-        use secrecy::ExposeSecret;
-        let req = AssumeRoleRequest { role };
-        let url = self.url.join("assume-role")?;
-
-        tracing::debug!(req = ?req, url = %url, server_id = &self.server_id, "requesting");
-        let resp = http()
-            .post(url.clone())
-            .bearer_auth(self.bearer_token.expose_secret())
-            .header(reqwest::header::ACCEPT, "application/json")
-            .body(serde_json::to_vec(&req)?)
-            .send()
-            .await?;
-
-        if let Err(e) = resp.error_for_status_ref() {
-            let e1 = crate::Error::ApiError {
-                url: url.clone(),
-                status_code: e.status().unwrap(),
-                message: resp.text().await.unwrap_or_default(),
-            };
-            tracing::error!(req = ?req, url = %url, server_id = &self.server_id, err0 = ?e, err = %e1, "assume-role response was not ok");
-            return Err(e1);
-        }
-
-        let credentials = resp.json::<AssumeRoleResponse>().await?;
-        tracing::debug!(req = ?req, url = %url, server_id = &self.server_id, credentials = ?credentials, "response");
-        Ok(credentials)
+pub(crate) fn make_credential_vendor(
+    session: &crate::session_manager::Session,
+) -> crate::Result<CredentialClient> {
+    if session.token.server.aws_sso.is_some() {
+        Ok(CredentialClient::AwsSso(
+            crate::awssso_client::Client::try_from(session.token.as_ref())?,
+        ))
+    } else {
+        Ok(CredentialClient::Api(crate::api_client::Client::from(
+            session.token.as_ref(),
+        )))
     }
-}
-
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "PascalCase")]
-struct AssumeRoleRequest<'a> {
-    role: &'a str,
 }
 
 /// https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html
@@ -103,6 +67,22 @@ impl From<&AssumeRoleResponse> for crate::proto::AssumeRoleResponse {
 pub struct AssumeRoleResponseMairuExt {
     #[serde(default)]
     pub no_cache: bool,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Invalid Argument: {0}")]
+    InvalidArgument(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Unauthenticated: {0}")]
+    Unauthenticated(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Resource exhausted: {0}")]
+    ResourceExhausted(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Not found: {0}")]
+    NotFound(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Unknown: {0} ({1})")]
+    Unknown(String, #[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 pub(crate) fn http() -> reqwest::Client {

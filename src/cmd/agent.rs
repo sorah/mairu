@@ -11,6 +11,7 @@ pub fn run(args: &AgentArgs) -> Result<(), anyhow::Error> {
     let path = crate::config::socket_path();
 
     protect_process();
+    crate::config::cache_dir_mkpath()?;
 
     if args.daemonize {
         serve_on_path_daemon(path)

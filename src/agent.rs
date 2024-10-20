@@ -69,6 +69,8 @@ impl crate::proto::agent_server::Agent for Agent {
         &self,
         request: tonic::Request<AssumeRoleRequest>,
     ) -> Result<tonic::Response<AssumeRoleResponse>, tonic::Status> {
+        use crate::client::CredentialVendor;
+
         let query = &request.get_ref().server_id;
         let role = &request.get_ref().role;
         let Ok(session) = self.session_manager.get(query) else {
@@ -92,7 +94,10 @@ impl crate::proto::agent_server::Agent for Agent {
             }
         }
         tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Obtaining credentials from server");
-        let client = crate::client::Client::from(session.token.as_ref());
+        let client = crate::client::make_credential_vendor(&session).map_err(|e| {
+            tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, err = ?e, "Failed to make_credential_vendor");
+            tonic::Status::internal(e.to_string())
+        })?;
         match client.assume_role(role).await {
             Ok(r) => {
                 if request.get_ref().cached {
@@ -101,23 +106,24 @@ impl crate::proto::agent_server::Agent for Agent {
                 tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?r.access_key_id, ext = ?r.mairu, "Vending credentials from server");
                 Ok(tonic::Response::new((&r).into()))
             }
-            Err(crate::Error::ApiError {
-                url: _url,
-                status_code,
-                message,
-            }) => match status_code {
-                reqwest::StatusCode::BAD_REQUEST => Err(tonic::Status::invalid_argument(message)),
-                reqwest::StatusCode::UNAUTHORIZED => Err(tonic::Status::unauthenticated(message)),
-                reqwest::StatusCode::FORBIDDEN => Err(tonic::Status::permission_denied(message)),
-                reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                    Err(tonic::Status::resource_exhausted(message))
-                }
-                reqwest::StatusCode::NOT_FOUND => Err(tonic::Status::not_found(message)),
-                _ => Err(tonic::Status::unknown(format!(
-                    "{}: {}",
-                    status_code, message
-                ))),
-            },
+            Err(crate::Error::RemoteError(crate::client::Error::InvalidArgument(message, _))) => {
+                Err(tonic::Status::invalid_argument(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::Unauthenticated(message, _))) => {
+                Err(tonic::Status::unauthenticated(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::PermissionDenied(message, _))) => {
+                Err(tonic::Status::permission_denied(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::ResourceExhausted(message, _))) => {
+                Err(tonic::Status::resource_exhausted(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::NotFound(message, _))) => {
+                Err(tonic::Status::not_found(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::Unknown(message, _))) => {
+                Err(tonic::Status::unknown(message))
+            }
             Err(e) => {
                 tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, err = ?e, "assume-role API returned error");
                 Err(tonic::Status::unknown(e.to_string()))
@@ -187,33 +193,159 @@ impl crate::proto::agent_server::Agent for Agent {
         let Some(flow0) = self.auth_flow_manager.retrieve(&req.handle) else {
             return Err(tonic::Status::not_found("flow handle not found"));
         };
-
-        let crate::auth_flow_manager::AuthFlow::OAuthCode(flow) = flow0.as_ref() else {
-            return Err(tonic::Status::invalid_argument(
-                "flow handle is not for the grant type",
-            ));
+        let completion = {
+            let crate::auth_flow_manager::AuthFlow::OAuthCode(flow) = flow0.as_ref() else {
+                return Err(tonic::Status::invalid_argument(
+                    "flow handle is not for the grant type",
+                ));
+            };
+            tracing::debug!(flow = ?flow0.as_ref(), "Completing OAuth 2.0 Authorization Code flow...");
+            flow.complete(request.into_inner()).await
         };
 
-        tracing::debug!(flow = ?flow0.as_ref(), "Completing OAuth 2.0 Authorization Code flow...");
+        self.accept_completed_auth_flow(flow0, completion)?;
 
-        let token = match flow.complete(request.into_inner()).await {
+        Ok(tonic::Response::new(CompleteOAuthCodeResponse {}))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn refresh_aws_sso_client_registration(
+        &self,
+        request: tonic::Request<RefreshAwsSsoClientRegistrationRequest>,
+    ) -> Result<tonic::Response<RefreshAwsSsoClientRegistrationResponse>, tonic::Status> {
+        let req = request.get_ref();
+
+        let mut server = match crate::config::Server::find_from_fs(&req.server_id).await {
+            Ok(server) => server,
+            Err(crate::Error::ConfigError(e)) => return Err(tonic::Status::internal(e)),
+            Err(crate::Error::UserError(e)) => return Err(tonic::Status::not_found(e)),
+            Err(e) => return Err(tonic::Status::internal(e.to_string())),
+        };
+
+        tracing::info!(server_id = ?server.id(), server_url = %server.url, "Refreshing AWS SSO Client Registration");
+
+        // XXX: validate checks .oauth existence...
+        //server.validate().map_err(|e| {
+        //    tonic::Status::failed_precondition(format!(
+        //        "Server '{}' has invalid configuration; {:}",
+        //        server.id(),
+        //        e,
+        //    ))
+        //})?;
+
+        server.ensure_aws_sso_oauth_client_registration(true)
+            .await
+            .map_err(|e| {
+                tracing::error!(err = ?e, server_id = server.id(), "error while refreshing oauth client registration");
+                tonic::Status::internal(format!("error while refreshing oauth client registration: {e}"))
+            })?;
+
+        Ok(tonic::Response::new(
+            RefreshAwsSsoClientRegistrationResponse {},
+        ))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn initiate_aws_sso_device(
+        &self,
+        request: tonic::Request<InitiateAwsSsoDeviceRequest>,
+    ) -> Result<tonic::Response<InitiateAwsSsoDeviceResponse>, tonic::Status> {
+        let req = request.get_ref();
+
+        let mut server = match crate::config::Server::find_from_fs(&req.server_id).await {
+            Ok(server) => server,
+            Err(crate::Error::ConfigError(e)) => return Err(tonic::Status::internal(e)),
+            Err(crate::Error::UserError(e)) => return Err(tonic::Status::not_found(e)),
+            Err(e) => return Err(tonic::Status::internal(e.to_string())),
+        };
+
+        server.ensure_aws_sso_oauth_client_registration(false)
+            .await
+            .map_err(|e| {
+                tracing::error!(err = ?e, server_id = server.id(), "error while refreshing oauth client registration");
+                tonic::Status::internal(format!("error while refreshing oauth client registration: {e}"))
+            })?;
+
+        server.validate().map_err(|e| {
+            tonic::Status::failed_precondition(format!(
+                "Server '{}' has invalid configuration; {:}",
+                server.id(),
+                e,
+            ))
+        })?;
+
+        let flow = crate::oauth_awssso::AwsSsoDeviceFlow::initiate(&server)
+            .await
+            .map_err(|e| {
+                tracing::error!(err = ?e, "AwsSsoDeviceFlow initiate failure");
+                tonic::Status::internal(e.to_string())
+            })?;
+
+        let response = (&flow).into();
+
+        tracing::debug!(flow = ?flow, "Initiated AWS SSO Device Grant flow");
+        self.auth_flow_manager
+            .store(crate::auth_flow_manager::AuthFlow::AwsSsoDevice(flow));
+
+        return Ok(tonic::Response::new(response));
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn complete_aws_sso_device(
+        &self,
+        request: tonic::Request<CompleteAwsSsoDeviceRequest>,
+    ) -> Result<tonic::Response<CompleteAwsSsoDeviceResponse>, tonic::Status> {
+        let req = request.get_ref();
+        let Some(flow0) = self.auth_flow_manager.retrieve(&req.handle) else {
+            return Err(tonic::Status::not_found("flow handle not found"));
+        };
+        let completion = {
+            let crate::auth_flow_manager::AuthFlow::AwsSsoDevice(flow) = flow0.as_ref() else {
+                return Err(tonic::Status::invalid_argument(
+                    "flow handle is not for the grant type",
+                ));
+            };
+            tracing::trace!(flow = ?flow0.as_ref(), "Completing AWS SSO Device Grant flow...");
+            flow.complete().await
+        };
+
+        self.accept_completed_auth_flow(flow0, completion)?;
+
+        Ok(tonic::Response::new(CompleteAwsSsoDeviceResponse {}))
+    }
+}
+
+impl Agent {
+    fn accept_completed_auth_flow(
+        &self,
+        flow: crate::auth_flow_manager::AuthFlowRetrieval,
+        completion: crate::Result<crate::token::ServerToken>,
+    ) -> tonic::Result<()> {
+        let token = match completion {
             Ok(t) => t,
+            Err(crate::Error::AuthNotReadyError) => {
+                tracing::debug!(flow = ?flow.as_ref(), "not yet ready");
+                return Err(tonic::Status::failed_precondition(
+                    "not yet ready".to_string(),
+                ));
+            }
             Err(crate::Error::AuthError(x)) => {
-                tracing::error!(err = ?x, "OAuthCodeFlow complete failure");
+                tracing::error!(flow = ?flow.as_ref(), err = ?x, "flow complete failure (AuthError)");
                 return Err(tonic::Status::invalid_argument(x));
             }
             Err(e) => {
-                tracing::error!(err = ?e, "OAuthCodeFlow complete failure");
+                tracing::error!(flow = ?flow.as_ref(), err = ?e, "flow complete failure (unknown)");
                 return Err(tonic::Status::unknown(e.to_string()));
             }
         };
-        flow0.mark_as_done(); // authorization codes cannot be reused, so mark as done now (whlist
-                              // later lines may fail)
+
+        flow.mark_as_done(); // authorization codes cannot be reused, so mark as done now (whlist
+                             // later lines may fail)
         self.session_manager
             .add(token)
             .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
 
-        Ok(tonic::Response::new(CompleteOAuthCodeResponse {}))
+        Ok(())
     }
 }
 

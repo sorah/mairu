@@ -18,6 +18,9 @@ pub enum Error {
     #[error(transparent)]
     UrlParseError(#[from] url::ParseError),
 
+    #[error("AuthNotReadyError: flow not yet ready")]
+    AuthNotReadyError,
+
     #[error(transparent)]
     OAuth2RequestTokenError(
         #[from]
@@ -39,12 +42,11 @@ pub enum Error {
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
 
-    #[error("ApiError({url}): {message}; {status_code:}")]
-    ApiError {
-        url: url::Url,
-        status_code: reqwest::StatusCode,
-        message: String,
-    },
+    #[error(transparent)]
+    AwsSsooidcError(#[from] aws_sdk_ssooidc::Error),
+
+    #[error(transparent)]
+    RemoteError(#[from] crate::client::Error),
 
     /// Failure, but we don't want to emit error to stderr/out anymore. Used in cmd
     #[error("")]
