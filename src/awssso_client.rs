@@ -177,35 +177,13 @@ impl crate::client::CredentialVendor for Client {
 }
 
 fn parse_rolespec<'a>(rolespec: &'a str) -> crate::Result<(&'a str, &'a str)> {
-    if rolespec.starts_with("arn:") {
-        let arn_parts: Vec<&str> = rolespec.split(':').collect();
-        let service = arn_parts.get(2).unwrap_or(&"");
-        if *service != "iam" {
-            return Err(crate::Error::UserError(format!(
-                "rolespec '{rolespec}' is invalid"
-            )));
-        }
-        let account_name = arn_parts.get(4).unwrap_or(&"");
-        if account_name.is_empty() {
-            return Err(crate::Error::UserError(format!(
-                "rolespec '{rolespec}' is invalid"
-            )));
-        }
-        let role_name = arn_parts
-            .get(5)
-            .unwrap_or(&"")
-            .strip_prefix("role/")
-            .ok_or_else(|| crate::Error::UserError(format!("rolespec '{rolespec}' is invalid")))?;
-        Ok((account_name, role_name))
-    } else {
-        let parts: Vec<&str> = rolespec.splitn(2, '/').collect();
-        if parts.len() != 2 {
-            return Err(crate::Error::UserError(format!(
-                "rolespec '{rolespec}' is invalid"
-            )));
-        }
-        Ok((parts[0], parts[1]))
+    let parts: Vec<&str> = rolespec.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(crate::Error::UserError(format!(
+            "rolespec '{rolespec}' is invalid"
+        )));
     }
+    Ok((parts[0], parts[1]))
 }
 
 #[cfg(test)]
@@ -214,32 +192,6 @@ mod tests {
 
     mod parse_rolespec {
         use super::*;
-
-        #[test]
-        fn arn_valid() {
-            let (a, b) = parse_rolespec("arn:aws:iam::123456781234:role/MyRole").unwrap();
-            assert_eq!("123456781234", a);
-            assert_eq!("MyRole", b);
-        }
-        #[test]
-        fn arn_valid_with_path() {
-            let (a, b) =
-                parse_rolespec("arn:aws:iam::123456781234:role/service-role/MyRole").unwrap();
-            assert_eq!("123456781234", a);
-            assert_eq!("service-role/MyRole", b);
-        }
-        #[test]
-        fn arn_invalid_service() {
-            assert!(parse_rolespec("arn:aws:s3::123456781234:role/MyRole").is_err());
-        }
-        #[test]
-        fn arn_invalid_resource() {
-            assert!(parse_rolespec("arn:aws:iam::123456781234:user/myuser").is_err());
-        }
-        #[test]
-        fn arn_invalid_account() {
-            assert!(parse_rolespec("arn:aws:iam:::role/MyRole").is_err());
-        }
 
         #[test]
         fn simple_valid() {

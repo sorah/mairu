@@ -4,7 +4,8 @@
   - $AWS_REGION
 - jump through local server to redirect_url
 - aws sso mode
-- device grant
+  - device grant
+  - refresh token
 - docker provider mode
 - mairu_tty
 - exec
