@@ -15,7 +15,7 @@ pub async fn register_client(
         crate::Error::UserError(format!("Server '{}' is not an aws_sso server", server.id(),))
     })?;
 
-    let ssooidc = sso_config_to_ssooidc(&sso).await;
+    let ssooidc = sso_config_to_ssooidc(sso).await;
 
     let product = env!("CARGO_PKG_NAME");
     let mut req = ssooidc
@@ -27,7 +27,7 @@ pub async fn register_client(
     }
     let resp = req.send().await.map_err(aws_sdk_ssooidc::Error::from)?;
 
-    crate::config::AwsSsoClientRegistrationCache::from_aws_sso(&server, &resp)
+    crate::config::AwsSsoClientRegistrationCache::from_aws_sso(server, &resp)
 }
 
 #[derive(Debug)]
@@ -50,7 +50,7 @@ impl From<&AwsSsoDeviceFlow> for crate::proto::InitiateAwsSsoDeviceResponse {
             verification_uri: flow.verification_uri.clone(),
             verification_uri_complete: flow.verification_uri_complete.clone(),
             interval: flow.interval,
-            expires_at: Some(std::time::SystemTime::from(flow.expires_at.clone()).into()),
+            expires_at: Some(std::time::SystemTime::from(flow.expires_at).into()),
         }
     }
 }
@@ -87,8 +87,7 @@ impl AwsSsoDeviceFlow {
                         "Server '{}': AWS returned no user_code",
                         server.id(),
                     ))
-                })?
-                .into(),
+                })?,
             device_code: resp
                 .device_code
                 .ok_or_else(|| {
@@ -105,8 +104,7 @@ impl AwsSsoDeviceFlow {
                         "Server '{}': AWS returned no verification_uri",
                         server.id(),
                     ))
-                })?
-                .into(),
+                })?,
             verification_uri_complete: resp
                 .verification_uri_complete
                 .ok_or_else(|| {
@@ -114,8 +112,7 @@ impl AwsSsoDeviceFlow {
                         "Server '{}': AWS returned no verification_uri_complete",
                         server.id(),
                     ))
-                })?
-                .into(),
+                })?,
 
             expires_at: chrono::Utc::now() + std::time::Duration::from_secs(resp.expires_in as u64),
             interval: if resp.interval <= 0 { 5 } else { resp.interval },

@@ -258,7 +258,7 @@ impl Server {
             return Ok(());
         }
         tracing::info!(server_id = ?self.id(), server_url = %self.url, refresh = ?refresh, "performing AWS SSO Client registration");
-        let registration = crate::oauth_awssso::register_client(&self).await.map_err(|e| {
+        let registration = crate::oauth_awssso::register_client(self).await.map_err(|e| {
             tracing::error!(err = ?e, server_id = self.id(), "error while sso-oidc:RegisterClient");
             e
         })?;

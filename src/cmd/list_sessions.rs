@@ -10,7 +10,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
         let expiring = session
             .expires_at
             .as_ref()
-            .and_then(|ts| std::time::SystemTime::try_from(ts.clone()).ok())
+            .and_then(|ts| std::time::SystemTime::try_from(*ts).ok())
             .map(|st| -> chrono::DateTime<chrono::Local> { chrono::DateTime::from(st) })
             .map(|t| format!(" [until {}]", t))
             .unwrap_or_else(|| "".to_owned());

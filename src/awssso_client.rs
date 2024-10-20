@@ -176,7 +176,7 @@ impl crate::client::CredentialVendor for Client {
     }
 }
 
-fn parse_rolespec<'a>(rolespec: &'a str) -> crate::Result<(&'a str, &'a str)> {
+fn parse_rolespec(rolespec: &str) -> crate::Result<(&str, &str)> {
     let parts: Vec<&str> = rolespec.splitn(2, '/').collect();
     if parts.len() != 2 {
         return Err(crate::Error::UserError(format!(

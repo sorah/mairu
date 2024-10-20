@@ -74,7 +74,7 @@ impl From<&crate::proto::Credentials> for CredentialProcessResponse {
             expiration: cred
                 .expiration
                 .as_ref()
-                .and_then(|ts| std::time::SystemTime::try_from(ts.clone()).ok())
+                .and_then(|ts| std::time::SystemTime::try_from(*ts).ok())
                 .map(|st| -> chrono::DateTime<chrono::Utc> { chrono::DateTime::from(st) }),
         }
     }
