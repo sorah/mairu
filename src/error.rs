@@ -43,7 +43,7 @@ pub enum Error {
     ReqwestError(#[from] reqwest::Error),
 
     #[error(transparent)]
-    AwsSsooidcError(#[from] aws_sdk_ssooidc::Error),
+    AwsSsooidcError(#[from] Box<aws_sdk_ssooidc::Error>),
 
     #[error(transparent)]
     RemoteError(#[from] crate::client::Error),

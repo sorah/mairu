@@ -25,7 +25,10 @@ pub async fn register_client(
     if !sso.scope.is_empty() {
         req = req.scopes(sso.scope.join(" "))
     }
-    let resp = req.send().await.map_err(aws_sdk_ssooidc::Error::from)?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| Box::new(aws_sdk_ssooidc::Error::from(e)))?;
 
     crate::config::AwsSsoClientRegistrationCache::from_aws_sso(server, &resp)
 }
@@ -76,18 +79,16 @@ impl AwsSsoDeviceFlow {
             .start_url(server.url.to_string())
             .send()
             .await
-            .map_err(aws_sdk_ssooidc::Error::from)?;
+            .map_err(|e| Box::new(aws_sdk_ssooidc::Error::from(e)))?;
         Ok(Self {
             handle,
             server: server.to_owned(),
-            user_code: resp
-                .user_code
-                .ok_or_else(|| {
-                    crate::Error::UserError(format!(
-                        "Server '{}': AWS returned no user_code",
-                        server.id(),
-                    ))
-                })?,
+            user_code: resp.user_code.ok_or_else(|| {
+                crate::Error::UserError(format!(
+                    "Server '{}': AWS returned no user_code",
+                    server.id(),
+                ))
+            })?,
             device_code: resp
                 .device_code
                 .ok_or_else(|| {
@@ -97,22 +98,18 @@ impl AwsSsoDeviceFlow {
                     ))
                 })?
                 .into(),
-            verification_uri: resp
-                .verification_uri
-                .ok_or_else(|| {
-                    crate::Error::UserError(format!(
-                        "Server '{}': AWS returned no verification_uri",
-                        server.id(),
-                    ))
-                })?,
-            verification_uri_complete: resp
-                .verification_uri_complete
-                .ok_or_else(|| {
-                    crate::Error::UserError(format!(
-                        "Server '{}': AWS returned no verification_uri_complete",
-                        server.id(),
-                    ))
-                })?,
+            verification_uri: resp.verification_uri.ok_or_else(|| {
+                crate::Error::UserError(format!(
+                    "Server '{}': AWS returned no verification_uri",
+                    server.id(),
+                ))
+            })?,
+            verification_uri_complete: resp.verification_uri_complete.ok_or_else(|| {
+                crate::Error::UserError(format!(
+                    "Server '{}': AWS returned no verification_uri_complete",
+                    server.id(),
+                ))
+            })?,
 
             expires_at: chrono::Utc::now() + std::time::Duration::from_secs(resp.expires_in as u64),
             interval: if resp.interval <= 0 { 5 } else { resp.interval },
@@ -171,7 +168,7 @@ impl AwsSsoDeviceFlow {
             {
                 Err(crate::Error::AuthNotReadyError)
             }
-            Err(e) => Err(aws_sdk_ssooidc::Error::from(e).into()),
+            Err(e) => Err(Box::new(aws_sdk_ssooidc::Error::from(e)).into()),
         }
     }
 }
