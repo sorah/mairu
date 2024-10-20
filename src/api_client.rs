@@ -51,13 +51,32 @@ impl Client {
             .await?;
 
         if let Err(e) = resp.error_for_status_ref() {
-            let e1 = crate::Error::ApiError {
-                url: url.clone(),
-                status_code: e.status().unwrap(),
-                message: resp.text().await.unwrap_or_default(),
+            let status_code = e.status().unwrap();
+            let message = resp.text().await.unwrap_or_default();
+            tracing::error!(req = ?req, url = %url, server_id = &self.server_id, err0 = ?e, status_code  = ?status_code,  "assume-role response was not ok");
+            let e1 = match status_code {
+                reqwest::StatusCode::BAD_REQUEST => {
+                    crate::client::Error::InvalidArgument(message, Box::new(e))
+                }
+                reqwest::StatusCode::UNAUTHORIZED => {
+                    crate::client::Error::Unauthenticated(message, Box::new(e))
+                }
+                reqwest::StatusCode::FORBIDDEN => {
+                    crate::client::Error::PermissionDenied(message, Box::new(e))
+                }
+                reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                    crate::client::Error::ResourceExhausted(message, Box::new(e))
+                }
+                reqwest::StatusCode::NOT_FOUND => {
+                    crate::client::Error::NotFound(message, Box::new(e))
+                }
+                _ => crate::client::Error::Unknown(
+                    format!("[{}] {}", status_code, message),
+                    Box::new(e),
+                ),
             };
-            tracing::error!(req = ?req, url = %url, server_id = &self.server_id, err0 = ?e, err = %e1, "assume-role response was not ok");
-            return Err(e1);
+
+            return Err(e1.into());
         }
 
         let credentials = resp.json::<crate::client::AssumeRoleResponse>().await?;

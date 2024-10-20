@@ -34,6 +34,22 @@ pub struct AssumeRoleResponseMairuExt {
     pub no_cache: bool,
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Invalid Argument: {0}")]
+    InvalidArgument(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Unauthenticated: {0}")]
+    Unauthenticated(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Resource exhausted: {0}")]
+    ResourceExhausted(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Not found: {0}")]
+    NotFound(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Unknown: {0} ({1})")]
+    Unknown(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
 pub(crate) fn http() -> reqwest::Client {
     static HTTP: once_cell::sync::OnceCell<reqwest::Client> = once_cell::sync::OnceCell::new();
     HTTP.get_or_init(|| {

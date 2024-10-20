@@ -101,23 +101,24 @@ impl crate::proto::agent_server::Agent for Agent {
                 tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?r.access_key_id, ext = ?r.mairu, "Vending credentials from server");
                 Ok(tonic::Response::new((&r).into()))
             }
-            Err(crate::Error::ApiError {
-                url: _url,
-                status_code,
-                message,
-            }) => match status_code {
-                reqwest::StatusCode::BAD_REQUEST => Err(tonic::Status::invalid_argument(message)),
-                reqwest::StatusCode::UNAUTHORIZED => Err(tonic::Status::unauthenticated(message)),
-                reqwest::StatusCode::FORBIDDEN => Err(tonic::Status::permission_denied(message)),
-                reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                    Err(tonic::Status::resource_exhausted(message))
-                }
-                reqwest::StatusCode::NOT_FOUND => Err(tonic::Status::not_found(message)),
-                _ => Err(tonic::Status::unknown(format!(
-                    "{}: {}",
-                    status_code, message
-                ))),
-            },
+            Err(crate::Error::RemoteError(crate::client::Error::InvalidArgument(message, _))) => {
+                Err(tonic::Status::invalid_argument(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::Unauthenticated(message, _))) => {
+                Err(tonic::Status::unauthenticated(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::PermissionDenied(message, _))) => {
+                Err(tonic::Status::permission_denied(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::ResourceExhausted(message, _))) => {
+                Err(tonic::Status::resource_exhausted(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::NotFound(message, _))) => {
+                Err(tonic::Status::not_found(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::Unknown(message, _))) => {
+                Err(tonic::Status::unknown(message))
+            }
             Err(e) => {
                 tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, err = ?e, "assume-role API returned error");
                 Err(tonic::Status::unknown(e.to_string()))

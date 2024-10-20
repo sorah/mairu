@@ -45,12 +45,8 @@ pub enum Error {
     #[error(transparent)]
     AwsSsooidcError(#[from] aws_sdk_ssooidc::Error),
 
-    #[error("ApiError({url}): {message}; {status_code:}")]
-    ApiError {
-        url: url::Url,
-        status_code: reqwest::StatusCode,
-        message: String,
-    },
+    #[error(transparent)]
+    RemoteError(#[from] crate::client::Error),
 
     /// Failure, but we don't want to emit error to stderr/out anymore. Used in cmd
     #[error("")]
