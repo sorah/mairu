@@ -153,7 +153,12 @@ impl Server {
                 Some(cache) if !cache.is_expired() => {
                     parsed.oauth = Some(cache.into_server_oauth(parsed.aws_sso.as_ref().unwrap()));
                 }
-                _ => {}
+                Some(_) => {
+                    tracing::debug!(server = ?parsed, "AwsSsoClientRegistrationCache is expired");
+                }
+                None => {
+                    tracing::debug!(server = ?parsed, "AwsSsoClientRegistrationCache is missing");
+                }
             }
         }
 
@@ -237,6 +242,34 @@ impl Server {
             .chain_update(sso.scope.join(" "))
             .finalize();
         Ok(base64::engine::general_purpose::URL_SAFE.encode(hash))
+    }
+
+    pub async fn ensure_aws_sso_oauth_client_registration(
+        &mut self,
+        refresh: bool,
+    ) -> crate::Result<()> {
+        if self.aws_sso.is_none() {
+            return Err(crate::Error::ConfigError(format!(
+                "Server '{}' is not aws_sso",
+                self.id()
+            )));
+        }
+        if self.oauth.is_some() && !refresh {
+            return Ok(());
+        }
+        tracing::info!(server_id = ?self.id(), server_url = %self.url, refresh = ?refresh, "performing AWS SSO Client registration");
+        let registration = crate::oauth_awssso::register_client(&self).await.map_err(|e| {
+            tracing::error!(err = ?e, server_id = self.id(), "error while sso-oidc:RegisterClient");
+            e
+        })?;
+        registration
+            .save_to_file(self.aws_sso_client_registration_cache_key().unwrap().as_ref())
+            .await.map_err(|e| {
+            tracing::error!(err = ?e, server_id = self.id(), "error while saving AwsSsoClientRegistrationCache file");
+            e
+        })?;
+        self.oauth = Some(registration.into_server_oauth(self.aws_sso.as_ref().unwrap()));
+        Ok(())
     }
 }
 

@@ -35,7 +35,7 @@ pub async fn login(
 
     match oauth_grant_type {
         crate::config::OAuthGrantType::Code => do_oauth_code(agent, server).await,
-        crate::config::OAuthGrantType::AwsSso => todo!(),
+        crate::config::OAuthGrantType::AwsSso => do_awssso(agent, server).await,
     }
 }
 
@@ -68,6 +68,57 @@ pub async fn do_oauth_code(
     eprintln!(":: {product} :: ");
 
     crate::oauth_code::listen_for_callback(listener, session, agent).await?;
+    tracing::info!("Logged in");
+    Ok(())
+}
+
+pub async fn do_awssso(
+    agent: &mut crate::agent::AgentConn,
+    server: crate::config::Server,
+) -> Result<(), anyhow::Error> {
+    server.try_oauth_awssso()?;
+
+    let session = agent
+        .initiate_aws_sso_device(crate::proto::InitiateAwsSsoDeviceRequest {
+            server_id: server.id().to_owned(),
+        })
+        .await?
+        .into_inner();
+    tracing::debug!(session = ?session, "Initiated flow");
+
+    let product = env!("CARGO_PKG_NAME");
+    let server_id = server.id();
+    let server_url = &server.url;
+    let user_code = &session.user_code;
+    let mut authorize_url = &session.verification_uri_complete;
+    if authorize_url.is_empty() {
+        authorize_url = &session.verification_uri;
+    }
+    eprintln!(":: {product} :: Login to {server_id} ({server_url}) ::::::::");
+    eprintln!(":: {product} :: ");
+    eprintln!(":: {product} ::                  Your Verification Code: {user_code}");
+    eprintln!(":: {product} :: Visit AWS SSO and authorize to continue: {authorize_url}");
+    eprintln!(":: {product} :: ");
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(session.interval as u64)).await;
+        let completion = agent
+            .complete_aws_sso_device(crate::proto::CompleteAwsSsoDeviceRequest {
+                handle: session.handle.clone(),
+            })
+            .await;
+
+        match completion {
+            Ok(_) => break,
+            Err(e) if e.code() == tonic::Code::FailedPrecondition => {
+                // continue
+            }
+            Err(e) => {
+                anyhow::bail!(e);
+            }
+        }
+    }
+
     tracing::info!("Logged in");
     Ok(())
 }

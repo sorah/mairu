@@ -5,6 +5,7 @@ pub const MAX_ITEMS: usize = 15;
 pub enum AuthFlow {
     Nop,
     OAuthCode(crate::oauth_code::OAuthCodeFlow),
+    AwsSsoDevice(crate::oauth_awssso::AwsSsoDeviceFlow),
 }
 
 impl AuthFlow {
@@ -12,6 +13,7 @@ impl AuthFlow {
         match self {
             AuthFlow::Nop => "",
             AuthFlow::OAuthCode(f) => &f.handle,
+            AuthFlow::AwsSsoDevice(f) => &f.handle,
         }
     }
 }

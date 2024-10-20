@@ -18,6 +18,9 @@ pub enum Error {
     #[error(transparent)]
     UrlParseError(#[from] url::ParseError),
 
+    #[error("AuthNotReadyError: flow not yet ready")]
+    AuthNotReadyError,
+
     #[error(transparent)]
     OAuth2RequestTokenError(
         #[from]
