@@ -92,7 +92,7 @@ impl crate::proto::agent_server::Agent for Agent {
             }
         }
         tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Obtaining credentials from server");
-        let client = crate::client::Client::from(session.token.as_ref());
+        let client = crate::api_client::Client::from(session.token.as_ref());
         match client.assume_role(role).await {
             Ok(r) => {
                 if request.get_ref().cached {

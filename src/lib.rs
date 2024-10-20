@@ -13,8 +13,10 @@ pub mod utils;
 pub mod oauth_awssso;
 pub mod oauth_code;
 
-pub mod auth_flow_manager;
+pub mod api_client;
 pub mod client;
+
+pub mod auth_flow_manager;
 pub mod credential_cache;
 pub mod session_manager;
 
