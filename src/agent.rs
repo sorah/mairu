@@ -94,7 +94,10 @@ impl crate::proto::agent_server::Agent for Agent {
             }
         }
         tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Obtaining credentials from server");
-        let client = crate::client::make_credential_vendor(&session);
+        let client = crate::client::make_credential_vendor(&session).map_err(|e| {
+            tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, err = ?e, "Failed to make_credential_vendor");
+            tonic::Status::internal(e.to_string())
+        })?;
         match client.assume_role(role).await {
             Ok(r) => {
                 if request.get_ref().cached {

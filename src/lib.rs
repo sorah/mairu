@@ -14,6 +14,7 @@ pub mod oauth_awssso;
 pub mod oauth_code;
 
 pub mod api_client;
+pub mod awssso_client;
 pub mod client;
 
 pub mod auth_flow_manager;

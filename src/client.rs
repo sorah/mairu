@@ -5,13 +5,31 @@ pub(crate) trait CredentialVendor {
     ) -> impl std::future::Future<Output = crate::Result<crate::client::AssumeRoleResponse>> + Send;
 }
 
+pub(crate) enum CredentialClient {
+    Api(crate::api_client::Client),
+    AwsSso(crate::awssso_client::Client),
+}
+
+impl CredentialVendor for CredentialClient {
+    async fn assume_role(&self, role: &str) -> crate::Result<crate::client::AssumeRoleResponse> {
+        match self {
+            CredentialClient::Api(c) => c.assume_role(role).await,
+            CredentialClient::AwsSso(c) => c.assume_role(role).await,
+        }
+    }
+}
+
 pub(crate) fn make_credential_vendor(
     session: &crate::session_manager::Session,
-) -> impl CredentialVendor {
+) -> crate::Result<CredentialClient> {
     if session.token.server.aws_sso.is_some() {
-        todo!()
+        Ok(CredentialClient::AwsSso(
+            crate::awssso_client::Client::try_from(session.token.as_ref())?,
+        ))
     } else {
-        crate::api_client::Client::from(session.token.as_ref())
+        Ok(CredentialClient::Api(crate::api_client::Client::from(
+            session.token.as_ref(),
+        )))
     }
 }
 

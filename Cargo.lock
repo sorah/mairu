@@ -1337,6 +1337,7 @@ dependencies = [
  "async-recursion",
  "async-trait",
  "aws-config",
+ "aws-sdk-sso",
  "aws-sdk-ssooidc",
  "axum",
  "base64 0.22.1",
