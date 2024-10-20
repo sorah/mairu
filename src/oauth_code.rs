@@ -201,6 +201,7 @@ struct CallbackQuery {
 /// HTML <head> to supress favicon.ico request
 const HTML_PREAMBLE: &str = r#"<!DOCTYPE html><html><head><link rel="icon" href="data:;base64,iVBORw0KGgo="><style>body { font-family: monospace; }</style></head><body>"#;
 
+#[allow(clippy::type_complexity)]
 #[tracing::instrument(skip_all)]
 async fn callback(
     query: axum::extract::Query<CallbackQuery>,
