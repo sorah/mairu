@@ -72,7 +72,7 @@ impl SessionManager {
         ))
     }
 
-    pub fn add(&self, token: crate::token::ServerToken) -> crate::Result<()> {
+    pub fn add(&self, token: crate::token::ServerToken) -> crate::Result<Session> {
         tracing::trace!(token = ?token, "Attempting to add");
         let mut items = self.items.write();
 
@@ -82,7 +82,7 @@ impl SessionManager {
             tracing::info!(token = ?token, id = ?item.id, "Storing updated token");
             item.token = std::sync::Arc::new(token);
             item.credential_cache.clear();
-            return Ok(());
+            return Ok(item.clone());
         }
 
         // Otherwise, add as a new server
@@ -101,15 +101,17 @@ impl SessionManager {
         }
 
         tracing::info!(token = ?token, "Storing new token");
-        items.push(Session {
+        let session = Session {
             id: self
                 .next_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             token: std::sync::Arc::new(token),
             credential_cache: crate::credential_cache::CredentialCache::new(),
-        });
+        };
+        let retval = session.clone();
+        items.push(session);
 
-        Ok(())
+        Ok(retval)
     }
 
     pub fn remove(&self, query: &str) -> bool {

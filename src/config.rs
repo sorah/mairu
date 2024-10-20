@@ -311,6 +311,10 @@ pub struct ServerOAuth {
     default_grant_type: Option<OAuthGrantType>,
     pub code_grant: Option<ServerCodeGrant>,
     pub device_grant: Option<ServerDeviceGrant>,
+
+    /// Expiration time of dynamically registered OAuth2 client registration, such as AWS SSO
+    /// clients.
+    pub client_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn default_oauth_scope() -> Vec<String> {
@@ -409,6 +413,7 @@ impl AwsSsoClientRegistrationCache {
             scope: sso.scope.clone(),
             code_grant: None,
             device_grant: None,
+            client_expires_at: Some(self.expires_at),
         }
     }
 }

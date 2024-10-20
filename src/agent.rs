@@ -94,10 +94,12 @@ impl crate::proto::agent_server::Agent for Agent {
             }
         }
         tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Obtaining credentials from server");
+        let session = self.ensure_session_freshness(session).await;
         let client = crate::client::make_credential_vendor(&session).map_err(|e| {
             tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, err = ?e, "Failed to make_credential_vendor");
             tonic::Status::internal(e.to_string())
         })?;
+
         match client.assume_role(role).await {
             Ok(r) => {
                 if request.get_ref().cached {
@@ -346,6 +348,48 @@ impl Agent {
             .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Refresh session if necessary and able to do so, using refresh_token.
+    async fn ensure_session_freshness(
+        &self,
+        session: crate::session_manager::Session,
+    ) -> crate::session_manager::Session {
+        if !session.token.is_access_token_near_expiration() {
+            return session;
+        }
+        if !session.token.has_active_refresh_token() {
+            return session;
+        }
+
+        // =====
+        if session.token.server.aws_sso.is_some() {
+            if let Some(new) = refresh_token_using_awssso(&session).await {
+                return self.session_manager.add(new).unwrap(); // XXX:
+            }
+        }
+        // TODO: general refresh_token implementation
+
+        // =====
+        tracing::warn!( server_id = session.token.server.id(), url = %session.token.server.url, "Skipped token refresh due to missing implementation to refresh this session");
+        session
+    }
+}
+
+async fn refresh_token_using_awssso(
+    session: &crate::session_manager::Session,
+) -> Option<crate::token::ServerToken> {
+    match crate::oauth_awssso::refresh_token(&session.token).await {
+        Ok(token) => Some(token),
+        Err(e) => {
+            tracing::warn!(
+                server_id = session.token.server.id(),
+                url = %session.token.server.url,
+                err = ?e,
+                "Failed to refresh session using refresh_token against AWS sso-oidc"
+            );
+            None
+        }
     }
 }
 

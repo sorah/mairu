@@ -3,9 +3,7 @@
   - auto install server configuration
   - $AWS_REGION
 - jump through local server to redirect_url
-- aws sso mode
-  - device grant
-  - refresh token
+- refresh token
 - docker provider mode
 - mairu_tty
 - exec
