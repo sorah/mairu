@@ -1,3 +1,20 @@
+pub(crate) trait CredentialVendor {
+    fn assume_role(
+        &self,
+        role: &str,
+    ) -> impl std::future::Future<Output = crate::Result<crate::client::AssumeRoleResponse>> + Send;
+}
+
+pub(crate) fn make_credential_vendor(
+    session: &crate::session_manager::Session,
+) -> impl CredentialVendor {
+    if session.token.server.aws_sso.is_some() {
+        todo!()
+    } else {
+        crate::api_client::Client::from(session.token.as_ref())
+    }
+}
+
 /// https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]

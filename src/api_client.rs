@@ -31,12 +31,9 @@ impl From<&crate::token::ServerToken> for Client {
     }
 }
 
-impl Client {
+impl crate::client::CredentialVendor for Client {
     #[tracing::instrument]
-    pub async fn assume_role(
-        &self,
-        role: &str,
-    ) -> crate::Result<crate::client::AssumeRoleResponse> {
+    async fn assume_role(&self, role: &str) -> crate::Result<crate::client::AssumeRoleResponse> {
         use secrecy::ExposeSecret;
         let req = AssumeRoleRequest { role };
         let url = self.url.join("assume-role")?;

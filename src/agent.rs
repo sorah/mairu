@@ -69,6 +69,8 @@ impl crate::proto::agent_server::Agent for Agent {
         &self,
         request: tonic::Request<AssumeRoleRequest>,
     ) -> Result<tonic::Response<AssumeRoleResponse>, tonic::Status> {
+        use crate::client::CredentialVendor;
+
         let query = &request.get_ref().server_id;
         let role = &request.get_ref().role;
         let Ok(session) = self.session_manager.get(query) else {
@@ -92,7 +94,7 @@ impl crate::proto::agent_server::Agent for Agent {
             }
         }
         tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Obtaining credentials from server");
-        let client = crate::api_client::Client::from(session.token.as_ref());
+        let client = crate::client::make_credential_vendor(&session);
         match client.assume_role(role).await {
             Ok(r) => {
                 if request.get_ref().cached {
