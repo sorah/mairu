@@ -49,13 +49,13 @@ async fn preflight_check(
         role: args.role.clone(),
         cached: !args.no_cache,
     };
-    let mut resp = agent.assume_role(req.clone()).await;
+    let mut resp = assume_role_with_long_attempt_notice(agent, req.clone()).await;
 
     if let Err(ref e) = resp {
         if e.code() == tonic::Code::Unauthenticated {
             login(agent, args).await?;
         }
-        resp = agent.assume_role(req.clone()).await;
+        resp = assume_role_with_long_attempt_notice(agent, req.clone()).await;
     }
 
     match resp {
@@ -83,6 +83,31 @@ async fn preflight_check(
                 .await;
             }
             Err(crate::Error::FailureButSilentlyExit.into())
+        }
+    }
+}
+
+const LONG_PREFLIGHT_CHECK_DURATION: tokio::time::Duration = tokio::time::Duration::from_secs(2);
+
+async fn assume_role_with_long_attempt_notice(
+    agent: &mut crate::agent::AgentConn,
+    req: crate::proto::AssumeRoleRequest,
+) -> tonic::Result<tonic::Response<crate::proto::AssumeRoleResponse>> {
+    let resp = agent.assume_role(req.clone());
+    let sleep = tokio::time::sleep(LONG_PREFLIGHT_CHECK_DURATION);
+    let mut elapsed = false;
+    tokio::pin!(resp);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            retval = &mut resp => {
+                return retval;
+            }
+            _ = &mut sleep, if !elapsed => {
+                elapsed = true;
+                let product = env!("CARGO_PKG_NAME");
+                crate::terminal::send(&format!(":: {product} :: Waiting for AWS credentials from your remote server...")).await;
+            }
         }
     }
 }

@@ -6,6 +6,5 @@
 - refresh token
 - docker provider mode
 - exec
-  - warn when preflight taking time
 - signals
 - background autorefresh
