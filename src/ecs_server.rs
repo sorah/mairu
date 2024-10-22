@@ -162,14 +162,14 @@ impl Backend for AgentBackend {
 }
 
 pub trait UserFeedbackDelegate: Send + Sync + Clone + std::fmt::Debug {
-    fn on_error(&self, err: &BackendRequestError);
+    fn on_error(&self, err: &BackendRequestError) -> impl std::future::Future<Output = ()> + Send;
 }
 
 #[derive(Debug, Clone)]
 pub struct NoUserFeedback;
 
 impl UserFeedbackDelegate for NoUserFeedback {
-    fn on_error(&self, _err: &BackendRequestError) {}
+    async fn on_error(&self, _err: &BackendRequestError) {}
 }
 
 pub async fn bind_tcp(port: Option<u16>) -> crate::Result<(tokio::net::TcpListener, url::Url)> {
@@ -221,17 +221,17 @@ async fn handle_get_credentials<B: Backend + 'static, U: UserFeedbackDelegate>(
             let code = match &be {
                 BackendRequestError::Unauthorized(e) => {
                     tracing::warn!(err = ?e, err_human = %e, server = ?server, "credential request was denied (unauthorized)");
-                    server.feedback.on_error(be);
+                    server.feedback.on_error(be).await;
                     axum::http::StatusCode::SERVICE_UNAVAILABLE
                 }
                 BackendRequestError::Forbidden(e) => {
                     tracing::warn!(err = ?e, err_human = %e, server = ?server, "credential request was denied (forbidden)");
-                    server.feedback.on_error(be);
+                    server.feedback.on_error(be).await;
                     axum::http::StatusCode::FORBIDDEN
                 }
                 BackendRequestError::Unknown(e) => {
                     tracing::warn!(err = ?e, err_human = %e, server = ?server, "credential request returned an unknown error");
-                    server.feedback.on_error(be);
+                    server.feedback.on_error(be).await;
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR
                 }
             };

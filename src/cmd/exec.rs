@@ -71,10 +71,16 @@ async fn preflight_check(
             let role = &args.role;
             let code = e.code();
             let message = e.message();
-            eprintln!(":: {product} :: ERROR, Couldn't obtain AWS credentials for {role} from {server_id} :::::::");
-            eprintln!(":: {product} :: > code={code:?}, message={message}");
+            crate::terminal::send(&indoc::formatdoc! {"
+                :: {product} :: ERROR, Couldn't obtain AWS credentials for {role} from {server_id} :::::::
+                :: {product} :: > code={code:?}, message={message}
+            "})
+            .await;
             if e.code() == tonic::Code::Unauthenticated {
-                eprintln!(":: {product} :: > logged in but still error is unauthenticated");
+                crate::terminal::send(&format!(
+                    ":: {product} :: > logged in but still error is unauthenticated"
+                ))
+                .await;
             }
             Err(crate::Error::FailureButSilentlyExit.into())
         }
@@ -93,9 +99,12 @@ async fn login(agent: &mut crate::agent::AgentConn, args: &ExecArgs) -> Result<(
         let product = env!("CARGO_PKG_NAME");
         let server_id = &args.server;
         let role = &args.role;
-        eprintln!(":: {product} :: Login required for AWS credentials from {server_id} for {role} :::::::");
-        eprintln!(":: {product} :: > Use the following command to continue");
-        eprintln!(":: {product} ::   $ {product} login {server_id}");
+        crate::terminal::send(&indoc::formatdoc! {"
+            :: {product} :: Login required for AWS credentials from {server_id} for {role} :::::::
+            :: {product} :: > Use the following command to continue
+            :: {product} ::   $ {product} login {server_id}
+        "})
+        .await;
         Err(crate::Error::FailureButSilentlyExit.into())
     }
 }
@@ -170,23 +179,29 @@ impl From<&ExecArgs> for ExecEcsUserFeedback {
 }
 
 impl crate::ecs_server::UserFeedbackDelegate for ExecEcsUserFeedback {
-    fn on_error(&self, err: &crate::ecs_server::BackendRequestError) {
+    async fn on_error(&self, err: &crate::ecs_server::BackendRequestError) {
         let product = env!("CARGO_PKG_NAME");
         let server = &self.server;
         let role = &self.role;
         let e = err.ui_message();
-        match &err {
+        crate::terminal::send(&(match &err {
             crate::ecs_server::BackendRequestError::Forbidden(_) => {
-                eprintln!(":: {product} :: Forbidden while retrieving AWS credentials of {role} from {server}; {e}. To login again, run: $ {product} login {server}");
+                indoc::formatdoc! {"
+                    :: {product} :: Forbidden while retrieving AWS credentials of {role} from {server}; {e}. To login again, run: $ {product} login {server}
+                "}
             }
             crate::ecs_server::BackendRequestError::Unauthorized(_) => {
-                eprintln!(":: {product} :: Login required to {server} for AWS credentials of {role}; {e}. Run: $ {product} login {server}");
-                eprintln!(":: {product} :: To continue, run: $ {product} login {server}");
+                indoc::formatdoc! {"
+                    :: {product} :: Login required to {server} for AWS credentials of {role}; {e}. Run: $ {product} login {server}
+                    :: {product} :: To continue, run: $ {product} login {server}
+                "}
             }
             crate::ecs_server::BackendRequestError::Unknown(_) => {
-                eprintln!(":: {product} :: Unknown error occured when retrieving AWS credentials for {role} from {server}; {e}. To reauthenticate, run: $ {product} login {server}");
+                indoc::formatdoc! {"
+                    :: {product} :: Unknown error occured when retrieving AWS credentials for {role} from {server}; {e}. To reauthenticate, run: $ {product} login {server}
+                "}
             }
-        }
+        })).await;
     }
 }
 
