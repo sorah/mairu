@@ -63,7 +63,6 @@ enum Output {
 
 fn output() -> Output {
     let fd = std::fs::OpenOptions::new()
-        .write(true)
         .append(true)
         .open("/dev/tty")
         .ok()
