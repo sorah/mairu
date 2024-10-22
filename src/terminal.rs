@@ -16,7 +16,12 @@ pub async fn send(m: &str) {
     static TX: tokio::sync::OnceCell<tokio::sync::mpsc::Sender<Message>> =
         tokio::sync::OnceCell::const_new();
     let tx = TX.get_or_init(start).await;
-    match tx.send(Message(m.to_owned())).await {
+    let s = if m.ends_with("\n") {
+        m.to_owned()
+    } else {
+        format!("{m}\n")
+    };
+    match tx.send(Message(s)).await {
         Ok(_) => {}
         Err(e) => {
             tracing::warn!("Failed to send to terminal: {e}; {}", m);
