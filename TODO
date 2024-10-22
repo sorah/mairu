@@ -6,5 +6,5 @@
 - refresh token
 - docker provider mode
 - exec
-- signals
+  - signals
 - background autorefresh
