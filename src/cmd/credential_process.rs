@@ -35,13 +35,16 @@ pub async fn run(args: &CredentialProcessArgs) -> Result<(), anyhow::Error> {
             let server_id = &args.server;
             let role = &args.role;
             if e.code() == tonic::Code::Unauthenticated {
-                eprintln!(":: {product} :: Authentication Needed to obtain AWS credentials from {server_id} ({role}) :::::::");
-                eprintln!(":: {product} :: Run the following command to continue");
-                eprintln!(":: {product} ::   $ {product} login {server_id}");
+                crate::terminal::send(&indoc::formatdoc! {"
+                    :: {product} :: Authentication Needed to obtain AWS credentials from {server_id} ({role}) :::::::
+                    :: {product} :: Run the following command to continue
+                    :: {product} ::   $ {product} login {server_id}
+                "})
+                .await;
             } else {
                 let code = e.code();
                 let message = e.message();
-                eprintln!(":: {product} :: ERROR when obtaining AWS credentials [{server_id},{role}]: {code:?}; {message}");
+                crate::terminal::send(&format!(":: {product} :: ERROR when obtaining AWS credentials [{server_id},{role}]: {code:?}; {message}")).await;
             }
             Err(crate::Error::FailureButSilentlyExit.into())
         }

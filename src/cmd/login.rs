@@ -59,13 +59,17 @@ pub async fn do_oauth_code(
     let server_id = server.id();
     let server_url = &server.url;
     let authorize_url = &session.authorize_url;
-    eprintln!(":: {product} :: Login to {server_id} ({server_url}) ::::::::");
-    eprintln!(":: {product} :: ");
-    eprintln!(":: {product} :: ");
-    eprintln!(":: {product} :: Open the following URL to continue");
-    eprintln!(":: {product} :: {authorize_url}");
-    eprintln!(":: {product} :: ");
-    eprintln!(":: {product} :: ");
+
+    crate::terminal::send(&indoc::formatdoc! {"
+        :: {product} :: Login to {server_id} ({server_url}) ::::::::
+        :: {product} ::
+        :: {product} ::
+        :: {product} :: Open the following URL to continue
+        :: {product} :: {authorize_url}
+        :: {product} ::
+        :: {product} ::
+    "})
+    .await;
 
     crate::oauth_code::listen_for_callback(listener, session, agent).await?;
     tracing::info!("Logged in");
@@ -94,11 +98,15 @@ pub async fn do_awssso(
     if authorize_url.is_empty() {
         authorize_url = &session.verification_uri;
     }
-    eprintln!(":: {product} :: Login to {server_id} ({server_url}) ::::::::");
-    eprintln!(":: {product} :: ");
-    eprintln!(":: {product} ::                  Your Verification Code: {user_code}");
-    eprintln!(":: {product} :: Visit AWS SSO and authorize to continue: {authorize_url}");
-    eprintln!(":: {product} :: ");
+
+    crate::terminal::send(&indoc::formatdoc! {"
+        :: {product} :: Login to {server_id} ({server_url}) ::::::::
+        :: {product} ::
+        :: {product} ::                  Your Verification Code: {user_code}
+        :: {product} :: Visit AWS SSO and authorize to continue: {authorize_url}
+        :: {product} ::
+    "})
+    .await;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(session.interval as u64)).await;

@@ -5,7 +5,7 @@
 - jump through local server to redirect_url
 - refresh token
 - docker provider mode
-- mairu_tty
 - exec
   - warn when preflight taking time
 - signals
+- background autorefresh
