@@ -1,10 +1,11 @@
 - auto mode
-  - directory trust
   - auto install server configuration
   - $AWS_REGION
 - jump through local server to redirect_url
 - refresh token
 - docker provider mode
 - exec
-- signals
+  - signals
 - background autorefresh
+- lock
+- trust signature

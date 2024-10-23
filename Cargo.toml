@@ -19,7 +19,7 @@ axum = { version = "0.7.4", features = ["tracing", "macros", "query"] }
 base64 = "0.22.1"
 base64ct = { version = "1.6.0", features = ["alloc", "std"] }
 chrono = { version = "0.4.34", features = ["serde"] }
-clap = { version = "4.5.1", features = ["cargo", "derive"] }
+clap = { version = "4.5.1", features = ["cargo", "derive", "env"] }
 daemonize = "0.5.0"
 headers = "0.4.0"
 hyper = { version = "1.1.0", features = ["http1", "server"] }
@@ -39,6 +39,7 @@ reqwest = { version = "0.12.8", features = ["json"] }
 secrecy = { version = "0.10.0", features = ["serde"] }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.114"
+serde_with = { version = "3.11.0", features = ["base64"] }
 sha2 = "0.10.8"
 subtle = { version = "2.5.0", features = ["core_hint_black_box"] }
 thiserror = "1.0.57"

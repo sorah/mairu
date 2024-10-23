@@ -30,6 +30,10 @@ pub fn cache_dir() -> std::path::PathBuf {
     state_dir().join("cache")
 }
 
+pub fn trust_dir() -> std::path::PathBuf {
+    state_dir().join("trust")
+}
+
 pub fn log_dir_mkpath() -> std::io::Result<std::path::PathBuf> {
     let dir = log_dir();
     std::fs::create_dir_all(&dir)?;
@@ -38,6 +42,12 @@ pub fn log_dir_mkpath() -> std::io::Result<std::path::PathBuf> {
 
 pub fn cache_dir_mkpath() -> std::io::Result<std::path::PathBuf> {
     let dir = cache_dir();
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn trust_dir_mkpath() -> std::io::Result<std::path::PathBuf> {
+    let dir = trust_dir();
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -241,7 +251,7 @@ impl Server {
             .chain_update(b"\0\0")
             .chain_update(sso.scope.join(" "))
             .finalize();
-        Ok(base64::engine::general_purpose::URL_SAFE.encode(hash))
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash))
     }
 
     pub async fn ensure_aws_sso_oauth_client_registration(
