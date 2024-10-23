@@ -6,6 +6,7 @@ pub mod ext_oauth2;
 pub mod singleflight;
 pub mod terminal;
 
+pub mod auto;
 pub mod config;
 pub mod proto;
 pub mod token;

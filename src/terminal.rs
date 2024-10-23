@@ -12,16 +12,23 @@ use std::task::Poll;
 
 struct Message(String);
 
+struct OutputTask {
+    tx: tokio::sync::mpsc::Sender<Message>,
+    is_terminal: bool,
+}
+
+static TASK: tokio::sync::OnceCell<OutputTask> = tokio::sync::OnceCell::const_new();
+
 pub async fn send(m: &str) {
-    static TX: tokio::sync::OnceCell<tokio::sync::mpsc::Sender<Message>> =
-        tokio::sync::OnceCell::const_new();
-    let tx = TX.get_or_init(start).await;
+    let task = TASK.get_or_init(start).await;
     let s = if m.ends_with("\n") {
         m.to_owned()
+    } else if m.ends_with("\0") {
+        m.strip_suffix("\0").unwrap_or(m).to_owned()
     } else {
         format!("{m}\n")
     };
-    match tx.send(Message(s)).await {
+    match task.tx.send(Message(s)).await {
         Ok(_) => {}
         Err(e) => {
             tracing::warn!("Failed to send to terminal: {e}; {}", m);
@@ -29,14 +36,20 @@ pub async fn send(m: &str) {
     }
 }
 
-async fn start() -> tokio::sync::mpsc::Sender<Message> {
-    let (tx, rx) = tokio::sync::mpsc::channel(2);
-    tokio::spawn(task(rx));
-    tx
+pub async fn is_terminal() -> bool {
+    let task = TASK.get_or_init(start).await;
+    task.is_terminal
 }
 
-async fn task(mut rx: tokio::sync::mpsc::Receiver<Message>) {
-    let mut output = output();
+async fn start() -> OutputTask {
+    let output = output();
+    let is_terminal = output.is_terminal();
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    tokio::spawn(task(output, rx));
+    OutputTask { tx, is_terminal }
+}
+
+async fn task(mut output: Output, mut rx: tokio::sync::mpsc::Receiver<Message>) {
     while let Some(m) = rx.recv().await {
         match write(&mut output, m.0.as_bytes()).await {
             Ok(_) => {}
@@ -70,6 +83,12 @@ fn output() -> Output {
     match fd {
         Some(file) => Output::File(file),
         None => Output::Stderr(tokio::io::stderr()),
+    }
+}
+
+impl Output {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Output::File(_))
     }
 }
 
