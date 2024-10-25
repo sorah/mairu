@@ -82,7 +82,7 @@ async fn resolve_auto(args: &mut ExecArgs) -> Result<(), anyhow::Error> {
     };
 
     if !trusted {
-        ask_trust(&args, &auto).await?
+        ask_trust(args, &auto).await?
     }
 
     // Resolve
@@ -108,8 +108,11 @@ async fn ask_trust(args: &ExecArgs, auto: &crate::auto::Auto) -> Result<(), anyh
     let json = serde_json::to_string_pretty(&auto.inner)
         .unwrap()
         .lines()
-        .map(|l| format!(":: {product} ::     {l}\n"))
-        .collect::<String>();
+        .fold(String::new(), |mut r, l| {
+            use std::fmt::Write;
+            let _ = writeln!(r, ":: {product} ::     {l}");
+            r
+        });
 
     crate::terminal::send(&indoc::formatdoc! {"
         :: {product} :: The following configuration is present but has to be confirmed:
