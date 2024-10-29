@@ -6,6 +6,5 @@
 - docker provider mode
 - exec
   - signals
-- background autorefresh
 - lock
 - trust signature

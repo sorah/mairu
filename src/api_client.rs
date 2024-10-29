@@ -77,6 +77,7 @@ impl crate::client::CredentialVendor for Client {
         }
 
         let credentials = resp.json::<crate::client::AssumeRoleResponse>().await?;
+        //credentials.expiration = chrono::Utc::now() + chrono::TimeDelta::seconds(915);
         tracing::debug!(req = ?req, url = %url, server_id = &self.server_id, credentials = ?credentials, "response");
         Ok(credentials)
     }
