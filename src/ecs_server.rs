@@ -90,7 +90,7 @@ where
     ) -> std::sync::Arc<Result<crate::proto::AssumeRoleResponse, BackendRequestError>> {
         self.coalesce_group
             .request(0, || {
-                tracing::debug!(server = ?self, "requesting credentials to backend");
+                tracing::trace!(server = ?self, "requesting credentials to backend");
                 let mut backend = self.backend.clone();
                 async move { backend.request_arc().await }
             })
@@ -213,7 +213,7 @@ async fn handle_get_credentials<B: Backend + 'static, U: UserFeedbackDelegate>(
             .into_response());
     }
 
-    tracing::debug!(server = ?server, "received credentials request");
+    tracing::trace!(server = ?server, "received credentials request");
     let resp = server.request().await;
     match resp.as_ref() {
         Err(be) => {
@@ -276,11 +276,7 @@ impl From<&crate::proto::Credentials> for ContainerCredentialsResponse {
             } else {
                 Some(cred.session_token.clone())
             },
-            expiration: cred
-                .expiration
-                .as_ref()
-                .and_then(|ts| std::time::SystemTime::try_from(*ts).ok())
-                .map(|st| -> chrono::DateTime<chrono::Utc> { chrono::DateTime::from(st) }),
+            expiration: cred.expiration().ok().flatten(),
         }
     }
 }

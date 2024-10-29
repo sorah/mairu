@@ -14,6 +14,9 @@ pub struct ExecArgs {
     #[arg(long, default_value_t = false)]
     no_login: bool,
 
+    #[arg(long, default_value_t = false)]
+    no_auto_refresh: bool,
+
     #[arg(long)]
     oauth_grant_type: Option<crate::config::OAuthGrantType>,
 
@@ -38,12 +41,30 @@ pub fn run(args: &ExecArgs) -> Result<(), anyhow::Error> {
 #[tokio::main]
 async fn run_inner(mut args: ExecArgs) -> Result<(), anyhow::Error> {
     let mut agent = crate::cmd::agent::connect_or_start().await?;
+
     if args.role == "auto" {
         resolve_auto(&mut args).await?;
     } else if args.server.is_none() {
         anyhow::bail!("--server is required (except when role = 'auto') but not given");
     }
-    preflight_check(&mut agent, &args).await?;
+
+    let mut initial_expiry = None;
+    if !args.no_preflight_check {
+        let r = preflight_check(&mut agent, &args).await?;
+
+        if !args.no_auto_refresh && !args.no_cache {
+            initial_expiry = match r {
+                Some(crate::proto::AssumeRoleResponse {
+                    credentials: Some(ref creds),
+                    ..
+                }) => creds.expiration().ok().flatten(),
+                _ => None,
+            };
+        }
+    }
+
+    let _auto_refresh_shutdown_tx =
+        auto_refresh::start(agent.clone(), args.clone(), initial_expiry); // keep running
     let _provider_shutdown_tx = start_provider(&mut agent, &args).await?; // keep provider running
 
     // TODO: signal handling
@@ -76,7 +97,7 @@ async fn resolve_auto(args: &mut ExecArgs) -> Result<(), anyhow::Error> {
             false
         }
         Some(crate::auto::Trustability::Matched(trust)) => {
-            tracing::debug!(cwd = %cwd.display(), auto = ?auto, trust = ?trust, "Trust is up to date");
+            tracing::trace!(cwd = %cwd.display(), auto = ?auto, trust = ?trust, "Trust is up to date");
             trust.trust
         }
     };
@@ -186,11 +207,7 @@ async fn prompt_trust_using_terminal() -> Result<bool, anyhow::Error> {
 async fn preflight_check(
     agent: &mut crate::agent::AgentConn,
     args: &ExecArgs,
-) -> Result<(), anyhow::Error> {
-    if args.no_preflight_check {
-        return Ok(());
-    }
-
+) -> Result<Option<crate::proto::AssumeRoleResponse>, anyhow::Error> {
     let req = crate::proto::AssumeRoleRequest {
         server_id: args.server.as_ref().unwrap().to_owned(),
         role: args.role.clone(),
@@ -207,9 +224,10 @@ async fn preflight_check(
 
     match resp {
         Ok(r) => {
-            let aki = r.into_inner().credentials.map(|c| c.access_key_id.clone());
+            let resp = r.into_inner();
+            let aki = resp.credentials.as_ref().map(|c| c.access_key_id.clone());
             tracing::debug!(args = ?args, aws_access_key_id = ?aki, "preflight check succeeded");
-            Ok(())
+            Ok(Some(resp))
         }
         Err(e) => {
             tracing::debug!(args = ?args, err = ?e, "preflight check failed");
@@ -404,6 +422,152 @@ async fn static_provider_set(
         }
     }
     Ok(())
+}
+
+mod auto_refresh {
+    use super::*;
+
+    pub(super) fn start(
+        agent: crate::agent::AgentConn,
+        args: ExecArgs,
+        initial_expiry: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<tokio::sync::oneshot::Sender<()>> {
+        match initial_expiry {
+            None => None,
+            Some(id) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(auto_refresh(rx, agent, args, id));
+                Some(tx)
+            }
+        }
+    }
+
+    // XXX: align with credential_cache RENEW_CREDENTIALS_BEFORE_SEC
+    static AUTO_REFRESH_BEFORE: chrono::TimeDelta = chrono::TimeDelta::seconds(897);
+
+    #[tracing::instrument(skip_all)]
+    async fn auto_refresh(
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        mut agent: crate::agent::AgentConn,
+        args: ExecArgs,
+        initial_expiry: chrono::DateTime<chrono::Utc>,
+    ) {
+        let mut expiry = initial_expiry;
+        //let mut expiry = chrono::Utc::now() + chrono::TimeDelta::seconds(60);
+        loop {
+            let mut retries: u32 = 0;
+            let Some(deadline) = calculate_deadline_in_duration(&expiry) else {
+                return;
+            };
+            tracing::debug!(retries = ?retries, expiry = %expiry, wait = ?deadline, "auto_refresh waiting");
+            let sleep = tokio::time::sleep(deadline);
+            tokio::pin!(sleep);
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    tracing::debug!("auto_refresh shutting down");
+                    return;
+                },
+                _ = &mut sleep => {},
+            }
+            tracing::debug!(retries = ?retries, expiry = %expiry, "auto_refresh performing refresh");
+            loop {
+                match perform(&mut agent, &args).await {
+                    Ok(Some(next_expiry)) => {
+                        if expiry != next_expiry {
+                            expiry = next_expiry;
+                            tracing::info!(retries = ?retries, next_expiry = %next_expiry, "auto_refresh refreshed credential cache in agent");
+                            break;
+                        } else {
+                            tracing::info!(retries = ?retries, expiry = %expiry, "auto_refresh attempted to refresh credential cache but still stale");
+                            retries += 1;
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "auto_refresh shutting down due to missing expiration after renewal"
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        retries += 1;
+                    }
+                }
+
+                // retry needed
+                let wait = calculate_retry_wait(retries);
+                tracing::info!(wait = ?wait, "auto_refresh retrying after {wait:?}");
+                let retry_sleep = tokio::time::sleep(wait);
+                tokio::pin!(retry_sleep);
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        tracing::debug!("auto_refresh shutting down");
+                        return;
+                    },
+                    _ = &mut retry_sleep => {},
+                }
+            }
+        }
+    }
+
+    fn calculate_deadline_in_duration(
+        expiry: &chrono::DateTime<chrono::Utc>,
+    ) -> Option<tokio::time::Duration> {
+        let thres = *expiry - AUTO_REFRESH_BEFORE;
+        let delta = thres.signed_duration_since(chrono::Utc::now());
+        match delta.to_std() {
+            Ok(std) => Some(std),
+            Err(_) => Some(tokio::time::Duration::from_secs(1)), // when delta is negative value
+        }
+    }
+
+    fn calculate_retry_wait(retries: u32) -> tokio::time::Duration {
+        use rand::Rng;
+        let initial_backoff = 1.0f64;
+        let max_backoff = tokio::time::Duration::from_secs(120);
+        let base: f64 = rand::thread_rng().gen();
+
+        let wait = match 2u32
+            .checked_pow(retries)
+            .map(|s| (s as f64) * initial_backoff)
+        {
+            Some(r) => match tokio::time::Duration::try_from_secs_f64(r) {
+                Ok(d) => d.min(max_backoff),
+                Err(e) => {
+                    tracing::warn!(err = ?e, "auto_refresh failed to calculate backoff");
+                    max_backoff
+                }
+            },
+            None => max_backoff,
+        };
+        // apply jitter
+        wait.mul_f64(base)
+    }
+
+    async fn perform(
+        agent: &mut crate::agent::AgentConn,
+        args: &ExecArgs,
+    ) -> crate::Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let req = crate::proto::AssumeRoleRequest {
+            server_id: args.server.as_ref().unwrap().to_owned(),
+            role: args.role.clone(),
+            cached: true,
+        };
+        let resp = match agent.assume_role(req.clone()).await {
+            Ok(r) => r.into_inner(),
+            Err(e) => {
+                // When remote access_token is expired, it would lead auto_refresh process backoff
+                // to max_backoff (120s). At this moment, taking the process opportunistic - let
+                // the process resume in max_backoff (at latest) after mairu agent gains a
+                // fresh access_token.
+                if e.code() != tonic::Code::Unauthenticated {
+                    tracing::warn!(req = ?req, err = ?e, "auto_refresh failing");
+                }
+                return Err(e.into());
+            }
+        };
+        let next_expiry = resp.credentials.and_then(|c| c.expiration().ok().flatten());
+        Ok(next_expiry)
+    }
 }
 
 #[tracing::instrument(skip_all)]

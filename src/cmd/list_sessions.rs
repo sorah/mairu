@@ -7,13 +7,14 @@ pub async fn run() -> Result<(), anyhow::Error> {
         .into_inner();
 
     for session in list.sessions.iter() {
-        let expiring = session
-            .expires_at
-            .as_ref()
-            .and_then(|ts| std::time::SystemTime::try_from(*ts).ok())
-            .map(|st| -> chrono::DateTime<chrono::Local> { chrono::DateTime::from(st) })
-            .map(|t| format!(" [until {}]", t))
-            .unwrap_or_else(|| "".to_owned());
+        let expiring = match session.expiration() {
+            Ok(Some(e)) => format!(" [until {e}]"),
+            Ok(None) => "".to_string(),
+            Err(e) => {
+                tracing::warn!(err = ?e, session = ?session, "Invalid expiration timestamp");
+                "".to_string()
+            }
+        };
         println!(
             "{}. {}: {}{}",
             session.id, session.server_id, session.server_url, expiring
