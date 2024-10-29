@@ -90,7 +90,7 @@ where
     ) -> std::sync::Arc<Result<crate::proto::AssumeRoleResponse, BackendRequestError>> {
         self.coalesce_group
             .request(0, || {
-                tracing::debug!(server = ?self, "requesting credentials to backend");
+                tracing::trace!(server = ?self, "requesting credentials to backend");
                 let mut backend = self.backend.clone();
                 async move { backend.request_arc().await }
             })
@@ -213,7 +213,7 @@ async fn handle_get_credentials<B: Backend + 'static, U: UserFeedbackDelegate>(
             .into_response());
     }
 
-    tracing::debug!(server = ?server, "received credentials request");
+    tracing::trace!(server = ?server, "received credentials request");
     let resp = server.request().await;
     match resp.as_ref() {
         Err(be) => {

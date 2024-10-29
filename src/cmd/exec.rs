@@ -76,7 +76,7 @@ async fn resolve_auto(args: &mut ExecArgs) -> Result<(), anyhow::Error> {
             false
         }
         Some(crate::auto::Trustability::Matched(trust)) => {
-            tracing::debug!(cwd = %cwd.display(), auto = ?auto, trust = ?trust, "Trust is up to date");
+            tracing::trace!(cwd = %cwd.display(), auto = ?auto, trust = ?trust, "Trust is up to date");
             trust.trust
         }
     };
