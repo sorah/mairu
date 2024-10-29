@@ -16,14 +16,17 @@ pub async fn login(
     agent: &mut crate::agent::AgentConn,
     args: &LoginArgs,
 ) -> Result<(), anyhow::Error> {
-    let server: crate::config::Server = agent
-        .get_server(tonic::Request::new(crate::proto::GetServerRequest {
-            query: args.server_name.clone(),
-            no_cache: true,
-        }))
-        .await?
-        .into_inner()
-        .try_into()?;
+    let mut server = get_server(agent, &args.server_name).await?;
+    if server.aws_sso.is_some() && server.oauth.is_none() {
+        agent
+            .refresh_aws_sso_client_registration(
+                crate::proto::RefreshAwsSsoClientRegistrationRequest {
+                    server_id: server.id().to_owned(),
+                },
+            )
+            .await?;
+        server = get_server(agent, &args.server_name).await?;
+    }
     server.validate()?;
 
     let oauth = server.oauth.as_ref().unwrap();
@@ -137,4 +140,18 @@ pub async fn do_awssso(
 
     tracing::info!("Logged in");
     Ok(())
+}
+
+async fn get_server(
+    agent: &mut crate::agent::AgentConn,
+    query: &str,
+) -> anyhow::Result<crate::config::Server> {
+    Ok(agent
+        .get_server(tonic::Request::new(crate::proto::GetServerRequest {
+            query: query.to_owned(),
+            no_cache: true,
+        }))
+        .await?
+        .into_inner()
+        .try_into()?)
 }
