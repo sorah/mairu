@@ -303,21 +303,25 @@ async fn login(agent: &mut crate::agent::AgentConn, args: &ExecArgs) -> Result<(
 mod provider {
     use super::*;
 
+    pub(super) struct ProviderHandle {
+        pub(super) shutdown: tokio::sync::oneshot::Sender<()>,
+        pub(super) environment: crate::proto::ExecEnvironment,
+    }
+
     pub(super) async fn start(
         agent: &mut crate::agent::AgentConn,
         args: &ExecArgs,
-    ) -> Result<tokio::sync::oneshot::Sender<()>, anyhow::Error> {
+    ) -> Result<ProviderHandle, anyhow::Error> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        match args.mode {
-            crate::config::ProviderMode::Ecs => {
-                ecs_provider_start(rx, agent, args).await?;
-                Ok(tx)
-            }
-            crate::config::ProviderMode::Static => {
-                static_provider_set(agent, args).await?;
-                Ok(tx)
-            }
-        }
+        let environment = match args.mode {
+            crate::config::ProviderMode::Ecs => ecs_provider_start(rx, agent, args).await?,
+            crate::config::ProviderMode::Static => static_provider_set(agent, args).await?,
+        };
+        environment.apply();
+        Ok(ProviderHandle {
+            shutdown: tx,
+            environment,
+        })
     }
 
     #[tracing::instrument(skip_all)]
@@ -325,7 +329,7 @@ mod provider {
         shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         agent: &mut crate::agent::AgentConn,
         args: &ExecArgs,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<crate::proto::ExecEnvironment, anyhow::Error> {
         let (listener, url) = crate::ecs_server::bind_tcp(None).await?;
         let server = crate::ecs_server::EcsServer::new_with_agent(
             agent.clone(),
@@ -336,17 +340,18 @@ mod provider {
             },
             ExecEcsUserFeedback::from(args),
         );
-        {
+        let environment = {
+            use crate::proto::ExecEnvironmentAction;
             use secrecy::ExposeSecret;
-            std::env::set_var("AWS_CONTAINER_CREDENTIALS_FULL_URI", url.to_string());
-            std::env::set_var(
-                "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-                zeroize::Zeroizing::new(format!(
-                    "Bearer {}",
-                    &server.bearer_token().expose_secret()
-                )),
-            );
-        }
+            let vars = [
+                ExecEnvironmentAction::Set("AWS_CONTAINER_CREDENTIALS_FULL_URI", url.to_string()),
+                ExecEnvironmentAction::Set(
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                    format!("Bearer {}", &server.bearer_token().expose_secret()),
+                ),
+            ];
+            crate::proto::ExecEnvironment::from_iter(vars.into_iter())
+        };
         tokio::spawn(async move {
             axum::serve(listener, server.router())
                 .with_graceful_shutdown(async {
@@ -357,7 +362,7 @@ mod provider {
                 .ok();
             tracing::debug!("ECS Server down");
         });
-        Ok(())
+        Ok(environment)
     }
 
     #[derive(Debug, Clone)]
@@ -406,7 +411,7 @@ mod provider {
     async fn static_provider_set(
         agent: &mut crate::agent::AgentConn,
         args: &ExecArgs,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<crate::proto::ExecEnvironment, anyhow::Error> {
         let resp = agent
             .assume_role(crate::proto::AssumeRoleRequest {
                 server_id: args.server.as_ref().unwrap().to_owned(),
@@ -419,16 +424,23 @@ mod provider {
             .credentials
             .ok_or_else(|| anyhow::anyhow!("agent sent empty credentials"))?;
 
-        {
-            std::env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
-            if !creds.session_token.is_empty() {
-                std::env::set_var("AWS_SESSION_TOKEN", &creds.session_token);
-            } else {
-                std::env::remove_var("AWS_SESSION_TOKEN");
-            }
-        }
-        Ok(())
+        let environment = {
+            use crate::proto::ExecEnvironmentAction;
+            let vars = [
+                ExecEnvironmentAction::Set("AWS_ACCESS_KEY_ID", creds.access_key_id.clone()),
+                ExecEnvironmentAction::Set(
+                    "AWS_SECRET_ACCESS_KEY",
+                    creds.secret_access_key.clone(),
+                ),
+                if !creds.session_token.is_empty() {
+                    ExecEnvironmentAction::Set("AWS_SESSION_TOKEN", creds.session_token.clone())
+                } else {
+                    ExecEnvironmentAction::Remove("AWS_SESSION_TOKEN")
+                },
+            ];
+            crate::proto::ExecEnvironment::from_iter(vars.into_iter())
+        };
+        Ok(environment)
     }
 }
 
