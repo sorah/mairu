@@ -1,34 +1,49 @@
 #[derive(clap::Args, Debug, Clone)]
 pub struct ExecArgs {
+    /// 'role' parameter to query your credential server.
+    /// For AWS SSO servers, this is formatted like "${account_id}/${permission_set_name}"
+    ///
+    /// Automatic role selection based on .mairu.json file is enabled when 'auto' is specified.
     role: String,
 
+    /// Credential server ID or URL to use. Not required when using 'auto' role.
     #[arg(long)]
     server: Option<String>,
 
+    /// Disable credential cache on mairu agent. Implies --no-auto-refresh.
     #[arg(long, default_value_t = false)]
     no_cache: bool,
 
+    /// Choose how mairu-exec supplies AWS credentials to a command.
     #[arg(long, short, default_value = "ecs")]
     mode: crate::config::ProviderMode,
 
+    /// Let mairu-exec quickly fail when login is required, rather than prompting to login.
     #[arg(long, default_value_t = false)]
     no_login: bool,
 
+    /// Disable automatic credentials refresh which is useful for slow credential servers.
     #[arg(long, default_value_t = false)]
     no_auto_refresh: bool,
 
+    /// Override OAuth grant type to use when logging in.
     #[arg(long)]
     oauth_grant_type: Option<crate::config::OAuthGrantType>,
 
+    /// Skip obtaining credentials before executing a command to verify valid configuration is given.
+    /// Implies --no-auto-refresh.
     #[arg(long, default_value_t = false)]
     no_preflight_check: bool,
 
+    /// Trust .mairu.json file if the given digest matches to the present .mairu.json file.
     #[arg(long)]
     confirm_trust: Option<String>,
 
+    /// Display which server and role was chosen when using 'auto' role.
     #[arg(long, env = "MAIRU_SHOW_AUTO_ROLE", default_value_t = false)]
     show_auto: bool,
 
+    /// Command line to execute.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<std::ffi::OsString>,
 }

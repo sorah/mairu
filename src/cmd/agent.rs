@@ -1,8 +1,10 @@
 #[derive(clap::Args)]
 pub struct AgentArgs {
+    /// Run as a daemon.
     #[arg(long, default_value_t = false)]
     daemonize: bool,
 
+    /// Enable logging to file ($XDG_STATE_HOME/mairu/log/*).
     #[arg(long, default_value_t = false)]
     pub log_to_file: bool,
 }

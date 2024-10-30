@@ -1,13 +1,20 @@
 #[derive(clap::Args, Debug)]
 pub struct SetupSsoArgs {
+    /// Credential server ID to use. Also be used for configuration file name.
+    /// ($XDG_CONFIG_HOME/servers.d/${server_id}.json)
     server_id: String,
+    /// AWS region name of your AWS SSO instance.
     #[arg(short, long)]
     region: String,
+    /// Start URL of your AWS SSO instance; e.g. https://{something}.awsapps.com/start
     #[arg(short = 'u', long)]
     start_url: url::Url,
+
+    /// Customize scope for OAuth 2.0 authorization.
     #[arg(short, long, default_values_t  = vec!["sso:account:access".to_owned()])]
     scope: Vec<String>,
 
+    /// Proceed and override even if the configuration file with the same SERVER_ID already exists.
     #[arg(short = 'y', long, default_value_t = false)]
     overwrite: bool,
 }

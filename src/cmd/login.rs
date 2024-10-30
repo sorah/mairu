@@ -1,8 +1,10 @@
 #[derive(clap::Args)]
 pub struct LoginArgs {
+    /// Override OAuth 2 grant type to use.
     #[arg(long)]
     pub oauth_grant_type: Option<crate::config::OAuthGrantType>,
 
+    /// Credential server ID or URL to use.
     pub server_name: String,
 }
 

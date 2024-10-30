@@ -1,6 +1,6 @@
 #[derive(clap::Parser)]
 #[clap(author, version, long_about = None)]
-#[clap(about = "Mairu TODO:")]
+#[clap(about = "Mairu: on-memory AWS credentials agent")]
 #[clap(propagate_version = true)]
 struct Cli {
     #[clap(subcommand)]
@@ -9,12 +9,20 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
-    Agent(mairu::cmd::agent::AgentArgs),
-    Login(mairu::cmd::login::LoginArgs),
-    CredentialProcess(mairu::cmd::credential_process::CredentialProcessArgs),
-    ListSessions,
+    /// Execute command with AWS credentials
     Exec(mairu::cmd::exec::ExecArgs),
 
+    /// Login to your credential server
+    Login(mairu::cmd::login::LoginArgs),
+    /// Use Mairu as a credenital process provider
+    CredentialProcess(mairu::cmd::credential_process::CredentialProcessArgs),
+    /// List active sessions
+    ListSessions,
+
+    /// Manually start agent process; it is automatically spawned when not present
+    Agent(mairu::cmd::agent::AgentArgs),
+
+    /// Setup Mairu for your AWS SSO (AWS IAM Identity Center) instance
     SetupSso(mairu::cmd::setup_sso::SetupSsoArgs),
 }
 

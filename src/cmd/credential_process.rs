@@ -1,8 +1,13 @@
 #[derive(clap::Args, Debug)]
 pub struct CredentialProcessArgs {
+    /// Credential server ID or URL to use.
     server: String,
+
+    /// 'role' parameter to query your credential server.
+    /// For AWS SSO servers, this is formatted like "${account_id}/${permission_set_name}"
     role: String,
 
+    /// Disable credential cache on mairu agent.
     #[arg(long, default_value_t = false)]
     no_cache: bool,
 }
