@@ -97,9 +97,22 @@ impl std::fmt::Debug for Server {
 
 impl Server {
     pub async fn find_from_fs(query: &str) -> crate::Result<Self> {
-        let mut d = tokio::fs::read_dir(config_dir().join("servers.d"))
-            .await
-            .map_err(|e| crate::Error::ConfigError(format!("Can't list servers.d: {}", e)))?;
+        let mut d = match tokio::fs::read_dir(config_dir().join("servers.d")).await {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(err = ?e, "servers.d not found");
+                return Err(crate::Error::UserError(format!(
+                    "No server configuration found for: {}",
+                    query
+                )));
+            }
+            Err(e) => {
+                return Err(crate::Error::ConfigError(format!(
+                    "Can't list servers.d: {}",
+                    e
+                )));
+            }
+        };
         let mut id_result = None;
         let mut url_result = vec![];
         while let Some(entry) = d.next_entry().await? {

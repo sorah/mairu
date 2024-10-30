@@ -50,6 +50,7 @@ pub async fn run(args: &SetupSsoArgs) -> Result<(), anyhow::Error> {
         }),
     };
 
+    tokio::fs::create_dir_all(server.config_path.parent().unwrap()).await?;
     {
         use tokio::io::AsyncWriteExt;
         let data = serde_json::to_string_pretty(&server)?;
