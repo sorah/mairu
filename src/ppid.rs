@@ -85,9 +85,18 @@ cfg_if::cfg_if! {
     } else if #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))] {
         fn subscribe_parent_process_die_as_signal() -> Result<bool, anyhow::Error> {
             // FIXME: https://github.com/nix-rust/nix/pull/2164
-            rustix::process::procctl::set_parent_process_death_signal(Some(PDEATHSIG as i32))
-                .map_err(|e| anyhow::error!("Failed to set_parent_process_death_signal (PROC_PDEATHSIG_CTL); {}", e))?;
-            todo!()
+            rustix::process::set_parent_process_death_signal(Some(
+                rustix::process::Signal::from_raw(PDEATHSIG as std::os::raw::c_int).ok_or_else(|| {
+                    anyhow::anyhow!("Failed to set_parent_process_death_signal (failed to have signal)")
+                })?,
+            ))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to set_parent_process_death_signal (PROC_PDEATHSIG_CTL); {}",
+                    e
+                )
+            })?;
+            Ok(true)
         }
     } else {
         #[inline]
