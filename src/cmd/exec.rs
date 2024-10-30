@@ -70,8 +70,6 @@ async fn run_inner(mut args: ExecArgs) -> Result<(), anyhow::Error> {
         auto_refresh::start(agent.clone(), args.clone(), initial_expiry); // keep running
     let _provider_shutdown_tx = start_provider(&mut agent, &args).await?; // keep provider running
 
-    // TODO: signal handling
-    // TODO: early credential cache refresh to workaround SDK timeouts
     execute(&args).await
 }
 #[tracing::instrument(skip_all)]
