@@ -12,9 +12,11 @@ Therefore, a credential server must implement OAuth 2.0 endpoints for a one of s
     - _Authentication server MUST support PKCE for auth code grant type_
     - authorization endpoint (default to `{url}/oauth/authorize`)
     - token endpoint (default to `{url}/oauth/token`)
-- For device authorization grant
+
+<!-- TODO: For device authorization grant
     - device authorization endpoint (default to `{url}/oauth/device`)
     - token endpoint (default to `{url}/oauth/token`)
+-->
 
 ### Assume Role Credentials API
 

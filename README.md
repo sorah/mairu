@@ -138,7 +138,8 @@ Mairu supports the following methods to provide credentials to AWS SDK. Choose y
 
 - `ecs` (default): Run ephemeral server to emulate [container provider](https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html). AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN environment variable will be exposed and supports automatic renewal.
 - `static`: Expose traditional AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN environment variables ([static credentials](https://docs.aws.amazon.com/sdkref/latest/guide/feature-static-credentials.html)). This method doesn't support automatic renewal, so you have to restart `mairu exec` when credentials have expired.
-< -- - `docker`: Similar to `ecs`, but launch a proxy container on Docker to connect Mairu agent from Docker containers. See [Docker support](#docker-support) for details. AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN environment will be exposed and supports automatic renewal. -->
+
+<-- TODO: - `docker`: Similar to `ecs`, but launch a proxy container on Docker to connect Mairu agent from Docker containers. See [Docker support](#docker-support) for details. AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN environment will be exposed and supports automatic renewal. -->
 
 Your preferred method can be specified in `--mode`:
 
@@ -148,9 +149,13 @@ $ mariu exec --mode=static auto rails server
 
 Alternatively, you can use Mairu `mairu credential-process` command for [process credential provider](https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html).
 
+<!--
+
 ### Docker support
 
 TBD
+
+-->
 
 ### Agent process
 
