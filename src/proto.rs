@@ -64,3 +64,52 @@ impl FromIterator<ExecEnvironmentAction> for ExecEnvironment {
         }
     }
 }
+
+static EXEC_IPC_VERSION: u32 = 100u32;
+
+impl ExecIpcInformExecutorRequest {
+    #[inline]
+    pub(crate) fn ready(ready: crate::proto::exec_ipc_inform_executor_request::Ready) -> Self {
+        crate::proto::ExecIpcInformExecutorRequest {
+            version: EXEC_IPC_VERSION,
+            result: Some(crate::proto::exec_ipc_inform_executor_request::Result::Ready(ready)),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn failure(
+        failure: crate::proto::exec_ipc_inform_executor_request::Failure,
+    ) -> Self {
+        crate::proto::ExecIpcInformExecutorRequest {
+            version: EXEC_IPC_VERSION,
+            result: Some(crate::proto::exec_ipc_inform_executor_request::Result::Failure(failure)),
+        }
+    }
+
+    pub(crate) fn into_std(
+        self,
+    ) -> Result<crate::proto::exec_ipc_inform_executor_request::Ready, crate::Error> {
+        if self.version == 0 {
+            return Err(crate::Error::SidecarError(
+                "Invalid data from sidecar; version==0, sidecar may be unexpectedly died?"
+                    .to_string(),
+            ));
+        }
+        if self.version != EXEC_IPC_VERSION {
+            return Err(crate::Error::SidecarError(
+                "Invalid data from sidecar; wrong version, sidecar may be unexpectedly died?"
+                    .to_string(),
+            ));
+        }
+        match self.result {
+            None => Err(crate::Error::SidecarError(
+                "Invalid data from sidecar; missing result, sidecar may be unexpectedly died?"
+                    .to_string(),
+            )),
+            Some(crate::proto::exec_ipc_inform_executor_request::Result::Failure(f)) => Err(
+                crate::Error::SidecarError(format!("Error in Sidecar: {}", f.error_message)),
+            ),
+            Some(crate::proto::exec_ipc_inform_executor_request::Result::Ready(info)) => Ok(info),
+        }
+    }
+}

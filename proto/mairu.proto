@@ -121,3 +121,17 @@ message ExecEnvironment {
   repeated string remove_vars = 2;
 }
 // NOTE: ExecEnvironmentAction (helper enum) is implemented directly on proto.rs
+
+message ExecIpcInformExecutorRequest {
+  uint32 version = 1;
+  message Ready {
+    ExecEnvironment environment = 1;
+  }
+  message Failure {
+    string error_message = 1;
+  }
+  oneof result {
+    Ready ready = 2;
+    Failure failure = 3;
+  }
+}
