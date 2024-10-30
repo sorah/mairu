@@ -109,3 +109,29 @@ message CompleteAwsSsoDeviceRequest {
 }
 message CompleteAwsSsoDeviceResponse {
 }
+
+//----- The following is used for mairu-exec subprocess IPC
+
+message ExecEnvVar {
+  string name = 1;
+  string value = 2;
+}
+message ExecEnvironment {
+  repeated ExecEnvVar set_vars = 1;
+  repeated string remove_vars = 2;
+}
+// NOTE: ExecEnvironmentAction (helper enum) is implemented directly on proto.rs
+
+message ExecIpcInformExecutorRequest {
+  uint32 version = 1;
+  message Ready {
+    ExecEnvironment environment = 1;
+  }
+  message Failure {
+    string error_message = 1;
+  }
+  oneof result {
+    Ready ready = 2;
+    Failure failure = 3;
+  }
+}

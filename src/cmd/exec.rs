@@ -29,20 +29,123 @@ pub struct ExecArgs {
     #[arg(long, env = "MAIRU_SHOW_AUTO_ROLE", default_value_t = false)]
     show_auto: bool,
 
-    #[arg(long)]
-    forward_signals: Vec<String>,
-
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<std::ffi::OsString>,
 }
 
+#[cfg(unix)]
 pub fn run(args: &ExecArgs) -> Result<(), anyhow::Error> {
     crate::config::trust_dir_mkpath()?;
-    run_inner(args.clone()) // XXX: &mut
+
+    // mairu-exec spawns a credential provider in a child process; we call it 'sidecar'.
+    // The specified command will be execvp(2)'d in a parent process; we call it 'executor'.
+    // This strategy lets Mairu transparent from other processes, in terms of handling signals and
+    // returning exit status; including signals.
+    //
+    // The executor first waits for an information from the sidecar. The sidecar informs the
+    // executor with necessary informations such as environment variables when it become ready. The
+    // executor then applies the variables and execvp(2)s the specified command line.
+    //
+    // The sidecar monitors the parent process (formerly an executor) while keep provider running,
+    // and terminates when the parent is gone.
+
+    let (ipc_i, ipc_o) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+    let pid = nix::unistd::Pid::this();
+    match unsafe { nix::unistd::fork() }? {
+        nix::unistd::ForkResult::Parent { child, .. } => {
+            drop(ipc_o);
+            executor::run(child, ipc_i, args.clone())
+        }
+        nix::unistd::ForkResult::Child => {
+            drop(ipc_i);
+            start_ignoring_signals();
+            run_sidecar(pid, ipc_o, args.clone())
+        }
+    }
 }
 
 #[tokio::main]
-async fn run_inner(mut args: ExecArgs) -> Result<(), anyhow::Error> {
+async fn run_sidecar(
+    parent: nix::unistd::Pid,
+    ipc: std::os::fd::OwnedFd,
+    args: ExecArgs,
+) -> Result<(), anyhow::Error> {
+    let main = do_sidecar(ipc, args);
+    let _result = tokio::spawn(main);
+    crate::ppid::wait_for_parent_process_die(parent).await?;
+    tracing::debug!("sidecar exiting");
+    Ok(())
+}
+
+struct SidecarHandler {
+    #[allow(dead_code)] // TODO: use SidecarHandler.auto_refresh_shutdown_tx
+    auto_refresh_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    provider: provider::ProviderHandle,
+}
+
+impl SidecarHandler {
+    fn info(&self) -> crate::proto::exec_ipc_inform_executor_request::Ready {
+        crate::proto::exec_ipc_inform_executor_request::Ready {
+            environment: Some(self.provider.environment.clone()),
+        }
+    }
+}
+
+async fn do_sidecar(
+    ipc: std::os::fd::OwnedFd,
+    args: ExecArgs,
+) -> Result<SidecarHandler, anyhow::Error> {
+    match do_sidecar_inner(args).await {
+        Ok(handler) => {
+            if let Err(e) = inform_executor(
+                ipc,
+                crate::proto::ExecIpcInformExecutorRequest::ready(handler.info()),
+            )
+            .await
+            {
+                tracing::warn!(err = ?e, "Error informing the executor")
+            };
+            Ok(handler)
+        }
+        Err(e) => {
+            if let Err(e) = inform_executor(
+                ipc,
+                crate::proto::ExecIpcInformExecutorRequest::failure(
+                    crate::proto::exec_ipc_inform_executor_request::Failure {
+                        error_message: e.to_string(),
+                    },
+                ),
+            )
+            .await
+            {
+                tracing::warn!(err = ?e, "Error informing the executor an error")
+            };
+            Err(e)
+        }
+    }
+}
+
+async fn inform_executor(
+    ipc_fd: std::os::fd::OwnedFd,
+    message: crate::proto::ExecIpcInformExecutorRequest,
+) -> Result<(), anyhow::Error> {
+    use prost::Message;
+    use tokio::io::AsyncWriteExt;
+    let mut ipc = tokio::fs::File::from_std(std::fs::File::from(ipc_fd));
+    let payload = zeroize::Zeroizing::new(message.encode_to_vec());
+    ipc.write_all(payload.as_slice())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to inform executor; {}", e))?;
+    ipc.flush()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to inform executor (flush); {}", e))?;
+    drop(ipc);
+    tracing::debug!("Informed executor");
+    Ok(())
+}
+
+#[tracing::instrument(name = "run_sidecar", skip_all)]
+async fn do_sidecar_inner(mut args: ExecArgs) -> Result<SidecarHandler, anyhow::Error> {
     let mut agent = crate::cmd::agent::connect_or_start().await?;
 
     if args.role == "auto" {
@@ -66,14 +169,15 @@ async fn run_inner(mut args: ExecArgs) -> Result<(), anyhow::Error> {
         }
     }
 
-    let _auto_refresh_shutdown_tx =
-        auto_refresh::start(agent.clone(), args.clone(), initial_expiry); // keep running
-    let _provider_shutdown_tx = start_provider(&mut agent, &args).await?; // keep provider running
+    let auto_refresh_shutdown_tx = auto_refresh::start(agent.clone(), args.clone(), initial_expiry); // keep running
+    let provider = provider::start(&mut agent, &args).await?; // keep provider running
 
-    // TODO: signal handling
-    // TODO: early credential cache refresh to workaround SDK timeouts
-    execute(&args).await
+    Ok(SidecarHandler {
+        auto_refresh_shutdown_tx,
+        provider,
+    })
 }
+
 #[tracing::instrument(skip_all)]
 async fn resolve_auto(args: &mut ExecArgs) -> Result<(), anyhow::Error> {
     let cwd = std::env::current_dir()
@@ -126,6 +230,7 @@ async fn resolve_auto(args: &mut ExecArgs) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+#[tracing::instrument(skip_all)]
 async fn ask_trust(args: &ExecArgs, auto: &crate::auto::Auto) -> Result<(), anyhow::Error> {
     let product = env!("CARGO_PKG_NAME");
 
@@ -302,82 +407,94 @@ async fn login(agent: &mut crate::agent::AgentConn, args: &ExecArgs) -> Result<(
     }
 }
 
-async fn start_provider(
-    agent: &mut crate::agent::AgentConn,
-    args: &ExecArgs,
-) -> Result<tokio::sync::oneshot::Sender<()>, anyhow::Error> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    match args.mode {
-        crate::config::ProviderMode::Ecs => {
-            ecs_provider_start(rx, agent, args).await?;
-            Ok(tx)
-        }
-        crate::config::ProviderMode::Static => {
-            static_provider_set(agent, args).await?;
-            Ok(tx)
-        }
-    }
-}
+mod provider {
+    use super::*;
 
-#[tracing::instrument(skip_all)]
-async fn ecs_provider_start(
-    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-    agent: &mut crate::agent::AgentConn,
-    args: &ExecArgs,
-) -> Result<(), anyhow::Error> {
-    let (listener, url) = crate::ecs_server::bind_tcp(None).await?;
-    let server = crate::ecs_server::EcsServer::new_with_agent(
-        agent.clone(),
-        crate::proto::AssumeRoleRequest {
-            server_id: args.server.as_ref().unwrap().to_owned(),
-            role: args.role.clone(),
-            cached: !args.no_cache,
-        },
-        ExecEcsUserFeedback::from(args),
-    );
-    {
-        use secrecy::ExposeSecret;
-        std::env::set_var("AWS_CONTAINER_CREDENTIALS_FULL_URI", url.to_string());
-        std::env::set_var(
-            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-            zeroize::Zeroizing::new(format!("Bearer {}", &server.bearer_token().expose_secret())),
+    pub(super) struct ProviderHandle {
+        #[allow(dead_code)] // TODO: use ProviderHandle#shutdown
+        pub(super) shutdown: tokio::sync::oneshot::Sender<()>,
+        pub(super) environment: crate::proto::ExecEnvironment,
+    }
+
+    pub(super) async fn start(
+        agent: &mut crate::agent::AgentConn,
+        args: &ExecArgs,
+    ) -> Result<ProviderHandle, anyhow::Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let environment = match args.mode {
+            crate::config::ProviderMode::Ecs => ecs_provider_start(rx, agent, args).await?,
+            crate::config::ProviderMode::Static => static_provider_set(agent, args).await?,
+        };
+        environment.apply();
+        Ok(ProviderHandle {
+            shutdown: tx,
+            environment,
+        })
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn ecs_provider_start(
+        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        agent: &mut crate::agent::AgentConn,
+        args: &ExecArgs,
+    ) -> Result<crate::proto::ExecEnvironment, anyhow::Error> {
+        let (listener, url) = crate::ecs_server::bind_tcp(None).await?;
+        let server = crate::ecs_server::EcsServer::new_with_agent(
+            agent.clone(),
+            crate::proto::AssumeRoleRequest {
+                server_id: args.server.as_ref().unwrap().to_owned(),
+                role: args.role.clone(),
+                cached: !args.no_cache,
+            },
+            ExecEcsUserFeedback::from(args),
         );
+        let environment = {
+            use crate::proto::ExecEnvironmentAction;
+            use secrecy::ExposeSecret;
+            let vars = [
+                ExecEnvironmentAction::Set("AWS_CONTAINER_CREDENTIALS_FULL_URI", url.to_string()),
+                ExecEnvironmentAction::Set(
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                    format!("Bearer {}", &server.bearer_token().expose_secret()),
+                ),
+            ];
+            crate::proto::ExecEnvironment::from_iter(vars.into_iter())
+        };
+        tokio::spawn(async move {
+            axum::serve(listener, server.router())
+                .with_graceful_shutdown(async {
+                    shutdown_rx.await.ok();
+                    tracing::trace!("ECS Server shutting down");
+                })
+                .await
+                .ok();
+            tracing::debug!("ECS Server down");
+        });
+        Ok(environment)
     }
-    tokio::spawn(async move {
-        axum::serve(listener, server.router())
-            .with_graceful_shutdown(async {
-                shutdown_rx.await.ok();
-                tracing::trace!("ECS Server shutting down");
-            })
-            .await
-            .ok();
-        tracing::debug!("ECS Server down");
-    });
-    Ok(())
-}
 
-#[derive(Debug, Clone)]
-struct ExecEcsUserFeedback {
-    role: String,
-    server: String,
-}
+    #[derive(Debug, Clone)]
+    struct ExecEcsUserFeedback {
+        role: String,
+        server: String,
+    }
 
-impl From<&ExecArgs> for ExecEcsUserFeedback {
-    fn from(a: &ExecArgs) -> Self {
-        Self {
-            role: a.role.clone(),
-            server: a.server.as_ref().unwrap().to_owned(),
+    impl From<&ExecArgs> for ExecEcsUserFeedback {
+        fn from(a: &ExecArgs) -> Self {
+            Self {
+                role: a.role.clone(),
+                server: a.server.as_ref().unwrap().to_owned(),
+            }
         }
     }
-}
 
-impl crate::ecs_server::UserFeedbackDelegate for ExecEcsUserFeedback {
-    async fn on_error(&self, err: &crate::ecs_server::BackendRequestError) {
-        let product = env!("CARGO_PKG_NAME");
-        let server = &self.server;
-        let role = &self.role;
-        let e = err.ui_message();
-        crate::terminal::send(&(match &err {
+    impl crate::ecs_server::UserFeedbackDelegate for ExecEcsUserFeedback {
+        async fn on_error(&self, err: &crate::ecs_server::BackendRequestError) {
+            let product = env!("CARGO_PKG_NAME");
+            let server = &self.server;
+            let role = &self.role;
+            let e = err.ui_message();
+            crate::terminal::send(&(match &err {
             crate::ecs_server::BackendRequestError::Forbidden(_) => {
                 indoc::formatdoc! {"
                     :: {product} :: Forbidden while retrieving AWS credentials of {role} from {server}; {e}. To login again, run: $ {product} login {server}
@@ -395,36 +512,44 @@ impl crate::ecs_server::UserFeedbackDelegate for ExecEcsUserFeedback {
                 "}
             }
         })).await;
-    }
-}
-
-#[tracing::instrument(skip_all)]
-async fn static_provider_set(
-    agent: &mut crate::agent::AgentConn,
-    args: &ExecArgs,
-) -> Result<(), anyhow::Error> {
-    let resp = agent
-        .assume_role(crate::proto::AssumeRoleRequest {
-            server_id: args.server.as_ref().unwrap().to_owned(),
-            role: args.role.clone(),
-            cached: !args.no_cache,
-        })
-        .await?
-        .into_inner();
-    let creds = resp
-        .credentials
-        .ok_or_else(|| anyhow::anyhow!("agent sent empty credentials"))?;
-
-    {
-        std::env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
-        if !creds.session_token.is_empty() {
-            std::env::set_var("AWS_SESSION_TOKEN", &creds.session_token);
-        } else {
-            std::env::remove_var("AWS_SESSION_TOKEN");
         }
     }
-    Ok(())
+
+    #[tracing::instrument(skip_all)]
+    async fn static_provider_set(
+        agent: &mut crate::agent::AgentConn,
+        args: &ExecArgs,
+    ) -> Result<crate::proto::ExecEnvironment, anyhow::Error> {
+        let resp = agent
+            .assume_role(crate::proto::AssumeRoleRequest {
+                server_id: args.server.as_ref().unwrap().to_owned(),
+                role: args.role.clone(),
+                cached: !args.no_cache,
+            })
+            .await?
+            .into_inner();
+        let creds = resp
+            .credentials
+            .ok_or_else(|| anyhow::anyhow!("agent sent empty credentials"))?;
+
+        let environment = {
+            use crate::proto::ExecEnvironmentAction;
+            let vars = [
+                ExecEnvironmentAction::Set("AWS_ACCESS_KEY_ID", creds.access_key_id.clone()),
+                ExecEnvironmentAction::Set(
+                    "AWS_SECRET_ACCESS_KEY",
+                    creds.secret_access_key.clone(),
+                ),
+                if !creds.session_token.is_empty() {
+                    ExecEnvironmentAction::Set("AWS_SESSION_TOKEN", creds.session_token.clone())
+                } else {
+                    ExecEnvironmentAction::Remove("AWS_SESSION_TOKEN")
+                },
+            ];
+            crate::proto::ExecEnvironment::from_iter(vars.into_iter())
+        };
+        Ok(environment)
+    }
 }
 
 mod auto_refresh {
@@ -573,96 +698,61 @@ mod auto_refresh {
     }
 }
 
-#[tracing::instrument(skip_all)]
-async fn execute(args: &ExecArgs) -> Result<(), anyhow::Error> {
-    use tokio_stream::StreamExt;
-    let arg0 = args
-        .command
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?;
-    let mut child = tokio::process::Command::new(arg0)
-        .args(&args.command[1..])
-        .spawn()?;
-    let pid = child.id();
+mod executor {
+    use super::*;
 
-    start_ignoring_signals();
-    let forwarded_signals = execute_listen_for_forwarded_signals(&args.forward_signals);
-    let waitpid = child.wait();
+    #[tracing::instrument(name = "executor_run", skip_all)]
+    pub(super) fn run(
+        sidecar_pid: nix::unistd::Pid,
+        ipc_fd: std::os::fd::OwnedFd,
+        args: ExecArgs,
+    ) -> Result<(), anyhow::Error> {
+        use prost::Message;
+        use std::io::Read;
 
-    tokio::pin!(waitpid);
-    tokio::pin!(forwarded_signals);
-    loop {
-        tokio::select! {
-            maybe_status = &mut waitpid => {
-                let status = maybe_status.unwrap();
-                return match status.code() {
-                    Some(0) => Ok(()),
-                    Some(code) => {
-                        let returning_code = std::process::ExitCode::from(code as u8);
-                        Err(crate::Error::SilentlyExitWithCode(returning_code).into())
-                    }
-                    None => handle_exit_status_signaled(status),
-                }
+        tracing::trace!(sidecar_pid = ?sidecar_pid, "Waiting for information from the sidecar");
+        let info = {
+            let mut ipc = std::fs::File::from(ipc_fd);
+            let mut buf = zeroize::Zeroizing::new(vec![]);
+            ipc.read_to_end(&mut buf)
+                .map_err(|e| anyhow::anyhow!("Failed to read data from sidecar; {}", e))?;
+            crate::proto::ExecIpcInformExecutorRequest::decode(&mut std::io::Cursor::new(
+                buf.as_slice(),
+            ))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to decode data from sidecar (it maybe unexpectedly crashed?); {}",
+                    e
+                )
+            })?
+        };
+        match info.into_std() {
+            Err(e) => {
+                tracing::error!(err = ?e, "Error in sidecar");
+                Err(crate::Error::FailureButSilentlyExit.into())
             }
-            signal =  forwarded_signals.next() => {
-                tracing::debug!(signal = ?signal, pid = ?pid, "Forwarding signal");
-                #[cfg(unix)]
-                if let Some(pid_u32) = pid {
-                    if let Err(e) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid_u32 as i32), signal) {
-                        tracing::warn!(signal = ?signal, pid = ?pid, err = ?e, "Failed to forward signal; kill(2) returned error");
-                    }
-                }
-            }
+            // Sidecar is ready (provider is up and running); execvp(2) the given command
+            Ok(info) => execute(info, args),
         }
     }
-}
 
-#[cfg(unix)]
-fn execute_listen_for_forwarded_signals(
-    signal_names: &Vec<String>,
-) -> impl futures_core::stream::Stream<Item = nix::sys::signal::Signal> {
-    use std::str::FromStr;
-    use tokio_stream::StreamExt;
-
-    let streams = signal_names
-        .iter()
-        .filter_map(
-            |name| match nix::sys::signal::Signal::from_str(name.as_str()) {
-                Ok(sig) => Some(sig),
-                Err(e) => {
-                    tracing::warn!(err = ?e, signal_name = ?name, "Unknown signal to forward: {name}");
-                    None
-                }
-            },
-        )
-        .filter_map(|sig| {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(
-                sig as std::os::raw::c_int,
-            )) {
-                Ok(l) => Some((sig, tokio_stream::wrappers::SignalStream::new(l))),
-                Err(e) => {
-                    tracing::warn!(err = ?e, signal = ?sig, "Failed to listen for forwarded signal");
-                    None
-                }
-            }
-        });
-    let mut map = tokio_stream::StreamMap::from_iter(streams);
-
-    async_stream::stream! {
-        while let Some((sig, _)) = map.next().await {
-            yield sig;
+    fn execute(
+        info: crate::proto::exec_ipc_inform_executor_request::Ready,
+        args: ExecArgs,
+    ) -> Result<(), anyhow::Error> {
+        use std::os::unix::process::CommandExt;
+        if let Some(env) = info.environment {
+            env.apply();
         }
+        let arg0 = args
+            .command
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?;
+        let err = std::process::Command::new(arg0)
+            .args(&args.command[1..])
+            .exec();
+        anyhow::bail!("Couldn't exec the command line: {}", err);
     }
-}
-
-#[cfg(unix)]
-fn handle_exit_status_signaled(status: std::process::ExitStatus) -> Result<(), anyhow::Error> {
-    use std::os::unix::process::ExitStatusExt;
-    if let Some(sig) = status.signal() {
-        let code = std::process::ExitCode::from(128 + (sig as u8));
-        return Err(crate::Error::SilentlyExitWithCode(code).into());
-    }
-    Err(crate::Error::FailureButSilentlyExit.into())
 }
 
 #[cfg(unix)]

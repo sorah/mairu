@@ -48,6 +48,9 @@ pub enum Error {
     #[error(transparent)]
     RemoteError(#[from] crate::client::Error),
 
+    #[error("{0}")]
+    SidecarError(String),
+
     /// Failure, but we don't want to emit error to stderr/out anymore. Used in cmd
     #[error("")]
     FailureButSilentlyExit,
