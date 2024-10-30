@@ -68,7 +68,7 @@ async fn run_inner(mut args: ExecArgs) -> Result<(), anyhow::Error> {
 
     let _auto_refresh_shutdown_tx =
         auto_refresh::start(agent.clone(), args.clone(), initial_expiry); // keep running
-    let _provider_shutdown_tx = start_provider(&mut agent, &args).await?; // keep provider running
+    let _provider_shutdown_tx = provider::start(&mut agent, &args).await?; // keep provider running
 
     execute(&args).await
 }
@@ -300,82 +300,88 @@ async fn login(agent: &mut crate::agent::AgentConn, args: &ExecArgs) -> Result<(
     }
 }
 
-async fn start_provider(
-    agent: &mut crate::agent::AgentConn,
-    args: &ExecArgs,
-) -> Result<tokio::sync::oneshot::Sender<()>, anyhow::Error> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    match args.mode {
-        crate::config::ProviderMode::Ecs => {
-            ecs_provider_start(rx, agent, args).await?;
-            Ok(tx)
-        }
-        crate::config::ProviderMode::Static => {
-            static_provider_set(agent, args).await?;
-            Ok(tx)
+mod provider {
+    use super::*;
+
+    pub(super) async fn start(
+        agent: &mut crate::agent::AgentConn,
+        args: &ExecArgs,
+    ) -> Result<tokio::sync::oneshot::Sender<()>, anyhow::Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match args.mode {
+            crate::config::ProviderMode::Ecs => {
+                ecs_provider_start(rx, agent, args).await?;
+                Ok(tx)
+            }
+            crate::config::ProviderMode::Static => {
+                static_provider_set(agent, args).await?;
+                Ok(tx)
+            }
         }
     }
-}
 
-#[tracing::instrument(skip_all)]
-async fn ecs_provider_start(
-    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-    agent: &mut crate::agent::AgentConn,
-    args: &ExecArgs,
-) -> Result<(), anyhow::Error> {
-    let (listener, url) = crate::ecs_server::bind_tcp(None).await?;
-    let server = crate::ecs_server::EcsServer::new_with_agent(
-        agent.clone(),
-        crate::proto::AssumeRoleRequest {
-            server_id: args.server.as_ref().unwrap().to_owned(),
-            role: args.role.clone(),
-            cached: !args.no_cache,
-        },
-        ExecEcsUserFeedback::from(args),
-    );
-    {
-        use secrecy::ExposeSecret;
-        std::env::set_var("AWS_CONTAINER_CREDENTIALS_FULL_URI", url.to_string());
-        std::env::set_var(
-            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-            zeroize::Zeroizing::new(format!("Bearer {}", &server.bearer_token().expose_secret())),
+    #[tracing::instrument(skip_all)]
+    async fn ecs_provider_start(
+        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        agent: &mut crate::agent::AgentConn,
+        args: &ExecArgs,
+    ) -> Result<(), anyhow::Error> {
+        let (listener, url) = crate::ecs_server::bind_tcp(None).await?;
+        let server = crate::ecs_server::EcsServer::new_with_agent(
+            agent.clone(),
+            crate::proto::AssumeRoleRequest {
+                server_id: args.server.as_ref().unwrap().to_owned(),
+                role: args.role.clone(),
+                cached: !args.no_cache,
+            },
+            ExecEcsUserFeedback::from(args),
         );
+        {
+            use secrecy::ExposeSecret;
+            std::env::set_var("AWS_CONTAINER_CREDENTIALS_FULL_URI", url.to_string());
+            std::env::set_var(
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                zeroize::Zeroizing::new(format!(
+                    "Bearer {}",
+                    &server.bearer_token().expose_secret()
+                )),
+            );
+        }
+        tokio::spawn(async move {
+            axum::serve(listener, server.router())
+                .with_graceful_shutdown(async {
+                    shutdown_rx.await.ok();
+                    tracing::trace!("ECS Server shutting down");
+                })
+                .await
+                .ok();
+            tracing::debug!("ECS Server down");
+        });
+        Ok(())
     }
-    tokio::spawn(async move {
-        axum::serve(listener, server.router())
-            .with_graceful_shutdown(async {
-                shutdown_rx.await.ok();
-                tracing::trace!("ECS Server shutting down");
-            })
-            .await
-            .ok();
-        tracing::debug!("ECS Server down");
-    });
-    Ok(())
-}
 
-#[derive(Debug, Clone)]
-struct ExecEcsUserFeedback {
-    role: String,
-    server: String,
-}
+    #[derive(Debug, Clone)]
+    struct ExecEcsUserFeedback {
+        role: String,
+        server: String,
+    }
 
-impl From<&ExecArgs> for ExecEcsUserFeedback {
-    fn from(a: &ExecArgs) -> Self {
-        Self {
-            role: a.role.clone(),
-            server: a.server.as_ref().unwrap().to_owned(),
+    impl From<&ExecArgs> for ExecEcsUserFeedback {
+        fn from(a: &ExecArgs) -> Self {
+            Self {
+                role: a.role.clone(),
+                server: a.server.as_ref().unwrap().to_owned(),
+            }
         }
     }
-}
 
-impl crate::ecs_server::UserFeedbackDelegate for ExecEcsUserFeedback {
-    async fn on_error(&self, err: &crate::ecs_server::BackendRequestError) {
-        let product = env!("CARGO_PKG_NAME");
-        let server = &self.server;
-        let role = &self.role;
-        let e = err.ui_message();
-        crate::terminal::send(&(match &err {
+    impl crate::ecs_server::UserFeedbackDelegate for ExecEcsUserFeedback {
+        async fn on_error(&self, err: &crate::ecs_server::BackendRequestError) {
+            let product = env!("CARGO_PKG_NAME");
+            let server = &self.server;
+            let role = &self.role;
+            let e = err.ui_message();
+            crate::terminal::send(&(match &err {
             crate::ecs_server::BackendRequestError::Forbidden(_) => {
                 indoc::formatdoc! {"
                     :: {product} :: Forbidden while retrieving AWS credentials of {role} from {server}; {e}. To login again, run: $ {product} login {server}
@@ -393,36 +399,37 @@ impl crate::ecs_server::UserFeedbackDelegate for ExecEcsUserFeedback {
                 "}
             }
         })).await;
-    }
-}
-
-#[tracing::instrument(skip_all)]
-async fn static_provider_set(
-    agent: &mut crate::agent::AgentConn,
-    args: &ExecArgs,
-) -> Result<(), anyhow::Error> {
-    let resp = agent
-        .assume_role(crate::proto::AssumeRoleRequest {
-            server_id: args.server.as_ref().unwrap().to_owned(),
-            role: args.role.clone(),
-            cached: !args.no_cache,
-        })
-        .await?
-        .into_inner();
-    let creds = resp
-        .credentials
-        .ok_or_else(|| anyhow::anyhow!("agent sent empty credentials"))?;
-
-    {
-        std::env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
-        if !creds.session_token.is_empty() {
-            std::env::set_var("AWS_SESSION_TOKEN", &creds.session_token);
-        } else {
-            std::env::remove_var("AWS_SESSION_TOKEN");
         }
     }
-    Ok(())
+
+    #[tracing::instrument(skip_all)]
+    async fn static_provider_set(
+        agent: &mut crate::agent::AgentConn,
+        args: &ExecArgs,
+    ) -> Result<(), anyhow::Error> {
+        let resp = agent
+            .assume_role(crate::proto::AssumeRoleRequest {
+                server_id: args.server.as_ref().unwrap().to_owned(),
+                role: args.role.clone(),
+                cached: !args.no_cache,
+            })
+            .await?
+            .into_inner();
+        let creds = resp
+            .credentials
+            .ok_or_else(|| anyhow::anyhow!("agent sent empty credentials"))?;
+
+        {
+            std::env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
+            if !creds.session_token.is_empty() {
+                std::env::set_var("AWS_SESSION_TOKEN", &creds.session_token);
+            } else {
+                std::env::remove_var("AWS_SESSION_TOKEN");
+            }
+        }
+        Ok(())
+    }
 }
 
 mod auto_refresh {
