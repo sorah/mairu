@@ -4,7 +4,7 @@ If you don't have the AWS SSO instance, you need to run your own credential vend
 
 ### Authentication
 
-Mairu acts as a OAuth 2.0 public client and supports [device authorization grant](https://datatracker.ietf.org/doc/html/rfc8628) and [authorization code grant](https://datatracker.ietf.org/doc/html/rfc6749#section-1.3.1) with [PKCE](https://datatracker.ietf.org/doc/html/rfc7636). Retrieved access token will be sent as a bearer token in `Authorization` header field ([RFC 6750 Section 2.1.](https://datatracker.ietf.org/doc/html/rfc6750#section-2.1)).
+Mairu acts as a OAuth 2.0 public client and supports <!-- [device authorization grant](https://datatracker.ietf.org/doc/html/rfc8628) --> and [authorization code grant](https://datatracker.ietf.org/doc/html/rfc6749#section-1.3.1) with [PKCE](https://datatracker.ietf.org/doc/html/rfc7636). Retrieved access token will be sent as a bearer token in `Authorization` header field ([RFC 6750 Section 2.1.](https://datatracker.ietf.org/doc/html/rfc6750#section-2.1)).
 
 Therefore, a credential server must implement OAuth 2.0 endpoints for a one of supported grant types (at least):
 
