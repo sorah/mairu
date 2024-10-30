@@ -29,6 +29,9 @@ pub struct ExecArgs {
     #[arg(long, env = "MAIRU_SHOW_AUTO_ROLE", default_value_t = false)]
     show_auto: bool,
 
+    #[arg(long)]
+    forward_signals: Vec<String>,
+
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<std::ffi::OsString>,
 }
@@ -572,22 +575,83 @@ mod auto_refresh {
 
 #[tracing::instrument(skip_all)]
 async fn execute(args: &ExecArgs) -> Result<(), anyhow::Error> {
+    use tokio_stream::StreamExt;
     let arg0 = args
         .command
         .first()
         .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?;
-    let status = tokio::process::Command::new(arg0)
+    let mut child = tokio::process::Command::new(arg0)
         .args(&args.command[1..])
-        .status()
-        .await?;
+        .spawn()?;
+    let pid = child.id();
 
-    match status.code() {
-        Some(0) => Ok(()),
-        Some(code) => {
-            let returning_code = std::process::ExitCode::from(code as u8);
-            Err(crate::Error::SilentlyExitWithCode(returning_code).into())
+    start_ignoring_signals();
+    let forwarded_signals = execute_listen_for_forwarded_signals(&args.forward_signals);
+    let waitpid = child.wait();
+
+    tokio::pin!(waitpid);
+    tokio::pin!(forwarded_signals);
+    loop {
+        tokio::select! {
+            maybe_status = &mut waitpid => {
+                let status = maybe_status.unwrap();
+                return match status.code() {
+                    Some(0) => Ok(()),
+                    Some(code) => {
+                        let returning_code = std::process::ExitCode::from(code as u8);
+                        Err(crate::Error::SilentlyExitWithCode(returning_code).into())
+                    }
+                    None => handle_exit_status_signaled(status),
+                }
+            }
+            signal =  forwarded_signals.next() => {
+                tracing::debug!(signal = ?signal, pid = ?pid, "Forwarding signal");
+                #[cfg(unix)]
+                if let Some(pid_u32) = pid {
+                    if let Err(e) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid_u32 as i32), signal) {
+                        tracing::warn!(signal = ?signal, pid = ?pid, err = ?e, "Failed to forward signal; kill(2) returned error");
+                    }
+                }
+            }
         }
-        None => handle_exit_status_signaled(status),
+    }
+}
+
+#[cfg(unix)]
+fn execute_listen_for_forwarded_signals(
+    signal_names: &Vec<String>,
+) -> impl futures_core::stream::Stream<Item = nix::sys::signal::Signal> {
+    use std::str::FromStr;
+    use tokio_stream::StreamExt;
+
+    let streams = signal_names
+        .iter()
+        .filter_map(
+            |name| match nix::sys::signal::Signal::from_str(name.as_str()) {
+                Ok(sig) => Some(sig),
+                Err(e) => {
+                    tracing::warn!(err = ?e, signal_name = ?name, "Unknown signal to forward: {name}");
+                    None
+                }
+            },
+        )
+        .filter_map(|sig| {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(
+                sig as std::os::raw::c_int,
+            )) {
+                Ok(l) => Some((sig, tokio_stream::wrappers::SignalStream::new(l))),
+                Err(e) => {
+                    tracing::warn!(err = ?e, signal = ?sig, "Failed to listen for forwarded signal");
+                    None
+                }
+            }
+        });
+    let mut map = tokio_stream::StreamMap::from_iter(streams);
+
+    async_stream::stream! {
+        while let Some((sig, _)) = map.next().await {
+            yield sig;
+        }
     }
 }
 
@@ -599,4 +663,18 @@ fn handle_exit_status_signaled(status: std::process::ExitStatus) -> Result<(), a
         return Err(crate::Error::SilentlyExitWithCode(code).into());
     }
     Err(crate::Error::FailureButSilentlyExit.into())
+}
+
+#[cfg(unix)]
+fn start_ignoring_signals() {
+    use nix::sys::signal::{signal, SigHandler, Signal};
+    if let Err(e) = unsafe { signal(Signal::SIGINT, SigHandler::SigIgn) } {
+        tracing::warn!(err = ?e, "failed to ignore SIGINT")
+    }
+    if let Err(e) = unsafe { signal(Signal::SIGQUIT, SigHandler::SigIgn) } {
+        tracing::warn!(err = ?e, "failed to ignore SIGQUIT")
+    }
+    if let Err(e) = unsafe { signal(Signal::SIGTSTP, SigHandler::SigIgn) } {
+        tracing::warn!(err = ?e, "failed to ignore SIGTSTP")
+    }
 }
