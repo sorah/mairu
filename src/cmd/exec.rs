@@ -576,10 +576,13 @@ async fn execute(args: &ExecArgs) -> Result<(), anyhow::Error> {
         .command
         .first()
         .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?;
-    let status = tokio::process::Command::new(arg0)
+    let mut child = tokio::process::Command::new(arg0)
         .args(&args.command[1..])
-        .status()
-        .await?;
+        .spawn()?;
+
+    start_ignoring_signals();
+
+    let status = child.wait().await?;
 
     match status.code() {
         Some(0) => Ok(()),
@@ -599,4 +602,18 @@ fn handle_exit_status_signaled(status: std::process::ExitStatus) -> Result<(), a
         return Err(crate::Error::SilentlyExitWithCode(code).into());
     }
     Err(crate::Error::FailureButSilentlyExit.into())
+}
+
+#[cfg(unix)]
+fn start_ignoring_signals() {
+    use nix::sys::signal::{signal, SigHandler, Signal};
+    if let Err(e) = unsafe { signal(Signal::SIGINT, SigHandler::SigIgn) } {
+        tracing::warn!(err = ?e, "failed to ignore SIGINT")
+    }
+    if let Err(e) = unsafe { signal(Signal::SIGQUIT, SigHandler::SigIgn) } {
+        tracing::warn!(err = ?e, "failed to ignore SIGQUIT")
+    }
+    if let Err(e) = unsafe { signal(Signal::SIGTSTP, SigHandler::SigIgn) } {
+        tracing::warn!(err = ?e, "failed to ignore SIGTSTP")
+    }
 }
