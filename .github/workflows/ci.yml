@@ -1,0 +1,27 @@
+name: ci
+on: 
+  push:
+    branches: [main,ci]
+  pull_request:
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform:
+          - target: x86_64-unknown-linux-gnu
+            features: "default"
+          - target: x86_64-unknown-linux-musl
+            features: "rustls"
+    steps:
+      - run: sudo apt-get install -y musl-tools
+        if: "${{ contains(matrix.platform.target, '-musl') }}"
+      - run: sudo apt-get install -y protobuf-compiler
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: "${{ matrix.platform.target }}"
+      - run: "cargo test --target ${{ matrix.platform.target }} --no-default-features --features ${{ matrix.platform.features }}"
+      - run: "cargo build --target ${{ matrix.platform.target }} --no-default-features --features ${{ matrix.platform.features }}"
