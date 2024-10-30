@@ -11,6 +11,7 @@ tonic-build = "0.12.3"
 [dependencies]
 anyhow = { version = "1.0.91", features = ["backtrace"] }
 async-recursion = "1.0.5"
+async-stream = "0.3.6"
 async-trait = "0.1.77"
 aws-config = { version = "1.5.9", features = ["behavior-version-latest"] }
 aws-sdk-sso = "1.47.0"
@@ -21,6 +22,8 @@ base64ct = { version = "1.6.0", features = ["alloc", "std"] }
 chrono = { version = "0.4.34", features = ["serde"] }
 clap = { version = "4.5.1", features = ["cargo", "derive", "env"] }
 daemonize = "0.5.0"
+futures = "0.3.31"
+futures-core = "0.3.31"
 headers = "0.4.0"
 hyper = { version = "1.1.0", features = ["http1", "server"] }
 hyper-util = "0.1.10"
@@ -44,7 +47,7 @@ sha2 = "0.10.8"
 subtle = { version = "2.5.0", features = ["core_hint_black_box"] }
 thiserror = "1.0.65"
 tokio = { version = "1.41.0", features = ["full"] }
-tokio-stream = { version = "0.1.14", features = ["net"] }
+tokio-stream = { version = "0.1.14", features = ["net", "signal"] }
 tonic = "0.12.3"
 tower = { version = "0.5.1", features = ["tracing"] }
 tracing = { version = "0.1.40", features = ["attributes"] }
