@@ -64,7 +64,7 @@ pub fn run(args: &ExecArgs) -> Result<(), anyhow::Error> {
     // The sidecar monitors the parent process (formerly an executor) while keep provider running,
     // and terminates when the parent is gone.
 
-    let (ipc_i, ipc_o) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+    let (ipc_i, ipc_o) = make_pipe()?;
     let pid = nix::unistd::Pid::this();
     match unsafe { nix::unistd::fork() }? {
         nix::unistd::ForkResult::Parent { child, .. } => {
@@ -75,6 +75,41 @@ pub fn run(args: &ExecArgs) -> Result<(), anyhow::Error> {
             drop(ipc_i);
             start_ignoring_signals();
             run_sidecar(pid, ipc_o, args.clone())
+        }
+    }
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))] {
+        fn make_pipe() -> anyhow::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+            Ok(nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?)
+        }
+    } else {
+        fn make_pipe() -> anyhow::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+            use std::os::fd::AsRawFd;
+            use nix::fcntl::{fcntl, FdFlag, F_GETFD, F_SETFD};
+
+            let (i, o) = nix::unistd::pipe()?;
+            {
+                let mut fdopts = FdFlag::from_bits(fcntl(i.as_raw_fd(), F_GETFD)?).unwrap();
+                fdopts.set(FdFlag::FD_CLOEXEC, true);
+                fcntl(i.as_raw_fd(), F_SETFD(fdopts))?;
+            }
+            {
+                let mut fdopts = FdFlag::from_bits(fcntl(o.as_raw_fd(), F_GETFD)?).unwrap();
+                fdopts.set(FdFlag::FD_CLOEXEC, true);
+                fcntl(o.as_raw_fd(), F_SETFD(fdopts))?;
+            }
+            Ok((i,o))
+
         }
     }
 }
