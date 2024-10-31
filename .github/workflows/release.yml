@@ -26,7 +26,13 @@ jobs:
           if ! grep -q "version = \"$VERSION\"" Cargo.toml; then
             exit 1
           fi
-      - run: 'gh release create "v${VERSION}" --draft --verify-tag --title "$VERSION"'
+      - name: create release
+        run: |
+          if gh release view "v${VERSION}" --json id; then
+            echo "release already exists"
+          else
+            gh release create "v${VERSION}" --draft --verify-tag --title "$VERSION"
+          fi
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
 
@@ -43,19 +49,30 @@ jobs:
             os: ubuntu-latest
             default-features: 'no-default-features'
             features: rustls
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: universal-apple-darwin
-            os: macos-latest
+            #- target: aarch64-apple-darwin
+            #  os: macos-latest
+            #- target: universal-apple-darwin
+            #  os: macos-latest
     runs-on: ${{ matrix.os }}
     steps:
+      - run: sudo apt-get install -y musl-tools
+        if: "${{ contains(matrix.target, '-musl') }}"
+      - run: sudo apt-get install -y protobuf-compiler
+        if: "${{ contains(matrix.target, '-linux-') }}"
+      - run: brew install protobuf
+        if: "${{ contains(matrix.target, '-apple-darwin') }}"
+
       - uses: actions/checkout@v4
+      - name: Install cross-compilation tools
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: "${{ matrix.target }}"
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: mairu
           target: '${{ matrix.target }}'
           tar: unix
-          no-default-features: '${{ matrix.default-features == "no-default-features" }}'
+          no-default-features: "${{ matrix.default-features == 'no-default-features' }}"
           features: ${{ matrix.features || '' }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -71,12 +88,27 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get install -y musl-tools
+        if: "${{ contains(matrix.target, '-musl') }}"
+      - run: sudo apt-get install -y protobuf-compiler
+        if: "${{ contains(matrix.target, '-linux-') }}"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: "${{ matrix.target }}"
+      - name: Install cross-compilation tools
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: "${{ matrix.target }}"
+      - name: Configure cargo
+        shell: bash
+        run: |
+          mkdir -p .cargo
+          echo '[target.${{ matrix.target }}]' >> .cargo/config
+          echo 'strip = { path = "${{ matrix.target }}-strip" }' >> .cargo/config
+          echo 'objcopy = { path = "${{ matrix.target }}-objcopy" }' >> .cargo/config
       - run: 'cargo install cargo-deb --locked'
       - run: 'cargo deb --target=${{ matrix.target }}'
-      - run: 'gh release upload "${{ github.ref_name }}" target/debian/*.deb'
+      - run: 'gh release upload "${{ github.ref_name }}" target/${{ matrix.target }}/debian/*.deb'
         shell: bash
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
