@@ -98,16 +98,8 @@ cfg_if::cfg_if! {
             use nix::fcntl::{fcntl, FdFlag, F_GETFD, F_SETFD};
 
             let (i, o) = nix::unistd::pipe()?;
-            {
-                let mut fdopts = FdFlag::from_bits(fcntl(i.as_raw_fd(), F_GETFD)?).unwrap();
-                fdopts.set(FdFlag::FD_CLOEXEC, true);
-                fcntl(i.as_raw_fd(), F_SETFD(fdopts))?;
-            }
-            {
-                let mut fdopts = FdFlag::from_bits(fcntl(o.as_raw_fd(), F_GETFD)?).unwrap();
-                fdopts.set(FdFlag::FD_CLOEXEC, true);
-                fcntl(o.as_raw_fd(), F_SETFD(fdopts))?;
-            }
+            crate::os::set_cloexec(&i, true)?;
+            crate::os::set_cloexec(&o, true)?;
             Ok((i,o))
 
         }

@@ -16,6 +16,9 @@ pub enum Error {
     IoError(#[from] std::io::Error),
 
     #[error(transparent)]
+    NixErrnoError(#[from] nix::errno::Errno),
+
+    #[error(transparent)]
     UrlParseError(#[from] url::ParseError),
 
     #[error("AuthNotReadyError: flow not yet ready")]
