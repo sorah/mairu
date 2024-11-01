@@ -23,7 +23,9 @@ pub fn run(args: &AgentArgs) -> Result<(), anyhow::Error> {
 }
 
 fn daemonize() -> Result<(), anyhow::Error> {
-    let d = daemonize::Daemonize::new().working_directory(crate::config::runtime_dir());
+    let d = daemonize::Daemonize::new()
+        .working_directory(crate::config::runtime_dir())
+        .stderr(daemonize::Stdio::keep());
 
     match d.execute() {
         daemonize::Outcome::Parent(Ok(o)) => {
@@ -188,6 +190,7 @@ pub async fn spawn_agent() -> Result<(), anyhow::Error> {
         .args(["agent", "--log-to-file", "--daemonize"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .kill_on_drop(false)
         .status()
         .await?;
