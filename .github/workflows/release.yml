@@ -9,7 +9,7 @@ on:
       - 'v[0-9]+.*'
 
 env:
-  MACOSX_DEPLOYMENT_TARGET: '10.11'
+  MACOSX_DEPLOYMENT_TARGET: '11.0' # Big Sur, first macOS release with Apple Silicon support
 
 jobs:
   create-release:
