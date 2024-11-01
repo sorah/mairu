@@ -58,10 +58,8 @@ fn protect_process() {
 
 #[cfg(target_os = "macos")]
 fn macos_pt_deny_attach() -> Result<(), anyhow::Error> {
-    let res = unsafe {
-        libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0);
-    };
-    nix::errno::Errno::result(res).map(drop)
+    let res = unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) };
+    Ok(nix::errno::Errno::result(res).map(drop)?)
 }
 
 #[tokio::main]

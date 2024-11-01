@@ -7,21 +7,28 @@ on:
 jobs:
   test:
     name: cargo test
-    runs-on: ubuntu-latest
+    runs-on: "${{ matrix.os || 'ubuntu-latest' }}"
     strategy:
+      fail-fast: false
       matrix:
-        platform:
+        include:
           - target: x86_64-unknown-linux-gnu
-            features: "default"
+            os: ubuntu-latest
           - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
             features: "rustls"
+          - target: aarch64-apple-darwin
+            os: macos-latest
     steps:
       - run: sudo apt-get install -y musl-tools
-        if: "${{ contains(matrix.platform.target, '-musl') }}"
+        if: "${{ contains(matrix.target, '-musl') }}"
       - run: sudo apt-get install -y protobuf-compiler
+        if: "${{ contains(matrix.target, '-linux-') }}"
+      - run: brew install protobuf
+        if: "${{ contains(matrix.target, '-apple-darwin') }}"
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: "${{ matrix.platform.target }}"
-      - run: "cargo test --target ${{ matrix.platform.target }} --no-default-features --features ${{ matrix.platform.features }}"
-      - run: "cargo build --target ${{ matrix.platform.target }} --no-default-features --features ${{ matrix.platform.features }}"
+          targets: "${{ matrix.target }}"
+      - run: "cargo test --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features || 'default' }}"
+      - run: "cargo build --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features || 'default' }}"
