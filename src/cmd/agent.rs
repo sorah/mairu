@@ -138,10 +138,20 @@ fn try_bind_or_check_liveness_std(
     }
 }
 
+#[cfg(unix)]
 async fn check_liveness(path: &std::path::PathBuf) -> Result<(), anyhow::Error> {
+    use std::os::unix::fs::FileTypeExt;
     if let Err(e) = crate::agent::connect_to_agent_with_path(&path).await {
         tracing::info!(err = ?e, path = ?path, "Attempting to replace the stale socket file as failing to connect to the existing agent");
-        tokio::fs::remove_file(&path).await?;
+        let stat = tokio::fs::symlink_metadata(&path).await?;
+        if stat.file_type().is_socket() {
+            tokio::fs::remove_file(&path).await?;
+        } else {
+            anyhow::bail!(
+                "A file at the socket path ({path}) is not a socket, aborting",
+                path = path.display()
+            );
+        }
         tracing::debug!(err = ?e, path = ?path, "removed stale socket file");
         return Ok(());
     }
