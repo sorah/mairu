@@ -7,6 +7,10 @@ pub struct AgentArgs {
     /// Enable logging to file ($XDG_STATE_HOME/mairu/log/*).
     #[arg(long, default_value_t = false)]
     pub log_to_file: bool,
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[arg(long, hide = true)]
+    uds_fd: Option<std::os::fd::RawFd>, // See daemonize_reexec() for details
 }
 
 pub fn run(args: &AgentArgs) -> Result<(), anyhow::Error> {
@@ -16,14 +20,24 @@ pub fn run(args: &AgentArgs) -> Result<(), anyhow::Error> {
     crate::config::cache_dir_mkpath()?;
 
     if args.daemonize {
-        serve_on_path_daemon(path)
-    } else {
-        serve_on_path(path)
+        return serve_on_path_daemon(path);
     }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        // See daemonize_reexec(2) for details
+        if let Some(uds_fd) = args.uds_fd {
+            return serve_on_fd(uds_fd);
+        }
+    }
+
+    serve_on_path(path)
 }
 
 fn daemonize() -> Result<(), anyhow::Error> {
-    let d = daemonize::Daemonize::new().working_directory(crate::config::runtime_dir());
+    let d = daemonize::Daemonize::new()
+        .working_directory(crate::config::runtime_dir())
+        .stderr(daemonize::Stdio::keep());
 
     match d.execute() {
         daemonize::Outcome::Parent(Ok(o)) => {
@@ -35,10 +49,46 @@ fn daemonize() -> Result<(), anyhow::Error> {
             );
         }
         daemonize::Outcome::Parent(Err(e)) => return Err(e.into()),
-        daemonize::Outcome::Child(Ok(_)) => {}
+        daemonize::Outcome::Child(Ok(_)) => {} // do nothing
         daemonize::Outcome::Child(Err(e)) => return Err(e.into()),
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn daemonize_reexec(
+    uds: std::os::unix::net::UnixListener,
+    arg0: std::path::PathBuf,
+) -> Result<(), anyhow::Error> {
+    // We can encounter the following error if we continue without re-exec(2)-ing:
+    //
+    //     objc[11602]: +[__NSCFConstantString initialize] may have been in progress in another thread when fork() was called.
+    //     We cannot safely call it or ignore it in the fork() child process. Crashing instead. Set a breakpoint on objc_initializeAfterForkError to debug.
+    //
+    // In Mairu's case, most these crashes are triggered in a copy_certificates_from_keychain dispatch queue thread.
+    // This is likely relevant to security-framework crate which utilise Security.framework for TLS functionality, and
+    // appears to be difficult to avoid; unforeseen risks remain ahead that could cause similar issues.
+    //
+    // We're avoiding by re-exec(2)-ing itself to prevent the issue at all.
+    //
+    // See also: https://www.sealiesoftware.com/blog/archive/2017/6/5/Objective-C_and_fork_in_macOS_1013.html
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let raw_fd = uds.into_raw_fd();
+    crate::os::set_cloexec(&raw_fd, false)?;
+
+    let args = std::env::args()
+        .skip(1)
+        .map(|x| x.to_owned())
+        .filter(|x| x.as_str() != "--daemonize")
+        .chain(["--uds-fd".to_string(), raw_fd.to_string()])
+        .collect::<Vec<_>>();
+
+    tracing::debug!(arg0 = ?arg0, args = ?args, "Re-exec(2)-ing");
+
+    let err = std::process::Command::new(arg0).args(args).exec();
+    panic!("exec(2) failed to re-exec itself after daemonize: {err}");
 }
 
 fn protect_process() {
@@ -69,11 +119,32 @@ pub async fn serve_on_path(path: std::path::PathBuf) -> Result<(), anyhow::Error
     serve(uds).await
 }
 
+#[tokio::main]
+pub async fn serve_on_fd(raw_fd: std::os::fd::RawFd) -> Result<(), anyhow::Error> {
+    use std::os::fd::FromRawFd;
+    tracing::info!(raw_fd = ?raw_fd, "Server starting using given fd");
+    crate::os::set_cloexec(&raw_fd, true)?;
+    // SAFETY: we validate liveness roughly by resetting O_CLOXEC
+    let uds = unsafe { std::os::unix::net::UnixListener::from_raw_fd(raw_fd) };
+    uds.set_nonblocking(true)?;
+    serve(tokio::net::UnixListener::from_std(uds)?).await
+}
+
+#[cfg_attr(any(target_os = "macos", target_os = "ios"), allow(unreachable_code))]
 pub fn serve_on_path_daemon(path: std::path::PathBuf) -> Result<(), anyhow::Error> {
     tracing::debug!(path = ?path, "Server starting as a daemon");
     let uds = try_bind_or_check_liveness_std(&path)?;
     tracing::info!(path = ?path, "Agent starting as a daemon");
+
+    // See daemonize_reexec() for details
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let arg0 = process_path::get_executable_path().expect("Can't get executable path");
+
     daemonize()?;
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    return daemonize_reexec(uds, arg0);
+
     serve_on_path_daemon2(uds)
 }
 
@@ -136,10 +207,20 @@ fn try_bind_or_check_liveness_std(
     }
 }
 
+#[cfg(unix)]
 async fn check_liveness(path: &std::path::PathBuf) -> Result<(), anyhow::Error> {
+    use std::os::unix::fs::FileTypeExt;
     if let Err(e) = crate::agent::connect_to_agent_with_path(&path).await {
         tracing::info!(err = ?e, path = ?path, "Attempting to replace the stale socket file as failing to connect to the existing agent");
-        tokio::fs::remove_file(&path).await?;
+        let stat = tokio::fs::symlink_metadata(&path).await?;
+        if stat.file_type().is_socket() {
+            tokio::fs::remove_file(&path).await?;
+        } else {
+            anyhow::bail!(
+                "A file at the socket path ({path}) is not a socket, aborting",
+                path = path.display()
+            );
+        }
         tracing::debug!(err = ?e, path = ?path, "removed stale socket file");
         return Ok(());
     }
@@ -188,6 +269,7 @@ pub async fn spawn_agent() -> Result<(), anyhow::Error> {
         .args(["agent", "--log-to-file", "--daemonize"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .kill_on_drop(false)
         .status()
         .await?;
