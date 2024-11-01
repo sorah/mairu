@@ -4,6 +4,9 @@ on:
     branches: [main,ci]
   pull_request:
 
+env:
+  MACOSX_DEPLOYMENT_TARGET: '11.0' # Big Sur, first macOS release with Apple Silicon support
+
 jobs:
   test:
     name: cargo test
