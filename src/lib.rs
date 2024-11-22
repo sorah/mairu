@@ -17,6 +17,7 @@ pub mod utils;
 pub mod oauth_awssso;
 pub mod oauth_code;
 pub mod oauth_device_code;
+pub mod oauth_refresh_token;
 
 pub mod api_client;
 pub mod awssso_client;

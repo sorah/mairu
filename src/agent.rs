@@ -431,16 +431,33 @@ impl Agent {
         }
 
         // =====
-        if session.token.server.aws_sso.is_some() {
-            if let Some(new) = refresh_token_using_awssso(&session).await {
-                return self.session_manager.add(new).unwrap(); // XXX:
-            }
+        let maybe_new = if session.token.server.aws_sso.is_some() {
+            refresh_token_using_awssso(&session).await
+        } else {
+            refresh_token_using_oauth2(&session).await
+        };
+        if let Some(new) = maybe_new {
+            self.session_manager.add(new).unwrap() // XXX: unwrap()
+        } else {
+            session
         }
-        // TODO: general refresh_token implementation
+    }
+}
 
-        // =====
-        tracing::warn!( server_id = session.token.server.id(), url = %session.token.server.url, "Skipped token refresh due to missing implementation to refresh this session");
-        session
+async fn refresh_token_using_oauth2(
+    session: &crate::session_manager::Session,
+) -> Option<crate::token::ServerToken> {
+    match crate::oauth_refresh_token::refresh_token(&session.token).await {
+        Ok(token) => Some(token),
+        Err(e) => {
+            tracing::warn!(
+                server_id = session.token.server.id(),
+                url = %session.token.server.url,
+                err = ?e,
+                "Failed to refresh session using refresh_token"
+            );
+            None
+        }
     }
 }
 
