@@ -217,6 +217,24 @@ impl Server {
         Ok((oauth, code_grant))
     }
 
+    pub fn try_oauth_device_code_grant(
+        &self,
+    ) -> crate::Result<(&ServerOAuth, &ServerDeviceCodeGrant)> {
+        let Some(oauth) = self.oauth.as_ref() else {
+            return Err(crate::Error::ConfigError(format!(
+                "Server '{}' is missing OAuth 2.0 client configuration",
+                self.id()
+            )));
+        };
+        match oauth.device_code_grant {
+            Some(ref grant) => Ok((oauth, grant)),
+            None => Err(crate::Error::ConfigError(format!(
+                "Server '{}' is missing OAuth 2.0 Device Code Grant configuration",
+                self.id()
+            ))),
+        }
+    }
+
     pub fn try_oauth_awssso(&self) -> crate::Result<&ServerOAuth> {
         if self.aws_sso.is_none() {
             return Err(crate::Error::ConfigError(format!(
@@ -307,6 +325,7 @@ impl TryFrom<crate::proto::GetServerResponse> for Server {
 #[serde(rename_all = "snake_case")]
 pub enum OAuthGrantType {
     Code,
+    DeviceCode,
     AwsSso,
 }
 
@@ -315,6 +334,7 @@ impl std::str::FromStr for OAuthGrantType {
     fn from_str(s: &str) -> Result<OAuthGrantType, crate::Error> {
         match s {
             "code" => Ok(OAuthGrantType::Code),
+            "device_code" => Ok(OAuthGrantType::DeviceCode),
             "aws_sso" => Ok(OAuthGrantType::AwsSso),
             _ => Err(crate::Error::UserError(
                 "unknown oauth_grant_type".to_owned(),
@@ -333,7 +353,7 @@ pub struct ServerOAuth {
     pub scope: Vec<String>,
     default_grant_type: Option<OAuthGrantType>,
     pub code_grant: Option<ServerCodeGrant>,
-    pub device_grant: Option<ServerDeviceGrant>,
+    pub device_code_grant: Option<ServerDeviceCodeGrant>,
 
     /// Expiration time of dynamically registered OAuth2 client registration, such as AWS SSO
     /// clients.
@@ -346,14 +366,15 @@ fn default_oauth_scope() -> Vec<String> {
 
 impl ServerOAuth {
     pub fn validate(&self) -> Result<(), crate::Error> {
-        if self.code_grant.is_none() && self.device_grant.is_none() {
+        if self.code_grant.is_none() && self.device_code_grant.is_none() {
             return Err(crate::Error::ConfigError(
-                "Either oauth.code_grant or oauth.device_grant must be provided, but absent"
+                "Either oauth.code_grant or oauth.device_code_grant must be provided, but absent"
                     .to_owned(),
             ));
         }
         if match self.default_grant_type {
             None => false,
+            Some(OAuthGrantType::DeviceCode) => self.device_code_grant.is_none(),
             Some(OAuthGrantType::Code) => self.code_grant.is_none(),
             Some(OAuthGrantType::AwsSso) => false,
         } {
@@ -364,16 +385,21 @@ impl ServerOAuth {
         Ok(())
     }
 
-    pub fn default_grant_type(&self) -> OAuthGrantType {
-        self.default_grant_type.unwrap_or_else(|| {
-            if self.code_grant.is_some() {
-                return OAuthGrantType::Code;
+    pub fn default_grant_type(&self) -> Result<OAuthGrantType, crate::Error> {
+        match self.default_grant_type {
+            Some(x) => Ok(x),
+            None => {
+                if self.code_grant.is_some() {
+                    return Ok(OAuthGrantType::Code);
+                }
+                if self.device_code_grant.is_some() {
+                    return Ok(OAuthGrantType::DeviceCode);
+                }
+                Err(crate::Error::ConfigError(
+                    "cannot determine default grant_type".to_string(),
+                ))
             }
-            if self.device_grant.is_some() {
-                // TODO: implement
-            }
-            unreachable!();
-        })
+        }
     }
 }
 
@@ -384,7 +410,7 @@ pub struct ServerCodeGrant {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct ServerDeviceGrant {
+pub struct ServerDeviceCodeGrant {
     pub device_authorization_endpoint: Option<url::Url>,
 }
 
@@ -435,7 +461,7 @@ impl AwsSsoClientRegistrationCache {
             token_endpoint: None,
             scope: sso.scope.clone(),
             code_grant: None,
-            device_grant: None,
+            device_code_grant: None,
             client_expires_at: Some(self.expires_at),
         }
     }

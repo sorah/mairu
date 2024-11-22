@@ -28,6 +28,9 @@ service Agent {
   rpc InitiateOauthCode(InitiateOAuthCodeRequest) returns (InitiateOAuthCodeResponse);
   rpc CompleteOauthCode(CompleteOAuthCodeRequest) returns (CompleteOAuthCodeResponse);
 
+  rpc InitiateOauthDeviceCode(InitiateOAuthDeviceCodeRequest) returns (InitiateOAuthDeviceCodeResponse);
+  rpc CompleteOauthDeviceCode(CompleteOAuthDeviceCodeRequest) returns (CompleteOAuthDeviceCodeResponse);
+
   rpc RefreshAwsSsoClientRegistration(RefreshAwsSsoClientRegistrationRequest) returns (RefreshAwsSsoClientRegistrationResponse);
   rpc InitiateAwsSsoDevice(InitiateAwsSsoDeviceRequest) returns (InitiateAwsSsoDeviceResponse);
   rpc CompleteAwsSsoDevice(CompleteAwsSsoDeviceRequest) returns (CompleteAwsSsoDeviceResponse);
@@ -84,6 +87,24 @@ message CompleteOAuthCodeRequest {
   string state = 3;
 }
 message CompleteOAuthCodeResponse {
+}
+
+message InitiateOAuthDeviceCodeRequest {
+  string server_id = 1;
+}
+message InitiateOAuthDeviceCodeResponse {
+  string handle = 1;
+  string user_code = 2;
+  string verification_uri = 3;
+  string verification_uri_complete = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  int32 interval = 6;
+}
+
+message CompleteOAuthDeviceCodeRequest {
+  string handle = 1;
+}
+message CompleteOAuthDeviceCodeResponse {
 }
 
 message RefreshAwsSsoClientRegistrationRequest {
