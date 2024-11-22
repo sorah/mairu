@@ -32,14 +32,16 @@ pub async fn login(
     server.validate()?;
 
     let oauth = server.oauth.as_ref().unwrap();
-    let oauth_grant_type = args
-        .oauth_grant_type
-        .unwrap_or_else(|| oauth.default_grant_type());
+    let oauth_grant_type = match args.oauth_grant_type {
+        Some(x) => Ok(x),
+        None => oauth.default_grant_type(),
+    }?;
 
     tracing::debug!(oauth_grant_type = ?oauth_grant_type, server = ?server, "Using OAuth");
 
     match oauth_grant_type {
         crate::config::OAuthGrantType::Code => do_oauth_code(agent, server).await,
+        crate::config::OAuthGrantType::DeviceCode => do_oauth_device_code(agent, server).await,
         crate::config::OAuthGrantType::AwsSso => do_awssso(agent, server).await,
     }
 }
@@ -85,6 +87,66 @@ pub async fn do_oauth_code(
     .await;
 
     crate::oauth_code::listen_for_callback(listener, session, agent).await?;
+    tracing::info!("Logged in");
+    Ok(())
+}
+
+pub async fn do_oauth_device_code(
+    agent: &mut crate::agent::AgentConn,
+    server: crate::config::Server,
+) -> Result<(), anyhow::Error> {
+    server.try_oauth_device_code_grant()?;
+
+    let session = agent
+        .initiate_oauth_device_code(crate::proto::InitiateOAuthDeviceCodeRequest {
+            server_id: server.id().to_owned(),
+        })
+        .await?
+        .into_inner();
+    tracing::debug!(session = ?session, "Initiated flow");
+
+    let product = env!("CARGO_PKG_NAME");
+    let server_id = server.id();
+    let server_url = &server.url;
+    let user_code = &session.user_code;
+    let mut authorize_url = &session.verification_uri_complete;
+    if authorize_url.is_empty() {
+        authorize_url = &session.verification_uri;
+    }
+
+    crate::terminal::send(&indoc::formatdoc! {"
+        :: {product} :: Login to {server_id} ({server_url}) ::::::::
+        :: {product} ::
+        :: {product} ::   Your Verification Code: {user_code}
+        :: {product} ::      To authorize, visit: {authorize_url}
+        :: {product} ::
+    "})
+    .await;
+
+    let mut interval = session.interval as u64;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        let completion = agent
+            .complete_oauth_device_code(crate::proto::CompleteOAuthDeviceCodeRequest {
+                handle: session.handle.clone(),
+            })
+            .await;
+
+        match completion {
+            Ok(_) => break,
+            Err(e) if e.code() == tonic::Code::ResourceExhausted => {
+                interval += 5;
+                tracing::debug!(interval = ?interval, "Received slow_down request");
+            }
+            Err(e) if e.code() == tonic::Code::FailedPrecondition => {
+                // continue
+            }
+            Err(e) => {
+                anyhow::bail!(e);
+            }
+        }
+    }
+
     tracing::info!("Logged in");
     Ok(())
 }

@@ -211,6 +211,68 @@ impl crate::proto::agent_server::Agent for Agent {
     }
 
     #[tracing::instrument(skip_all)]
+    async fn initiate_oauth_device_code(
+        &self,
+        request: tonic::Request<InitiateOAuthDeviceCodeRequest>,
+    ) -> Result<tonic::Response<InitiateOAuthDeviceCodeResponse>, tonic::Status> {
+        let req = request.get_ref();
+
+        let server = match crate::config::Server::find_from_fs(&req.server_id).await {
+            Ok(server) => server,
+            Err(crate::Error::ConfigError(e)) => return Err(tonic::Status::internal(e)),
+            Err(crate::Error::UserError(e)) => return Err(tonic::Status::not_found(e)),
+            Err(e) => return Err(tonic::Status::internal(e.to_string())),
+        };
+
+        server.validate().map_err(|e| {
+            tonic::Status::failed_precondition(format!(
+                "Server '{}' has invalid configuration; {:}",
+                server.id(),
+                e,
+            ))
+        })?;
+
+        let flow = crate::oauth_device_code::OAuthDeviceCodeFlow::initiate(&server)
+            .await
+            .map_err(|e| {
+                tracing::error!(err = ?e, "OAuthDeviceCodeFlow initiate failure");
+                tonic::Status::internal(e.to_string())
+            })?;
+
+        let response = (&flow).into();
+
+        tracing::debug!(flow = ?flow, "Initiated OAuth 2.0 Device Code flow");
+        self.auth_flow_manager
+            .store(crate::auth_flow_manager::AuthFlow::OAuthDeviceCode(flow));
+
+        return Ok(tonic::Response::new(response));
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn complete_oauth_device_code(
+        &self,
+        request: tonic::Request<CompleteOAuthDeviceCodeRequest>,
+    ) -> Result<tonic::Response<CompleteOAuthDeviceCodeResponse>, tonic::Status> {
+        let req = request.get_ref();
+        let Some(flow0) = self.auth_flow_manager.retrieve(&req.handle) else {
+            return Err(tonic::Status::not_found("flow handle not found"));
+        };
+        let completion = {
+            let crate::auth_flow_manager::AuthFlow::OAuthDeviceCode(flow) = flow0.as_ref() else {
+                return Err(tonic::Status::invalid_argument(
+                    "flow handle is not for the grant type",
+                ));
+            };
+            tracing::trace!(flow = ?flow0.as_ref(), "Completing OAuth 2.0 Device Code Grant flow...");
+            flow.complete().await
+        };
+
+        self.accept_completed_auth_flow(flow0, completion)?;
+
+        Ok(tonic::Response::new(CompleteOAuthDeviceCodeResponse {}))
+    }
+
+    #[tracing::instrument(skip_all)]
     async fn refresh_aws_sso_client_registration(
         &self,
         request: tonic::Request<RefreshAwsSsoClientRegistrationRequest>,
@@ -325,7 +387,13 @@ impl Agent {
     ) -> tonic::Result<()> {
         let token = match completion {
             Ok(t) => t,
-            Err(crate::Error::AuthNotReadyError) => {
+            Err(crate::Error::AuthNotReadyError { slow_down: true }) => {
+                tracing::debug!(flow = ?flow.as_ref(), "not yet ready, slow down");
+                return Err(tonic::Status::resource_exhausted(
+                    "not yet ready, slow down".to_string(),
+                ));
+            }
+            Err(crate::Error::AuthNotReadyError { slow_down: false }) => {
                 tracing::debug!(flow = ?flow.as_ref(), "not yet ready");
                 return Err(tonic::Status::failed_precondition(
                     "not yet ready".to_string(),

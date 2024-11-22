@@ -22,7 +22,7 @@ pub enum Error {
     UrlParseError(#[from] url::ParseError),
 
     #[error("AuthNotReadyError: flow not yet ready")]
-    AuthNotReadyError,
+    AuthNotReadyError { slow_down: bool },
 
     #[error(transparent)]
     OAuth2RequestTokenError(

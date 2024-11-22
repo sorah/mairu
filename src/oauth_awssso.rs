@@ -192,7 +192,7 @@ impl AwsSsoDeviceFlow {
             Err(aws_sdk_ssooidc::error::SdkError::ServiceError(e))
                 if e.err().is_authorization_pending_exception() =>
             {
-                Err(crate::Error::AuthNotReadyError)
+                Err(crate::Error::AuthNotReadyError { slow_down: false })
             }
             Err(e) => Err(Box::new(aws_sdk_ssooidc::Error::from(e)).into()),
         }
