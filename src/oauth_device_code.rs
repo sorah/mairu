@@ -37,21 +37,23 @@ impl OAuthDeviceCodeFlow {
 
         // oauth2 crate doesn't allow non-standard response type
         let scopes = oauth.scope.join(" ");
-        let resp = crate::client::http()
+        let req = crate::client::http()
             .post(grant.device_authorization_endpoint.clone().ok_or_else(|| {
                 crate::Error::ConfigError(format!(
                     "{} is missing device_authorization_endpoint",
                     server.id()
                 ))
             })?)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .basic_auth(&oauth.client_id, oauth.client_secret.as_ref())
-            .form(&[
+            .header(reqwest::header::ACCEPT, "application/json");
+        let req = crate::ext_oauth2::reqwest_give_client_auth(
+            req,
+            oauth,
+            &[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("scope", &scopes),
-            ])
-            .send()
-            .await?;
+            ],
+        );
+        let resp = req.send().await?;
 
         let status = resp.status();
         if status != reqwest::StatusCode::OK {
@@ -96,15 +98,16 @@ impl OAuthDeviceCodeFlow {
             .post(oauth.token_endpoint.clone().ok_or_else(|| {
                 crate::Error::ConfigError(format!("{} is missing token_endpoint", self.server.id()))
             })?)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .basic_auth(&oauth.client_id, oauth.client_secret.as_ref())
-            .form(&[
+            .header(reqwest::header::ACCEPT, "application/json");
+        let req = crate::ext_oauth2::reqwest_give_client_auth(
+            req,
+            oauth,
+            &[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", self.device_code.expose_secret()),
-            ])
-            .build()?;
-        tracing::debug!(req = ?req, "complete req");
-        let resp = crate::client::http().execute(req).await?;
+            ],
+        );
+        let resp = req.send().await?;
 
         let status = resp.status();
         if status != reqwest::StatusCode::OK {
