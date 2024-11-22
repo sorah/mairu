@@ -112,6 +112,21 @@ where
     }
 }
 
+pub(crate) fn reqwest_give_client_auth(
+    req: reqwest::RequestBuilder,
+    oauth: &crate::config::ServerOAuth,
+    params: &[(&str, &str)],
+) -> reqwest::RequestBuilder {
+    match oauth.client_secret {
+        Some(ref secret) => req.basic_auth(&oauth.client_id, Some(secret)).form(params),
+        None => {
+            let auth_param = [("client_id", oauth.client_id.as_ref())];
+            let new_params: Vec<_> = auth_param.iter().chain(params.iter()).collect();
+            req.form(&new_params)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
