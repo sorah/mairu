@@ -85,9 +85,9 @@ pub struct AwsSsoDeviceFlow {
     pub interval: i32,
 }
 
-impl From<&AwsSsoDeviceFlow> for crate::proto::InitiateAwsSsoDeviceResponse {
-    fn from(flow: &AwsSsoDeviceFlow) -> crate::proto::InitiateAwsSsoDeviceResponse {
-        crate::proto::InitiateAwsSsoDeviceResponse {
+impl From<&AwsSsoDeviceFlow> for crate::proto::InitiateOAuthDeviceCodeResponse {
+    fn from(flow: &AwsSsoDeviceFlow) -> crate::proto::InitiateOAuthDeviceCodeResponse {
+        crate::proto::InitiateOAuthDeviceCodeResponse {
             handle: flow.handle.clone(),
             user_code: flow.user_code.clone(),
             verification_uri: flow.verification_uri.clone(),

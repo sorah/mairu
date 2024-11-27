@@ -32,8 +32,6 @@ service Agent {
   rpc CompleteOauthDeviceCode(CompleteOAuthDeviceCodeRequest) returns (CompleteOAuthDeviceCodeResponse);
 
   rpc RefreshAwsSsoClientRegistration(RefreshAwsSsoClientRegistrationRequest) returns (RefreshAwsSsoClientRegistrationResponse);
-  rpc InitiateAwsSsoDevice(InitiateAwsSsoDeviceRequest) returns (InitiateAwsSsoDeviceResponse);
-  rpc CompleteAwsSsoDevice(CompleteAwsSsoDeviceRequest) returns (CompleteAwsSsoDeviceResponse);
 }
 
 message PingAgentRequest {
@@ -111,24 +109,6 @@ message RefreshAwsSsoClientRegistrationRequest {
   string server_id = 1;
 }
 message RefreshAwsSsoClientRegistrationResponse {
-}
-
-message InitiateAwsSsoDeviceRequest {
-  string server_id = 1;
-}
-message InitiateAwsSsoDeviceResponse {
-  string handle = 1;
-  string user_code = 2;
-  string verification_uri = 3;
-  string verification_uri_complete = 4;
-  google.protobuf.Timestamp expires_at = 5;
-  int32 interval = 6;
-}
-
-message CompleteAwsSsoDeviceRequest {
-  string handle = 1;
-}
-message CompleteAwsSsoDeviceResponse {
 }
 
 //----- The following is used for mairu-exec subprocess IPC
