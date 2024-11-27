@@ -248,9 +248,12 @@ impl Server {
                 self.id()
             )));
         };
-        if !matches!(oauth.default_grant_type, Some(OAuthGrantType::AwsSso)) {
+        if !matches!(
+            oauth.default_grant_type,
+            Some(OAuthGrantType::AwsSsoDeviceCode)
+        ) {
             return Err(crate::Error::ConfigError(format!(
-                "Server '{}' client registration is not default_grant_type=aws_sso",
+                "Server '{}' client registration is not default_grant_type=aws_sso_device_code",
                 self.id()
             )));
         }
@@ -299,7 +302,7 @@ impl Server {
             return Ok(());
         }
         tracing::info!(server_id = ?self.id(), server_url = %self.url, refresh = ?refresh, "performing AWS SSO Client registration");
-        let registration = crate::oauth_awssso::register_client(self).await.map_err(|e| {
+        let registration = crate::oauth_awssso_device_code::register_client(self).await.map_err(|e| {
             tracing::error!(err = ?e, server_id = self.id(), "error while sso-oidc:RegisterClient");
             e
         })?;
@@ -326,7 +329,7 @@ impl TryFrom<crate::proto::GetServerResponse> for Server {
 pub enum OAuthGrantType {
     Code,
     DeviceCode,
-    AwsSso,
+    AwsSsoDeviceCode,
 }
 
 impl std::str::FromStr for OAuthGrantType {
@@ -335,7 +338,9 @@ impl std::str::FromStr for OAuthGrantType {
         match s {
             "code" => Ok(OAuthGrantType::Code),
             "device_code" => Ok(OAuthGrantType::DeviceCode),
-            "aws_sso" => Ok(OAuthGrantType::AwsSso),
+            "aws_sso_device_code" => Ok(OAuthGrantType::AwsSsoDeviceCode),
+            "aws_sso_code" => Ok(OAuthGrantType::AwsSsoDeviceCode),
+            "aws_sso" => Ok(OAuthGrantType::AwsSsoDeviceCode),
             _ => Err(crate::Error::UserError(
                 "unknown oauth_grant_type".to_owned(),
             )),
@@ -376,7 +381,7 @@ impl ServerOAuth {
             None => false,
             Some(OAuthGrantType::DeviceCode) => self.device_code_grant.is_none(),
             Some(OAuthGrantType::Code) => self.code_grant.is_none(),
-            Some(OAuthGrantType::AwsSso) => false,
+            Some(OAuthGrantType::AwsSsoDeviceCode) => false,
         } {
             return Err(crate::Error::ConfigError(
                 "default_grant_type is specified but its configuration is not given".to_owned(),
@@ -455,7 +460,7 @@ pub struct AwsSsoClientRegistrationCache {
 impl AwsSsoClientRegistrationCache {
     fn into_server_oauth(self, sso: &ServerAwsSso) -> ServerOAuth {
         ServerOAuth {
-            default_grant_type: Some(crate::config::OAuthGrantType::AwsSso),
+            default_grant_type: Some(crate::config::OAuthGrantType::AwsSsoDeviceCode),
             client_id: self.client_id,
             client_secret: Some(self.client_secret),
             token_endpoint: None,

@@ -42,7 +42,9 @@ pub async fn login(
     match oauth_grant_type {
         crate::config::OAuthGrantType::Code => do_oauth_code(agent, server).await,
         crate::config::OAuthGrantType::DeviceCode => do_oauth_device_code(agent, server).await,
-        crate::config::OAuthGrantType::AwsSso => do_awssso(agent, server).await,
+        crate::config::OAuthGrantType::AwsSsoDeviceCode => {
+            do_aws_sso_device_code(agent, server).await
+        }
     }
 }
 
@@ -151,7 +153,7 @@ pub async fn do_oauth_device_code(
     Ok(())
 }
 
-pub async fn do_awssso(
+pub async fn do_aws_sso_device_code(
     agent: &mut crate::agent::AgentConn,
     server: crate::config::Server,
 ) -> Result<(), anyhow::Error> {

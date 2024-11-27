@@ -338,7 +338,7 @@ impl crate::proto::agent_server::Agent for Agent {
             ))
         })?;
 
-        let flow = crate::oauth_awssso::AwsSsoDeviceFlow::initiate(&server)
+        let flow = crate::oauth_awssso_device_code::AwsSsoDeviceFlow::initiate(&server)
             .await
             .map_err(|e| {
                 tracing::error!(err = ?e, "AwsSsoDeviceFlow initiate failure");
@@ -464,7 +464,7 @@ async fn refresh_token_using_oauth2(
 async fn refresh_token_using_awssso(
     session: &crate::session_manager::Session,
 ) -> Option<crate::token::ServerToken> {
-    match crate::oauth_awssso::refresh_token(&session.token).await {
+    match crate::oauth_awssso_device_code::refresh_token(&session.token).await {
         Ok(token) => Some(token),
         Err(e) => {
             tracing::warn!(
