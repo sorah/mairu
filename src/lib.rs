@@ -1,6 +1,7 @@
 mod error;
 pub use error::{Error, Result};
 
+pub mod ext_awssso;
 pub mod ext_axum;
 pub mod ext_oauth2;
 pub mod os;
