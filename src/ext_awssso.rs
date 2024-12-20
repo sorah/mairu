@@ -1,3 +1,5 @@
+use aws_smithy_runtime_api::client::endpoint::ResolveEndpoint;
+
 pub async fn sso_config_to_ssooidc(sso: &crate::config::ServerAwsSso) -> aws_sdk_ssooidc::Client {
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest())
         .await
@@ -91,4 +93,59 @@ pub fn create_token_output_to_token(
             .into(),
         refresh_token: r.refresh_token.map(|x| x.into()),
     })
+}
+
+pub async fn ssooidc_authorize_url(sso: &crate::config::ServerAwsSso) -> () {
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest())
+        .await
+        .to_builder()
+        .region(Some(aws_config::Region::new(sso.region.clone())))
+        .identity_cache(aws_config::identity::IdentityCache::no_cache())
+        .build();
+    let client = aws_sdk_ssooidc::Client::new(&config);
+
+    //let epr = ssooidc.config().endpoint_resolver();
+    todo!()
+}
+
+#[derive(Debug)]
+struct EndpointStealingInterceptor;
+impl aws_smithy_runtime_api::client::interceptors::Intercept for EndpointStealingInterceptor {
+    fn name(&self) -> &'static str {
+        "EndpointStealingInterceptor"
+    }
+
+    fn read_before_serialization(
+        &self,
+        _context: &aws_smithy_runtime_api::client::interceptors::context::BeforeSerializationInterceptorContextRef<
+            '_,
+            aws_smithy_runtime_api::client::interceptors::context::Input,
+            aws_smithy_runtime_api::client::interceptors::context::Output,
+            aws_smithy_runtime_api::client::interceptors::context::Error,
+        >,
+        runtime_components: &aws_smithy_runtime_api::client::runtime_components::RuntimeComponents,
+        cfg: &mut aws_smithy_types::config_bag::ConfigBag,
+    ) -> ::std::result::Result<(), ::aws_smithy_runtime_api::box_error::BoxError> {
+        use core::future::Future;
+        let params = cfg
+            .load::<aws_smithy_runtime_api::client::endpoint::EndpointResolverParams>()
+            .ok_or_else(|| {
+                crate::Error::UnknownError("could not load EndpointResolverParams".to_string())
+            })?;
+        let epr = runtime_components.endpoint_resolver();
+        let fut = epr.resolve_endpoint(params);
+        let waker = futures::task::noop_waker();
+        let mut ctx = futures::task::Context::from_waker(&waker);
+        tokio::pin!(fut);
+        match fut.poll(&mut ctx) {
+            core::task::Poll::Ready(Ok(x)) => panic!("x"),
+            _ => {
+                return Err(Box::new(crate::Error::UnknownError(
+                    "error during aws-ssooidc endpoint resolution; it was not instantly Ready"
+                        .to_string(),
+                )))
+            }
+        }
+        ::std::result::Result::Ok(())
+    }
 }
