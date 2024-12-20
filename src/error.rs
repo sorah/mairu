@@ -9,6 +9,9 @@ pub enum Error {
     #[error("AuthError: {0}")]
     AuthError(String),
 
+    #[error("UnknownError: {0}")]
+    UnknownError(String),
+
     #[error(transparent)]
     JsonError(#[from] serde_json::Error),
 

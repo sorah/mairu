@@ -173,11 +173,11 @@ impl Server {
             )
             .await?
             {
-                Some(cache) if !cache.is_expired() => {
+                Some(cache) if !cache.is_expired() && !cache.is_legacy() => {
                     parsed.oauth = Some(cache.into_server_oauth(parsed.aws_sso.as_ref().unwrap()));
                 }
                 Some(_) => {
-                    tracing::debug!(server = ?parsed, "AwsSsoClientRegistrationCache is expired");
+                    tracing::debug!(server = ?parsed, "AwsSsoClientRegistrationCache is expired or being legacy");
                 }
                 None => {
                     tracing::debug!(server = ?parsed, "AwsSsoClientRegistrationCache is missing");
@@ -435,15 +435,20 @@ pub struct ServerAwsSso {
     pub region: String,
     #[serde(default = "default_aws_sso_scope")]
     pub scope: Vec<String>,
+    pub local_port: Option<u16>,
 }
 
 fn default_aws_sso_scope() -> Vec<String> {
     vec!["sso:account:access".to_owned()]
 }
 
+static CURRENT_EPOCH: u64 = 2;
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct AwsSsoClientRegistrationCache {
     pub id: String,
+    #[serde(default)]
+    pub epoch: u64,
     pub issued_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub client_id: String,
@@ -453,13 +458,18 @@ pub struct AwsSsoClientRegistrationCache {
 impl AwsSsoClientRegistrationCache {
     fn into_server_oauth(self, sso: &ServerAwsSso) -> ServerOAuth {
         ServerOAuth {
-            default_grant_type: Some(crate::config::OAuthGrantType::DeviceCode),
+            default_grant_type: Some(crate::config::OAuthGrantType::Code),
             client_id: self.client_id,
             client_secret: Some(self.client_secret),
             token_endpoint: None,
             scope: sso.scope.clone(),
-            code_grant: None,
-            device_code_grant: None,
+            code_grant: Some(ServerCodeGrant {
+                authorization_endpoint: None,
+                local_port: sso.local_port,
+            }),
+            device_code_grant: Some(ServerDeviceCodeGrant {
+                device_authorization_endpoint: None,
+            }),
             client_expires_at: Some(self.expires_at),
         }
     }
@@ -499,12 +509,17 @@ impl AwsSsoClientRegistrationCache {
         self.expires_at <= chrono::Utc::now()
     }
 
+    pub fn is_legacy(&self) -> bool {
+        self.epoch < CURRENT_EPOCH
+    }
+
     pub fn from_aws_sso(
         server: &Server,
         resp: &aws_sdk_ssooidc::operation::register_client::RegisterClientOutput,
     ) -> crate::Result<Self> {
         Ok(AwsSsoClientRegistrationCache {
             id: server.id().to_owned(),
+            epoch: CURRENT_EPOCH,
             issued_at: chrono::DateTime::from_timestamp(resp.client_id_issued_at, 0)
                 .ok_or_else(|| crate::Error::UserError("invalid client_id_issued_at".to_owned()))?,
             expires_at: chrono::DateTime::from_timestamp(resp.client_secret_expires_at, 0)

@@ -51,8 +51,14 @@ pub async fn do_oauth_code(
 ) -> Result<(), anyhow::Error> {
     let (_oauth, code_grant) = server.try_oauth_code_grant()?;
 
+    let path = if server.aws_sso.is_some() {
+        "/oauth/callback"
+    } else {
+        "/oauth2callback"
+    };
+
     let (listener, url) =
-        match crate::oauth_code::bind_tcp_for_callback(code_grant.local_port).await {
+        match crate::oauth_code::bind_tcp_for_callback(path, code_grant.local_port).await {
             Ok(t) => t,
             Err(e) => anyhow::bail!(
                 "Failed to bind TCP server for OAuth 2.0 callback acceptance, perhaps there is concurrent mairu-exec call waitng for login, or occupied by oher process; {}",
@@ -94,9 +100,7 @@ pub async fn do_oauth_device_code(
     agent: &mut crate::agent::AgentConn,
     server: crate::config::Server,
 ) -> Result<(), anyhow::Error> {
-    if server.aws_sso.is_none() {
-        server.try_oauth_device_code_grant()?;
-    }
+    server.try_oauth_device_code_grant()?;
 
     let session = agent
         .initiate_oauth_device_code(crate::proto::InitiateOAuthDeviceCodeRequest {

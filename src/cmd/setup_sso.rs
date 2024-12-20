@@ -54,6 +54,7 @@ pub async fn run(args: &SetupSsoArgs) -> Result<(), anyhow::Error> {
         aws_sso: Some(crate::config::ServerAwsSso {
             region: args.region.clone(),
             scope: args.scope.clone(),
+            local_port: None,
         }),
     };
 

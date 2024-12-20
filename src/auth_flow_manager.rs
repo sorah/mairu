@@ -7,6 +7,7 @@ pub enum AuthFlow {
     OAuthCode(crate::oauth_code::OAuthCodeFlow),
     OAuthDeviceCode(crate::oauth_device_code::OAuthDeviceCodeFlow),
     AwsSsoDevice(crate::oauth_awssso_device_code::AwsSsoDeviceFlow),
+    AwsSsoCode(crate::oauth_awssso_code::AwsSsoCodeFlow),
 }
 
 impl AuthFlow {
@@ -16,6 +17,7 @@ impl AuthFlow {
             AuthFlow::OAuthCode(f) => &f.handle,
             AuthFlow::OAuthDeviceCode(f) => &f.handle,
             AuthFlow::AwsSsoDevice(f) => &f.handle,
+            AuthFlow::AwsSsoCode(f) => &f.handle,
         }
     }
 }
