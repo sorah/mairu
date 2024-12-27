@@ -1,6 +1,7 @@
 mod error;
 pub use error::{Error, Result};
 
+pub mod ext_awssso;
 pub mod ext_axum;
 pub mod ext_oauth2;
 pub mod os;
@@ -14,7 +15,8 @@ pub mod proto;
 pub mod token;
 pub mod utils;
 
-pub mod oauth_awssso;
+pub mod oauth_awssso_code;
+pub mod oauth_awssso_device_code;
 pub mod oauth_code;
 pub mod oauth_device_code;
 pub mod oauth_refresh_token;

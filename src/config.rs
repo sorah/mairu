@@ -173,11 +173,11 @@ impl Server {
             )
             .await?
             {
-                Some(cache) if !cache.is_expired() => {
+                Some(cache) if !cache.is_expired() && !cache.is_legacy() => {
                     parsed.oauth = Some(cache.into_server_oauth(parsed.aws_sso.as_ref().unwrap()));
                 }
                 Some(_) => {
-                    tracing::debug!(server = ?parsed, "AwsSsoClientRegistrationCache is expired");
+                    tracing::debug!(server = ?parsed, "AwsSsoClientRegistrationCache is expired or being legacy");
                 }
                 None => {
                     tracing::debug!(server = ?parsed, "AwsSsoClientRegistrationCache is missing");
@@ -248,9 +248,9 @@ impl Server {
                 self.id()
             )));
         };
-        if !matches!(oauth.default_grant_type, Some(OAuthGrantType::AwsSso)) {
+        if !matches!(oauth.default_grant_type, Some(OAuthGrantType::DeviceCode)) {
             return Err(crate::Error::ConfigError(format!(
-                "Server '{}' client registration is not default_grant_type=aws_sso",
+                "Server '{}' client registration is not default_grant_type=aws_sso_device_code",
                 self.id()
             )));
         }
@@ -299,7 +299,7 @@ impl Server {
             return Ok(());
         }
         tracing::info!(server_id = ?self.id(), server_url = %self.url, refresh = ?refresh, "performing AWS SSO Client registration");
-        let registration = crate::oauth_awssso::register_client(self).await.map_err(|e| {
+        let registration = crate::ext_awssso::register_client(self).await.map_err(|e| {
             tracing::error!(err = ?e, server_id = self.id(), "error while sso-oidc:RegisterClient");
             e
         })?;
@@ -326,7 +326,6 @@ impl TryFrom<crate::proto::GetServerResponse> for Server {
 pub enum OAuthGrantType {
     Code,
     DeviceCode,
-    AwsSso,
 }
 
 impl std::str::FromStr for OAuthGrantType {
@@ -335,7 +334,7 @@ impl std::str::FromStr for OAuthGrantType {
         match s {
             "code" => Ok(OAuthGrantType::Code),
             "device_code" => Ok(OAuthGrantType::DeviceCode),
-            "aws_sso" => Ok(OAuthGrantType::AwsSso),
+            "aws_sso" => Ok(OAuthGrantType::DeviceCode),
             _ => Err(crate::Error::UserError(
                 "unknown oauth_grant_type".to_owned(),
             )),
@@ -365,7 +364,7 @@ fn default_oauth_scope() -> Vec<String> {
 }
 
 impl ServerOAuth {
-    pub fn validate(&self) -> Result<(), crate::Error> {
+    pub(crate) fn validate(&self) -> Result<(), crate::Error> {
         if self.code_grant.is_none() && self.device_code_grant.is_none() {
             return Err(crate::Error::ConfigError(
                 "Either oauth.code_grant or oauth.device_code_grant must be provided, but absent"
@@ -376,7 +375,6 @@ impl ServerOAuth {
             None => false,
             Some(OAuthGrantType::DeviceCode) => self.device_code_grant.is_none(),
             Some(OAuthGrantType::Code) => self.code_grant.is_none(),
-            Some(OAuthGrantType::AwsSso) => false,
         } {
             return Err(crate::Error::ConfigError(
                 "default_grant_type is specified but its configuration is not given".to_owned(),
@@ -437,15 +435,20 @@ pub struct ServerAwsSso {
     pub region: String,
     #[serde(default = "default_aws_sso_scope")]
     pub scope: Vec<String>,
+    pub local_port: Option<u16>,
 }
 
 fn default_aws_sso_scope() -> Vec<String> {
     vec!["sso:account:access".to_owned()]
 }
 
+static CURRENT_EPOCH: u64 = 2;
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct AwsSsoClientRegistrationCache {
     pub id: String,
+    #[serde(default)]
+    pub epoch: u64,
     pub issued_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub client_id: String,
@@ -455,13 +458,18 @@ pub struct AwsSsoClientRegistrationCache {
 impl AwsSsoClientRegistrationCache {
     fn into_server_oauth(self, sso: &ServerAwsSso) -> ServerOAuth {
         ServerOAuth {
-            default_grant_type: Some(crate::config::OAuthGrantType::AwsSso),
+            default_grant_type: Some(crate::config::OAuthGrantType::Code),
             client_id: self.client_id,
             client_secret: Some(self.client_secret),
             token_endpoint: None,
             scope: sso.scope.clone(),
-            code_grant: None,
-            device_code_grant: None,
+            code_grant: Some(ServerCodeGrant {
+                authorization_endpoint: None,
+                local_port: sso.local_port,
+            }),
+            device_code_grant: Some(ServerDeviceCodeGrant {
+                device_authorization_endpoint: None,
+            }),
             client_expires_at: Some(self.expires_at),
         }
     }
@@ -501,12 +509,17 @@ impl AwsSsoClientRegistrationCache {
         self.expires_at <= chrono::Utc::now()
     }
 
+    pub fn is_legacy(&self) -> bool {
+        self.epoch < CURRENT_EPOCH
+    }
+
     pub fn from_aws_sso(
         server: &Server,
         resp: &aws_sdk_ssooidc::operation::register_client::RegisterClientOutput,
     ) -> crate::Result<Self> {
         Ok(AwsSsoClientRegistrationCache {
             id: server.id().to_owned(),
+            epoch: CURRENT_EPOCH,
             issued_at: chrono::DateTime::from_timestamp(resp.client_id_issued_at, 0)
                 .ok_or_else(|| crate::Error::UserError("invalid client_id_issued_at".to_owned()))?,
             expires_at: chrono::DateTime::from_timestamp(resp.client_secret_expires_at, 0)

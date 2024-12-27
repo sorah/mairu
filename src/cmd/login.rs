@@ -42,7 +42,6 @@ pub async fn login(
     match oauth_grant_type {
         crate::config::OAuthGrantType::Code => do_oauth_code(agent, server).await,
         crate::config::OAuthGrantType::DeviceCode => do_oauth_device_code(agent, server).await,
-        crate::config::OAuthGrantType::AwsSso => do_awssso(agent, server).await,
     }
 }
 
@@ -52,8 +51,14 @@ pub async fn do_oauth_code(
 ) -> Result<(), anyhow::Error> {
     let (_oauth, code_grant) = server.try_oauth_code_grant()?;
 
+    let path = if server.aws_sso.is_some() {
+        "/oauth/callback"
+    } else {
+        "/oauth2callback"
+    };
+
     let (listener, url) =
-        match crate::oauth_code::bind_tcp_for_callback(code_grant.local_port).await {
+        match crate::oauth_code::bind_tcp_for_callback(path, code_grant.local_port).await {
             Ok(t) => t,
             Err(e) => anyhow::bail!(
                 "Failed to bind TCP server for OAuth 2.0 callback acceptance, perhaps there is concurrent mairu-exec call waitng for login, or occupied by oher process; {}",
@@ -138,61 +143,6 @@ pub async fn do_oauth_device_code(
                 interval += 5;
                 tracing::debug!(interval = ?interval, "Received slow_down request");
             }
-            Err(e) if e.code() == tonic::Code::FailedPrecondition => {
-                // continue
-            }
-            Err(e) => {
-                anyhow::bail!(e);
-            }
-        }
-    }
-
-    tracing::info!("Logged in");
-    Ok(())
-}
-
-pub async fn do_awssso(
-    agent: &mut crate::agent::AgentConn,
-    server: crate::config::Server,
-) -> Result<(), anyhow::Error> {
-    server.try_oauth_awssso()?;
-
-    let session = agent
-        .initiate_aws_sso_device(crate::proto::InitiateAwsSsoDeviceRequest {
-            server_id: server.id().to_owned(),
-        })
-        .await?
-        .into_inner();
-    tracing::debug!(session = ?session, "Initiated flow");
-
-    let product = env!("CARGO_PKG_NAME");
-    let server_id = server.id();
-    let server_url = &server.url;
-    let user_code = &session.user_code;
-    let mut authorize_url = &session.verification_uri_complete;
-    if authorize_url.is_empty() {
-        authorize_url = &session.verification_uri;
-    }
-
-    crate::terminal::send(&indoc::formatdoc! {"
-        :: {product} :: Login to {server_id} ({server_url}) ::::::::
-        :: {product} ::
-        :: {product} ::                  Your Verification Code: {user_code}
-        :: {product} :: Visit AWS SSO and authorize to continue: {authorize_url}
-        :: {product} ::
-    "})
-    .await;
-
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(session.interval as u64)).await;
-        let completion = agent
-            .complete_aws_sso_device(crate::proto::CompleteAwsSsoDeviceRequest {
-                handle: session.handle.clone(),
-            })
-            .await;
-
-        match completion {
-            Ok(_) => break,
             Err(e) if e.code() == tonic::Code::FailedPrecondition => {
                 // continue
             }

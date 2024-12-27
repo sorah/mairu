@@ -25,7 +25,7 @@ impl OAuthCodeFlow {
         let client = oauth2_client_from_server(server)?
             .set_redirect_uri(oauth2::RedirectUrl::from_url(redirect_url.clone()));
         let (oauth, _) = server.try_oauth_code_grant()?;
-        let (pkce_challenge, pkce_verifier) = generate_pkce_challenge();
+        let (pkce_challenge, pkce_verifier) = crate::ext_oauth2::generate_pkce_challenge();
         let request = client
             .authorize_url(oauth2::CsrfToken::new_random)
             .add_scopes(oauth.scope.iter().map(|x| oauth2::Scope::new(x.to_owned())))
@@ -68,24 +68,6 @@ impl OAuthCodeFlow {
     }
 }
 
-// We can't use oauth2 provided method where prohibits cloning strings
-fn generate_pkce_challenge() -> (oauth2::PkceCodeChallenge, secrecy::SecretString) {
-    use base64::Engine;
-    use rand::RngCore;
-    use secrecy::ExposeSecret;
-
-    let mut buf = [0u8; 64];
-    rand::thread_rng().fill_bytes(&mut buf);
-    let verifier_raw =
-        secrecy::SecretString::new(base64::engine::general_purpose::URL_SAFE.encode(buf).into());
-    let verifier = oauth2::PkceCodeVerifier::new(verifier_raw.expose_secret().to_owned());
-
-    (
-        oauth2::PkceCodeChallenge::from_code_verifier_sha256(&verifier),
-        verifier_raw,
-    )
-}
-
 fn oauth2_client_from_server(
     server: &crate::config::Server,
 ) -> crate::Result<
@@ -126,6 +108,7 @@ fn oauth2_client_from_server(
 }
 
 pub async fn bind_tcp_for_callback(
+    path: &str,
     port: Option<u16>,
 ) -> crate::Result<(tokio::net::TcpListener, url::Url)> {
     // FIXME: IPv6
@@ -133,7 +116,8 @@ pub async fn bind_tcp_for_callback(
         std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), port.unwrap_or(0));
     let sock = tokio::net::TcpListener::bind(bindaddr).await?;
     let addr = sock.local_addr()?;
-    let mut url = url::Url::parse("http://127.0.0.1/oauth2callback")?;
+    let mut url = url::Url::parse("http://127.0.0.1/")?;
+    url.set_path(path);
     url.set_port(Some(addr.port())).unwrap();
     tracing::debug!(url = %url, "Listening TCP for Callback");
     Ok((sock, url))
@@ -158,6 +142,7 @@ pub async fn listen_for_callback(
     let context = std::sync::Arc::new(OneoffServerContext { result_tx, session });
     let conn = agent.clone();
     let app = axum::Router::new()
+        .route("/oauth/callback", axum::routing::get(callback))
         .route("/oauth2callback", axum::routing::get(callback))
         .layer(axum::extract::Extension(conn))
         .layer(axum::extract::Extension(context));
