@@ -247,26 +247,23 @@ impl Server {
         }
     }
 
-    pub fn try_oauth_awssso(&self) -> crate::Result<&ServerOAuth> {
-        if self.aws_sso.is_none() {
+    pub fn try_oauth_awssso(
+        &self,
+        grant_type: OAuthGrantType,
+    ) -> crate::Result<(&ServerAwsSso, &ServerOAuth)> {
+        let Some(aws_sso) = self.aws_sso.as_ref() else {
             return Err(crate::Error::ConfigError(format!(
-                "Server '{}' is not aws_sso",
+                "Server '{}' is not aws_sso server",
                 self.id()
             )));
-        }
+        };
         let Some(oauth) = self.oauth.as_ref() else {
             return Err(crate::Error::ConfigError(format!(
                 "Server '{}' is missing OAuth 2.0 client registration",
                 self.id()
             )));
         };
-        if !matches!(oauth.default_grant_type, Some(OAuthGrantType::DeviceCode)) {
-            return Err(crate::Error::ConfigError(format!(
-                "Server '{}' client registration is not default_grant_type=aws_sso_device_code",
-                self.id()
-            )));
-        }
-        Ok(oauth)
+        Ok((aws_sso, oauth))
     }
 
     #[inline]
@@ -346,6 +343,7 @@ impl std::str::FromStr for OAuthGrantType {
         match s {
             "code" => Ok(OAuthGrantType::Code),
             "device_code" => Ok(OAuthGrantType::DeviceCode),
+            "device-code" => Ok(OAuthGrantType::DeviceCode),
             "aws_sso" => Ok(OAuthGrantType::DeviceCode),
             _ => Err(crate::Error::UserError(
                 "unknown oauth_grant_type".to_owned(),
@@ -465,6 +463,10 @@ pub struct AwsSsoClientRegistrationCache {
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub client_id: String,
     pub client_secret: String,
+    // #[serde(default)]
+    // pub scope: Vec<String>,
+    // #[serde(default)]
+    // pub grant_types: Vec<String>,
 }
 
 impl AwsSsoClientRegistrationCache {
