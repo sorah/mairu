@@ -25,15 +25,8 @@ impl From<&AwsSsoDeviceFlow> for crate::proto::InitiateOAuthDeviceCodeResponse {
 
 impl AwsSsoDeviceFlow {
     pub async fn initiate(server: &crate::config::Server) -> crate::Result<Self> {
-        let aws_sso = server.aws_sso.as_ref().ok_or_else(|| {
-            crate::Error::ConfigError(format!("Server '{}' is not an aws_sso server", server.id()))
-        })?;
-        let oauth = server.oauth.as_ref().ok_or_else(|| {
-            crate::Error::ConfigError(format!(
-                "Server '{}' is missing an OAuth 2.0 client registration",
-                server.id()
-            ))
-        })?;
+        let (aws_sso, oauth) =
+            server.try_oauth_awssso(crate::config::OAuthGrantType::DeviceCode)?;
         let handle = crate::utils::generate_flow_handle();
         tracing::info!(server = ?server, handle = ?handle, "Initiating AWS SSO Device Grant flow");
         let ssooidc = crate::ext_awssso::sso_config_to_ssooidc(aws_sso).await;
@@ -82,18 +75,9 @@ impl AwsSsoDeviceFlow {
     }
 
     pub async fn complete(&self) -> crate::Result<crate::token::ServerToken> {
-        let aws_sso = self.server.aws_sso.as_ref().ok_or_else(|| {
-            crate::Error::ConfigError(format!(
-                "Server '{}' is not an aws_sso server",
-                self.server.id(),
-            ))
-        })?;
-        let oauth = self.server.oauth.as_ref().ok_or_else(|| {
-            crate::Error::ConfigError(format!(
-                "Server '{}' is missing an OAuth 2.0 client registration",
-                self.server.id(),
-            ))
-        })?;
+        let (aws_sso, oauth) = self
+            .server
+            .try_oauth_awssso(crate::config::OAuthGrantType::DeviceCode)?;
         tracing::debug!(server = ?self.server, handle = ?self.handle, "Checking AWS SSO Device Grant flow");
         let ssooidc = crate::ext_awssso::sso_config_to_ssooidc(aws_sso).await;
 

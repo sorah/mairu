@@ -19,6 +19,13 @@ pub struct SetupSsoArgs {
     overwrite: bool,
 }
 
+#[derive(serde::Serialize, Clone)]
+struct ServerConfig {
+    url: url::Url,
+    id: Option<String>,
+    aws_sso: Option<crate::config::ServerAwsSso>,
+}
+
 #[tokio::main]
 pub async fn run(args: &SetupSsoArgs) -> Result<(), anyhow::Error> {
     let mut agent = crate::cmd::agent::connect_or_start().await?;
@@ -44,13 +51,12 @@ pub async fn run(args: &SetupSsoArgs) -> Result<(), anyhow::Error> {
     }
 
     let id = args.server_id.clone();
-    let server = crate::config::Server {
-        config_path: crate::config::config_dir()
-            .join("servers.d")
-            .join(format!("{id}.json")),
+    let config_path = crate::config::config_dir()
+        .join("servers.d")
+        .join(format!("{id}.json"));
+    let server = ServerConfig {
         id: Some(id.clone()),
         url: args.start_url.clone(),
-        oauth: None,
         aws_sso: Some(crate::config::ServerAwsSso {
             region: args.region.clone(),
             scope: args.scope.clone(),
@@ -58,7 +64,7 @@ pub async fn run(args: &SetupSsoArgs) -> Result<(), anyhow::Error> {
         }),
     };
 
-    tokio::fs::create_dir_all(server.config_path.parent().unwrap()).await?;
+    tokio::fs::create_dir_all(config_path.parent().unwrap()).await?;
     {
         use tokio::io::AsyncWriteExt;
         let data = serde_json::to_string_pretty(&server)?;
@@ -66,7 +72,7 @@ pub async fn run(args: &SetupSsoArgs) -> Result<(), anyhow::Error> {
             .write(true)
             .truncate(true)
             .create(true)
-            .open(&server.config_path)
+            .open(&config_path)
             .await?;
         file.write_all(data.as_bytes()).await?;
         file.write_all(b"\n").await?;

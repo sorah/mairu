@@ -162,7 +162,7 @@ impl crate::proto::agent_server::Agent for Agent {
         };
 
         if server.aws_sso.is_some() {
-            server.ensure_aws_sso_oauth_client_registration(false)
+            server.ensure_aws_sso_oauth_client_registration(true, crate::config::OAuthGrantType::Code)
                 .await
                 .map_err(|e| {
                     tracing::error!(err = ?e, server_id = server.id(), "error while refreshing oauth client registration");
@@ -255,7 +255,7 @@ impl crate::proto::agent_server::Agent for Agent {
         };
 
         if server.aws_sso.is_some() {
-            server.ensure_aws_sso_oauth_client_registration(false)
+            server.ensure_aws_sso_oauth_client_registration(true, crate::config::OAuthGrantType::DeviceCode)
                 .await
                 .map_err(|e| {
                     tracing::error!(err = ?e, server_id = server.id(), "error while refreshing oauth client registration");
@@ -351,10 +351,16 @@ impl crate::proto::agent_server::Agent for Agent {
         //    ))
         //})?;
 
-        server.ensure_aws_sso_oauth_client_registration(true)
+        server.ensure_aws_sso_oauth_client_registration(true, crate::config::OAuthGrantType::Code)
             .await
             .map_err(|e| {
-                tracing::error!(err = ?e, server_id = server.id(), "error while refreshing oauth client registration");
+                tracing::error!(err = ?e, server_id = server.id(), "error while refreshing oauth client registration (Code)");
+                tonic::Status::internal(format!("error while refreshing oauth client registration: {e}"))
+            })?;
+        server.ensure_aws_sso_oauth_client_registration(true, crate::config::OAuthGrantType::DeviceCode)
+            .await
+            .map_err(|e| {
+                tracing::error!(err = ?e, server_id = server.id(), "error while refreshing oauth client registration (DeviceCode)");
                 tonic::Status::internal(format!("error while refreshing oauth client registration: {e}"))
             })?;
 

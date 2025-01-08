@@ -12,6 +12,7 @@ pub async fn sso_config_to_ssooidc(sso: &crate::config::ServerAwsSso) -> aws_sdk
 
 pub async fn register_client(
     server: &crate::config::Server,
+    purpose: crate::config::OAuthGrantType,
 ) -> crate::Result<crate::config::AwsSsoClientRegistrationCache> {
     let sso = server.aws_sso.as_ref().ok_or_else(|| {
         crate::Error::UserError(format!("Server '{}' is not an aws_sso server", server.id(),))
@@ -19,16 +20,28 @@ pub async fn register_client(
 
     let ssooidc = sso_config_to_ssooidc(sso).await;
 
+    // XXX: We need to maintain separate client registrations per grant_type (`purpose`).
+    // A client must be registered with grant_types parameter to opt-in to authorization_code grant
+    // (in addition to device_code type, which was grant_type only supported in AWS SSO),
+    // but AWS SSO returns internal exception with HTTP 500 status code when a client registration
+    // has both grant_types("urn:ietf:params:oauth:grant-type:device_code") and grant_types("authorization_code").
+
     let product = env!("CARGO_PKG_NAME");
+    let hostname = nix::unistd::gethostname()
+        .ok()
+        .and_then(|x| x.into_string().ok())
+        .unwrap_or_else(|| "?".to_string());
     let mut req = ssooidc
         .register_client()
-        .client_name(format!("{} ({})", product, server.id()))
+        .client_name(format!("{} ({}@{})", product, server.id(), hostname))
         .client_type("public")
-        .grant_types("authorization_code")
-        .grant_types("refresh_token")
-        .grant_types("urn:ietf:params:oauth:grant-type:device_code")
         .issuer_url(server.url.to_string())
         .redirect_uris("http://127.0.0.1/oauth/callback"); // [::1] is refused by AWS
+    if matches!(purpose, crate::config::OAuthGrantType::Code) {
+        req = req
+            .grant_types("authorization_code")
+            .grant_types("refresh_token");
+    }
     if !sso.scope.is_empty() {
         req = req.scopes(sso.scope.join(" "))
     }
@@ -154,10 +167,10 @@ impl aws_smithy_runtime_api::client::interceptors::Intercept for EndpointStealin
     fn read_before_serialization(
         &self,
         _context: &aws_smithy_runtime_api::client::interceptors::context::BeforeSerializationInterceptorContextRef<
-            '_,
-            aws_smithy_runtime_api::client::interceptors::context::Input,
-            aws_smithy_runtime_api::client::interceptors::context::Output,
-            aws_smithy_runtime_api::client::interceptors::context::Error,
+        '_,
+        aws_smithy_runtime_api::client::interceptors::context::Input,
+        aws_smithy_runtime_api::client::interceptors::context::Output,
+        aws_smithy_runtime_api::client::interceptors::context::Error,
         >,
         runtime_components: &aws_smithy_runtime_api::client::runtime_components::RuntimeComponents,
         cfg: &mut aws_smithy_types::config_bag::ConfigBag,
