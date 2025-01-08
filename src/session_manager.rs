@@ -142,7 +142,7 @@ impl Default for SessionManager {
 
 fn find_item_for_update(items: &[Session], token: &crate::token::ServerToken) -> Option<usize> {
     for (i, item) in items.iter().enumerate() {
-        if item.token.server.config_path == token.server.config_path
+        if item.token.server.config_path() == token.server.config_path()
             && item.token.server.id() == token.server.id()
             && item.token.server.url == token.server.url
         {

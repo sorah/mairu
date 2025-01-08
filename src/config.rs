@@ -76,13 +76,18 @@ pub fn socket_path() -> std::path::PathBuf {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Server {
-    #[serde(skip)]
-    pub config_path: std::path::PathBuf,
-
     pub url: url::Url,
     pub(crate) id: Option<String>,
     pub oauth: Option<ServerOAuth>,
     pub aws_sso: Option<ServerAwsSso>,
+
+    #[serde(skip)]
+    internal: Option<ServerInternal>,
+}
+
+#[derive(Clone)]
+struct ServerInternal {
+    config_path: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for Server {
@@ -90,7 +95,7 @@ impl std::fmt::Debug for Server {
         f.debug_struct("Server")
             .field("id", &self.id)
             .field("url", &self.url.as_str())
-            .field("config_path", &self.config_path)
+            .field("config_path", &self.config_path())
             .finish()
     }
 }
@@ -163,7 +168,9 @@ impl Server {
     pub async fn read_from_file(path: impl AsRef<std::path::Path>) -> crate::Result<Self> {
         let data = tokio::fs::read(&path).await?;
         let mut parsed: Self = serde_json::from_slice(&data)?;
-        parsed.config_path = path.as_ref().into();
+        parsed.internal = Some(ServerInternal {
+            config_path: path.as_ref().into(),
+        });
 
         // Load client cache as .oauth when aws_sso
         if parsed.oauth.is_none() && parsed.aws_sso.is_some() {
@@ -191,6 +198,11 @@ impl Server {
     // pub fn from_json_str(data: &str) -> serde_json::Result<Self> {
     //     serde_json::from_str(data)
     // }
+
+    #[inline]
+    pub fn config_path(&self) -> &std::path::Path {
+        self.internal.as_ref().unwrap().config_path.as_path()
+    }
 
     pub fn validate(&self) -> crate::Result<()> {
         if self.oauth.is_none() {
