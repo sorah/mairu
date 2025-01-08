@@ -4,20 +4,25 @@ Mairu is a tool to securely grant AWS credentials to command-line tools and scri
 
 By using as a executor, you can seamlessly switch between IAM roles per-project and give explicit intent to allow a command line to access your AWS resources. Plus, Mairu's __auto role selector__ allows reading a desired IAM role from `.mairu.json` under your working directory, so you as an admin don't have to tell detailed configuration such as IAM role ARN per project to your colleagues.
 
+## Installation
+
+* __Cargo:__ `cargo install --locked mairu` (recommended)
+* __Binaries:__ Binaries for Linux and macOS are available at https://github.com/sorah/mairu/releases
+
 ## Quick Introduction
 
 Mairu can be used like the following cases. In any case, Mairu automatically retrieves a AWS credential for specified role and prompts user to login when server token is expired or doesn't exist yet.
 
-### Setup AWS SSO
+### Configure AWS SSO
 
 ```
-$ mairu setup-sso my-server --region ${aws_sso_region} --start-url https://my-aws-sso-domain.awsapps.com/start
+$ mairu setup-sso contoso --region ${aws_sso_region} --start-url https://my-aws-sso-domain.awsapps.com/start
 ```
 
 ### Use as a executor
 
 ```
-$ mairu exec --server=my-server 123456789999/AmazingAppDevelopment rails server
+$ mairu exec --server=contoso 123456789999/AmazingAppDevelopment rails server
 ```
 
 or, utilize Mairu's `auto` role feature like as follows:
@@ -28,12 +33,12 @@ $ cd my-project
 $ mairu exec auto rails server
 ```
 
-## Use as a credential process provider
+### Use as a credential process provider
 
 ```ini
 # ~/.aws/config
 [profile mairu_amazing_app]
-credential_process = mairu credential-process my-credential-server arn:aws:iam::123456789999:role/AmazingAppDevelopment
+credential_process = mairu credential-process contoso 123456789999/AmazingAppDevelopment
 ```
 
 then
@@ -42,18 +47,11 @@ then
 $ AWS_PROFILE=mairu_amazing_app rails server
 ```
 
-## Setup
-
-### Installation
-
-* __Cargo:__ `cargo install --locked mairu` (recommended)
-* __Binaries:__ Binaries for Linux and macOS are available at https://github.com/sorah/mairu/releases
-
-### Configure credential server information
+## Configuration
 
 Mairu reads `~/.config/mairu/servers.d/*.json` for a credential server information:
 
-#### AWS IAM Identity Center (AWS SSO)
+### AWS IAM Identity Center (AWS SSO)
 
 To quickly generate:
 
@@ -73,7 +71,9 @@ Or create by hand:
 }
 ```
 
-#### Mairu Assume Role Credentials API
+You may specify `--local-port` (or `.aws_sso.local_port`) to fix Authorization Code grant callback port.
+
+### Mairu Assume Role Credentials API
 
 ```jsonc
 {
@@ -101,13 +101,13 @@ Or create by hand:
 }
 ```
 
-#### Choosing Server ID
+### How to choose a Server ID
 
 It is recommended to use the same `id` for your entire organisation. Personal preferences can be stored in other location, so it is safe to distribute the servers.d file with MDM or something else.
 
 To learn how to prepare your credential server, continue reading at [Credential Server](#credential-server) section.
 
-## Detailed Usage
+## Usage in detail
 
 ### `auto` role
 
@@ -136,7 +136,7 @@ Mairu supports the following methods to provide credentials to AWS SDK. Choose y
 - `ecs` (default): Run ephemeral server to emulate [container provider](https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html). AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN environment variable will be exposed and supports automatic renewal.
 - `static`: Expose traditional AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN environment variables ([static credentials](https://docs.aws.amazon.com/sdkref/latest/guide/feature-static-credentials.html)). This method doesn't support automatic renewal, so you have to restart `mairu exec` when credentials have expired.
 
-<-- TODO: - `docker`: Similar to `ecs`, but launch a proxy container on Docker to connect Mairu agent from Docker containers. See [Docker support](#docker-support) for details. AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN environment will be exposed and supports automatic renewal. -->
+<!-- TODO: - `docker`: Similar to `ecs`, but launch a proxy container on Docker to connect Mairu agent from Docker containers. See [Docker support](#docker-support) for details. AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN environment will be exposed and supports automatic renewal. -->
 
 Your preferred method can be specified in `--mode`:
 
@@ -158,7 +158,7 @@ TBD
 
 Mairu automatically launches agent process in background. This is similar to ssh-agent and gpg-agent. Mairu Agent retains all access tokens for credential server, and caches AWS credentials for re-use on memory.
 
-It listens on `$XDG_RUNTIME_DIR/mairu-agent.sock` (or `~/.config/mairu/mairu-agent.sock`) by default.
+It listens on `$XDG_RUNTIME_DIR/mairu-agent.sock` (or `~/.local/state/mairu/run/mairu-agent.sock`) by default.
 
 ## Credential Server API
 
