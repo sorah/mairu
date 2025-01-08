@@ -18,6 +18,7 @@ pub fn run(args: &AgentArgs) -> Result<(), anyhow::Error> {
 
     protect_process();
     crate::config::cache_dir_mkpath()?;
+    crate::config::runtime_dir_mkpath()?;
 
     if args.daemonize {
         return serve_on_path_daemon(path);
