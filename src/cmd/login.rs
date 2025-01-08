@@ -31,10 +31,17 @@ pub async fn login(
     }
     server.validate()?;
 
-    let oauth = server.oauth.as_ref().unwrap();
     let oauth_grant_type = match args.oauth_grant_type {
         Some(x) => Ok(x),
-        None => oauth.default_grant_type(),
+        // XXX: this must live in config.rs
+        None if server.aws_sso.is_some() => Ok(crate::config::OAuthGrantType::Code),
+        None => {
+            let oauth = server
+                .oauth
+                .as_ref()
+                .ok_or_else(|| crate::Error::ConfigError("server missing oauth".to_string()))?;
+            oauth.default_grant_type()
+        }
     }?;
 
     tracing::debug!(oauth_grant_type = ?oauth_grant_type, server = ?server, "Using OAuth");
@@ -49,16 +56,15 @@ pub async fn do_oauth_code(
     agent: &mut crate::agent::AgentConn,
     server: crate::config::Server,
 ) -> Result<(), anyhow::Error> {
-    let (_oauth, code_grant) = server.try_oauth_code_grant()?;
-
-    let path = if server.aws_sso.is_some() {
-        "/oauth/callback"
+    let (path, local_port) = if let Some(ref aws_sso) = server.aws_sso {
+        ("/oauth/callback", aws_sso.local_port)
     } else {
-        "/oauth2callback"
+        let (_oauth, code_grant) = server.try_oauth_code_grant()?;
+        ("/oauth2callback", code_grant.local_port)
     };
 
     let (listener, url) =
-        match crate::oauth_code::bind_tcp_for_callback(path, code_grant.local_port).await {
+        match crate::oauth_code::bind_tcp_for_callback(path, local_port).await {
             Ok(t) => t,
             Err(e) => anyhow::bail!(
                 "Failed to bind TCP server for OAuth 2.0 callback acceptance, perhaps there is concurrent mairu-exec call waitng for login, or occupied by oher process; {}",
@@ -100,7 +106,9 @@ pub async fn do_oauth_device_code(
     agent: &mut crate::agent::AgentConn,
     server: crate::config::Server,
 ) -> Result<(), anyhow::Error> {
-    server.try_oauth_device_code_grant()?;
+    if server.aws_sso.is_none() {
+        server.try_oauth_device_code_grant()?;
+    }
 
     let session = agent
         .initiate_oauth_device_code(crate::proto::InitiateOAuthDeviceCodeRequest {

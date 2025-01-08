@@ -61,18 +61,9 @@ impl AwsSsoCodeFlow {
         completion: crate::proto::CompleteOAuthCodeRequest,
     ) -> crate::Result<crate::token::ServerToken> {
         tracing::info!(flow = ?self, "Completing OAuth 2.0 Authorization Code flow (AWS SSO)");
-        let aws_sso = self.server.aws_sso.as_ref().ok_or_else(|| {
-            crate::Error::ConfigError(format!(
-                "Server '{}' is not an aws_sso server",
-                self.server.id(),
-            ))
-        })?;
-        let oauth = self.server.oauth.as_ref().ok_or_else(|| {
-            crate::Error::ConfigError(format!(
-                "Server '{}' is missing an OAuth 2.0 client registration",
-                self.server.id(),
-            ))
-        })?;
+        let (aws_sso, oauth) = self
+            .server
+            .try_oauth_awssso(crate::config::OAuthGrantType::Code)?;
 
         if self.csrf_token != completion.state {
             return Err(crate::Error::AuthError("csrf detected".to_owned()));

@@ -88,6 +88,8 @@ pub struct Server {
 #[derive(Clone)]
 struct ServerInternal {
     config_path: std::path::PathBuf,
+    aws_sso_oauth_code: Option<ServerOAuth>,
+    aws_sso_oauth_device: Option<ServerOAuth>,
 }
 
 impl std::fmt::Debug for Server {
@@ -165,33 +167,33 @@ impl Server {
         )))
     }
 
+    #[tracing::instrument(fields(path = path.as_ref().to_str()))]
     pub async fn read_from_file(path: impl AsRef<std::path::Path>) -> crate::Result<Self> {
         let data = tokio::fs::read(&path).await?;
         let mut parsed: Self = serde_json::from_slice(&data)?;
-        parsed.internal = Some(ServerInternal {
+        let mut internal = ServerInternal {
             config_path: path.as_ref().into(),
-        });
+            aws_sso_oauth_code: None,
+            aws_sso_oauth_device: None,
+        };
 
         // Load client cache as .oauth when aws_sso
-        if parsed.oauth.is_none() && parsed.aws_sso.is_some() {
-            // TODO: ignore parse failure (treat as cache miss)
-            match AwsSsoClientRegistrationCache::read_from_file(
-                &parsed.aws_sso_client_registration_cache_key()?,
-            )
-            .await?
-            {
-                Some(cache) if !cache.is_expired() && !cache.is_legacy() => {
-                    parsed.oauth = Some(cache.into_server_oauth(parsed.aws_sso.as_ref().unwrap()));
-                }
-                Some(_) => {
-                    tracing::debug!(server = ?parsed, "AwsSsoClientRegistrationCache is expired or being legacy");
-                }
-                None => {
-                    tracing::debug!(server = ?parsed, "AwsSsoClientRegistrationCache is missing");
-                }
+        if parsed.oauth.is_none() {
+            if let Some(ref aws_sso) = parsed.aws_sso {
+                internal.aws_sso_oauth_code = AwsSsoClientRegistrationCache::try_from_file(
+                    &parsed.aws_sso_client_registration_cache_key(OAuthGrantType::Code)?,
+                )
+                .await
+                .map(|x| x.into_server_oauth(aws_sso));
+                internal.aws_sso_oauth_device = AwsSsoClientRegistrationCache::try_from_file(
+                    &parsed.aws_sso_client_registration_cache_key(OAuthGrantType::DeviceCode)?,
+                )
+                .await
+                .map(|x| x.into_server_oauth(aws_sso));
             }
         }
 
+        parsed.internal = Some(internal);
         Ok(parsed)
     }
 
@@ -201,11 +203,14 @@ impl Server {
 
     #[inline]
     pub fn config_path(&self) -> &std::path::Path {
-        self.internal.as_ref().unwrap().config_path.as_path()
+        match self.internal.as_ref() {
+            Some(x) => x.config_path.as_path(),
+            None => std::path::Path::new(""), // this is reachable when loaded from GetServer RPC
+        }
     }
 
     pub fn validate(&self) -> crate::Result<()> {
-        if self.oauth.is_none() {
+        if self.oauth.is_none() && self.aws_sso.is_none() {
             return Err(crate::Error::ConfigError(
                 "oauth configuration is missing".to_owned(),
             ));
@@ -257,7 +262,12 @@ impl Server {
                 self.id()
             )));
         };
-        let Some(oauth) = self.oauth.as_ref() else {
+        let internal = self.internal.as_ref().unwrap();
+        let maybe_oauth = match grant_type {
+            OAuthGrantType::Code => internal.aws_sso_oauth_code.as_ref(),
+            OAuthGrantType::DeviceCode => internal.aws_sso_oauth_device.as_ref(),
+        };
+        let Some(oauth) = maybe_oauth else {
             return Err(crate::Error::ConfigError(format!(
                 "Server '{}' is missing OAuth 2.0 client registration",
                 self.id()
@@ -271,7 +281,10 @@ impl Server {
         self.id.as_deref().unwrap_or_else(|| self.url.as_str())
     }
 
-    pub(crate) fn aws_sso_client_registration_cache_key(&self) -> crate::Result<String> {
+    fn aws_sso_client_registration_cache_key(
+        &self,
+        grant_type: OAuthGrantType,
+    ) -> crate::Result<String> {
         use base64::Engine;
         use sha2::Digest;
 
@@ -291,12 +304,18 @@ impl Server {
             .chain_update(b"\0\0")
             .chain_update(sso.scope.join(" "))
             .finalize();
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash))
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
+        Ok(format!(
+            "{b64}.{grant_type}",
+            grant_type = grant_type.cache_key()
+        ))
     }
 
+    #[tracing::instrument(fields(server_id = self.id(), refresh = refresh, grant_type = grant_type.cache_key()))]
     pub async fn ensure_aws_sso_oauth_client_registration(
         &mut self,
         refresh: bool,
+        grant_type: OAuthGrantType,
     ) -> crate::Result<()> {
         if self.aws_sso.is_none() {
             return Err(crate::Error::ConfigError(format!(
@@ -304,21 +323,38 @@ impl Server {
                 self.id()
             )));
         }
-        if self.oauth.is_some() && !refresh {
+
+        let should_refresh = refresh || {
+            let internal = self.internal.as_ref().unwrap();
+            match grant_type {
+                OAuthGrantType::Code => internal.aws_sso_oauth_code.is_none(),
+                OAuthGrantType::DeviceCode => internal.aws_sso_oauth_device.is_none(),
+            }
+        };
+        if !should_refresh {
             return Ok(());
         }
-        tracing::info!(server_id = ?self.id(), server_url = %self.url, refresh = ?refresh, "performing AWS SSO Client registration");
-        let registration = crate::ext_awssso::register_client(self).await.map_err(|e| {
+
+        tracing::info!(server_id = ?self.id(), server_url = %self.url, refresh = ?refresh, grant_type = ?grant_type, "performing AWS SSO Client registration");
+        let registration = crate::ext_awssso::register_client(self, grant_type).await.map_err(|e| {
             tracing::error!(err = ?e, server_id = self.id(), "error while sso-oidc:RegisterClient");
             e
         })?;
         registration
-            .save_to_file(self.aws_sso_client_registration_cache_key().unwrap().as_ref())
+            .save_to_file(self.aws_sso_client_registration_cache_key(grant_type).unwrap().as_ref())
             .await.map_err(|e| {
             tracing::error!(err = ?e, server_id = self.id(), "error while saving AwsSsoClientRegistrationCache file");
             e
         })?;
-        self.oauth = Some(registration.into_server_oauth(self.aws_sso.as_ref().unwrap()));
+        {
+            let mut internal = self.internal.take().unwrap();
+            let oauth = Some(registration.into_server_oauth(self.aws_sso.as_ref().unwrap()));
+            match grant_type {
+                OAuthGrantType::Code => internal.aws_sso_oauth_code = oauth,
+                OAuthGrantType::DeviceCode => internal.aws_sso_oauth_device = oauth,
+            }
+            self.internal = Some(internal)
+        }
         Ok(())
     }
 }
@@ -335,6 +371,15 @@ impl TryFrom<crate::proto::GetServerResponse> for Server {
 pub enum OAuthGrantType {
     Code,
     DeviceCode,
+}
+
+impl OAuthGrantType {
+    fn cache_key(&self) -> &'static str {
+        match self {
+            OAuthGrantType::Code => "code",
+            OAuthGrantType::DeviceCode => "device",
+        }
+    }
 }
 
 impl std::str::FromStr for OAuthGrantType {
@@ -498,6 +543,22 @@ impl AwsSsoClientRegistrationCache {
         let data = tokio::fs::read(&path).await?;
         let parsed: Self = serde_json::from_slice(&data)?;
         Ok(Some(parsed))
+    }
+
+    #[tracing::instrument]
+    async fn try_from_file(key: &str) -> Option<Self> {
+        match Self::read_from_file(key).await {
+            Ok(Some(cache)) if !cache.is_expired() && !cache.is_legacy() => Some(cache),
+            Ok(Some(_cache)) => {
+                tracing::debug!(key = ?key, "AwsSsoClientRegistrationCache is expired or being legacy");
+                None
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(e = ?e, key = ?key, "Failed to parse AWS SSO client registration cache");
+                None
+            }
+        }
     }
 
     pub async fn save_to_file(&self, key: &str) -> crate::Result<()> {
