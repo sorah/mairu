@@ -20,9 +20,13 @@ pub async fn register_client(
     let ssooidc = sso_config_to_ssooidc(sso).await;
 
     let product = env!("CARGO_PKG_NAME");
+    let hostname = nix::unistd::gethostname()
+        .ok()
+        .and_then(|x| x.into_string().ok())
+        .unwrap_or_else(|| "?".to_string());
     let mut req = ssooidc
         .register_client()
-        .client_name(format!("{} ({})", product, server.id()))
+        .client_name(format!("{} ({}@{})", product, server.id(), hostname))
         .client_type("public")
         .grant_types("authorization_code")
         .grant_types("refresh_token")
