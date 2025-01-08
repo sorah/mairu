@@ -46,11 +46,8 @@ $ AWS_PROFILE=mairu_amazing_app rails server
 
 ### Installation
 
-#### Cargo
-
-```
-cargo install --locked mairu
-```
+* __Cargo:__ `cargo install --locked mairu` (recommended)
+* __Binaries:__ Binaries for Linux and macOS are available at https://github.com/sorah/mairu/releases
 
 ### Configure credential server information
 
