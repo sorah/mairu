@@ -34,13 +34,14 @@ pub async fn register_client(
     let mut req = ssooidc
         .register_client()
         .client_name(format!("{} ({}@{})", product, server.id(), hostname))
-        .client_type("public")
-        .issuer_url(server.url.to_string())
-        .redirect_uris("http://127.0.0.1/oauth/callback"); // [::1] is refused by AWS
+        .client_type("public");
+
     if matches!(purpose, crate::config::OAuthGrantType::Code) {
         req = req
             .grant_types("authorization_code")
-            .grant_types("refresh_token");
+            .grant_types("refresh_token")
+            .issuer_url(server.url.to_string())
+            .redirect_uris("http://127.0.0.1/oauth/callback"); // [::1] is refused by AWS
     }
     if !sso.scope.is_empty() {
         req = req.scopes(sso.scope.join(" "))

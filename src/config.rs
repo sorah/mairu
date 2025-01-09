@@ -508,7 +508,7 @@ fn default_aws_sso_scope() -> Vec<String> {
     vec!["sso:account:access".to_owned()]
 }
 
-static CURRENT_EPOCH: u64 = 2;
+static CURRENT_EPOCH: u64 = 3;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct AwsSsoClientRegistrationCache {
