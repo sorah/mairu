@@ -1,3 +1,11 @@
+## 0.3.0
+
+- agent: Ensure runtime_dir (to create a socket) is only writable by owner (0700) https://github.com/sorah/mairu/pull/19
+
+### Breaking changes
+
+- Agent socket location is changed to state_dir `~/.local/state/mairu/run` on platforms without XDG_RUNTIME_DIR (e.g. macOS)
+
 ## 0.2.0
 
 - Fix crash on macOS https://github.com/sorah/mairu/pull/14
