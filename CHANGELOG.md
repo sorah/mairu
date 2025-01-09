@@ -1,3 +1,7 @@
+## 0.3.1
+
+- AWS SSO: fix failure on device code flow. This requires re-registration of OAuth 2.0 dynamic client (which is performed automatically).
+
 ## 0.3.0
 
 - agent: Ensure runtime_dir (to create a socket) is only writable by owner (0700) https://github.com/sorah/mairu/pull/19
