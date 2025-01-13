@@ -17,7 +17,7 @@ enum Commands {
     /// Use Mairu as a credenital process provider
     CredentialProcess(mairu::cmd::credential_process::CredentialProcessArgs),
     /// List active sessions
-    ListSessions,
+    ListSessions(mairu::cmd::list_sessions::ListSessionsArgs),
 
     /// Manually start agent process; it is automatically spawned when not present
     Agent(mairu::cmd::agent::AgentArgs),
@@ -49,7 +49,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::Agent(args) => mairu::cmd::agent::run(args),
         Commands::Login(args) => mairu::cmd::login::run(args),
         Commands::CredentialProcess(args) => mairu::cmd::credential_process::run(args),
-        Commands::ListSessions => mairu::cmd::list_sessions::run(),
+        Commands::ListSessions(args) => mairu::cmd::list_sessions::run(args),
         Commands::Exec(args) => mairu::cmd::exec::run(args),
         Commands::SetupSso(args) => mairu::cmd::setup_sso::run(args),
     };
