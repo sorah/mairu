@@ -168,6 +168,7 @@ If you don't have the AWS SSO instance, you need to run your own credential vend
 ### Known implementations
 
 - https://github.com/sorah/himari2amc
+- https://github.com/sorah/himeko
 
 ### API Spec
 
