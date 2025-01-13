@@ -82,7 +82,7 @@ You may specify `--local-port` (or `.aws_sso.local_port`) to fix Authorization C
 
     "oauth": {
         "client_id": "...",
-        "client_secret": "...",
+        "client_secret": "...", // Optional
 
         "token_endpoint": "...", // Optional if token_endpoint is at ${url}/oauth/token
         "scope": [], // Optional, default to ["profile"]
@@ -95,6 +95,7 @@ You may specify `--local-port` (or `.aws_sso.local_port`) to fix Authorization C
         "code_grant": {
             "authorization_endpoint": "...", // Omit if it is at ${url}/oauth/authorize
             "local_port": 16624, // Optional. Static port number to listen for oauth2 redirect_uri, otherwise ephemeral port is assigned and used.
+            "use_localhost": false, // Optional, default to false. Use http://localhost for redirect_uri. Has to be true for some issuers, i.e. Microsoft (public client).
         },
         "default_grant_type": "code_grant", // Optional
     }

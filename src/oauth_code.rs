@@ -81,35 +81,32 @@ fn oauth2_client_from_server(
 > {
     let (oauth, code_grant) = server.try_oauth_code_grant()?;
 
-    let client = crate::ext_oauth2::SecrecyClient::new(oauth2::ClientId::new(oauth.client_id.clone()))
-        .set_client_secret(
-            oauth2::ClientSecret::new(
-                oauth
-                    .client_secret
+    let mut client =
+        crate::ext_oauth2::SecrecyClient::new(oauth2::ClientId::new(oauth.client_id.clone()))
+            .set_auth_uri(oauth2::AuthUrl::from_url(
+                code_grant
+                    .authorization_endpoint
                     .clone()
-                    .ok_or_else(|| crate::Error::ConfigError(format!("Server '{}' is missing OAuth 2.0 Client Secret; Required for Authorization Code Grant", server.id())))?
-            )
-        )
-        .set_auth_uri(oauth2::AuthUrl::from_url(
-            code_grant
-                .authorization_endpoint
-                .clone()
-                .map(Ok)
-                .unwrap_or_else(|| server.url.join("oauth/authorize"))?,
-        ))
-        .set_token_uri(oauth2::TokenUrl::from_url(
-                    oauth
-                        .token_endpoint
-                        .clone()
-                        .map(Ok)
-                        .unwrap_or_else(|| server.url.join("oauth/token"))?,
-        ));
+                    .map(Ok)
+                    .unwrap_or_else(|| server.url.join("oauth/authorize"))?,
+            ))
+            .set_token_uri(oauth2::TokenUrl::from_url(
+                oauth
+                    .token_endpoint
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(|| server.url.join("oauth/token"))?,
+            ));
+    if let Some(ref secret) = oauth.client_secret {
+        client = client.set_client_secret(oauth2::ClientSecret::new(secret.to_owned()));
+    }
     Ok(client)
 }
 
 pub async fn bind_tcp_for_callback(
     path: &str,
     port: Option<u16>,
+    use_localhost: bool,
 ) -> crate::Result<(tokio::net::TcpListener, url::Url)> {
     // FIXME: IPv6
     let bindaddr =
@@ -117,6 +114,9 @@ pub async fn bind_tcp_for_callback(
     let sock = tokio::net::TcpListener::bind(bindaddr).await?;
     let addr = sock.local_addr()?;
     let mut url = url::Url::parse("http://127.0.0.1/")?;
+    if use_localhost {
+        url.set_host(Some("localhost")).unwrap();
+    }
     url.set_path(path);
     url.set_port(Some(addr.port())).unwrap();
     tracing::debug!(url = %url, "Listening TCP for Callback");

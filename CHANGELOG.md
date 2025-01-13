@@ -1,3 +1,8 @@
+## 0.4.0
+
+- Support OAuth 2.0 Authorization Code Grant without client secret; It's safe because we always use PKCE, and expects your authorization server to enforce PKCE.
+- `.oauth.code_grant` server configuration gains `use_localhost` flag, which forces redirect_uri to be `http://localhost:.../oauth2callback` instead of `http://127.0.0.1:.../oauth2callback`. This is required for some authorization servers, e.g. Microsoft + Mairu as a public client.
+
 ## 0.3.1
 
 - AWS SSO: fix failure on device code flow. This requires re-registration of OAuth 2.0 dynamic client (which is performed automatically).

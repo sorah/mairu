@@ -56,15 +56,19 @@ pub async fn do_oauth_code(
     agent: &mut crate::agent::AgentConn,
     server: crate::config::Server,
 ) -> Result<(), anyhow::Error> {
-    let (path, local_port) = if let Some(ref aws_sso) = server.aws_sso {
-        ("/oauth/callback", aws_sso.local_port)
+    let (path, local_port, use_localhost) = if let Some(ref aws_sso) = server.aws_sso {
+        ("/oauth/callback", aws_sso.local_port, false)
     } else {
         let (_oauth, code_grant) = server.try_oauth_code_grant()?;
-        ("/oauth2callback", code_grant.local_port)
+        (
+            "/oauth2callback",
+            code_grant.local_port,
+            code_grant.use_localhost,
+        )
     };
 
     let (listener, url) =
-        match crate::oauth_code::bind_tcp_for_callback(path, local_port).await {
+        match crate::oauth_code::bind_tcp_for_callback(path, local_port, use_localhost).await {
             Ok(t) => t,
             Err(e) => anyhow::bail!(
                 "Failed to bind TCP server for OAuth 2.0 callback acceptance, perhaps there is concurrent mairu-exec call waitng for login, or occupied by oher process; {}",

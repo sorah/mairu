@@ -471,6 +471,9 @@ impl ServerOAuth {
 pub struct ServerCodeGrant {
     pub authorization_endpoint: Option<url::Url>,
     pub local_port: Option<u16>,
+
+    #[serde(default)]
+    pub use_localhost: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -536,6 +539,7 @@ impl AwsSsoClientRegistrationCache {
             code_grant: Some(ServerCodeGrant {
                 authorization_endpoint: None,
                 local_port: sso.local_port,
+                use_localhost: false,
             }),
             device_code_grant: Some(ServerDeviceCodeGrant {
                 device_authorization_endpoint: None,
