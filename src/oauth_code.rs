@@ -106,6 +106,7 @@ fn oauth2_client_from_server(
 pub async fn bind_tcp_for_callback(
     path: &str,
     port: Option<u16>,
+    use_localhost: bool,
 ) -> crate::Result<(tokio::net::TcpListener, url::Url)> {
     // FIXME: IPv6
     let bindaddr =
@@ -113,6 +114,9 @@ pub async fn bind_tcp_for_callback(
     let sock = tokio::net::TcpListener::bind(bindaddr).await?;
     let addr = sock.local_addr()?;
     let mut url = url::Url::parse("http://127.0.0.1/")?;
+    if use_localhost {
+        url.set_host(Some("localhost")).unwrap();
+    }
     url.set_path(path);
     url.set_port(Some(addr.port())).unwrap();
     tracing::debug!(url = %url, "Listening TCP for Callback");
