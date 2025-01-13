@@ -82,7 +82,7 @@ You may specify `--local-port` (or `.aws_sso.local_port`) to fix Authorization C
 
     "oauth": {
         "client_id": "...",
-        "client_secret": "...",
+        "client_secret": "...", // Optional
 
         "token_endpoint": "...", // Optional if token_endpoint is at ${url}/oauth/token
         "scope": [], // Optional, default to ["profile"]
