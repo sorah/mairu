@@ -8,8 +8,20 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
     for session in list.sessions.iter() {
         let expiring = match session.expiration() {
-            Ok(Some(e)) => format!(" [until {e}]"),
-            Ok(None) => "".to_string(),
+            Ok(Some(e)) => {
+                if session.refreshable {
+                    format!(" [renews after {e}]")
+                } else {
+                    format!(" [until {e}]")
+                }
+            }
+            Ok(None) => {
+                if session.refreshable {
+                    "[refreshable]".to_string()
+                } else {
+                    "".to_string()
+                }
+            }
             Err(e) => {
                 tracing::warn!(err = ?e, session = ?session, "Invalid expiration timestamp");
                 "".to_string()

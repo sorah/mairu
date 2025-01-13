@@ -15,6 +15,7 @@ impl From<&Session> for crate::proto::Session {
                 .token
                 .expires_at
                 .map(|t| std::time::SystemTime::from(t).into()),
+            refreshable: item.token.refresh_token.is_some(),
         }
     }
 }
