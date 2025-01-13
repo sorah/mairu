@@ -8,6 +8,7 @@ message Session {
   string server_id = 2;
   string server_url = 3;
   google.protobuf.Timestamp expires_at = 4;
+  bool refreshable = 5;
 }
 
 message Credentials {
