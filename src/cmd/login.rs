@@ -56,7 +56,7 @@ pub async fn do_oauth_code(
     agent: &mut crate::agent::AgentConn,
     server: crate::config::Server,
 ) -> Result<(), anyhow::Error> {
-    let (path, local_port, use_localhost) = if let Some(ref aws_sso) = server.aws_sso {
+    let (path, mut local_port, use_localhost) = if let Some(ref aws_sso) = server.aws_sso {
         ("/oauth/callback", aws_sso.local_port, false)
     } else {
         let (_oauth, code_grant) = server.try_oauth_code_grant()?;
@@ -66,6 +66,12 @@ pub async fn do_oauth_code(
             code_grant.use_localhost,
         )
     };
+
+    if let Ok(x) = std::env::var("MAIRU_LOCAL_PORT") {
+        if let Ok(i) = x.parse() {
+            local_port = Some(i);
+        }
+    }
 
     let (listener, url) =
         match crate::oauth_code::bind_tcp_for_callback(path, local_port, use_localhost).await {
