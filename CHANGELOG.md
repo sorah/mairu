@@ -1,3 +1,7 @@
+## 0.5.0
+
+- `mairu login` uses `$MAIRU_LOCAL_PORT` environment variable for a port number when listening to callback. Takes precedence over a server configuration.
+
 ## 0.4.0
 
 - Support OAuth 2.0 Authorization Code Grant without client secret; It's safe because we always use PKCE, and expects your authorization server to enforce PKCE.
