@@ -1,3 +1,7 @@
+## 0.5.1
+
+- debian: Debian package was missing `setcap` call on post installation, which results into mlockall failure on `mairu agent`.
+
 ## 0.5.0
 
 - `mairu login` uses `$MAIRU_LOCAL_PORT` environment variable for a port number when listening to callback. Takes precedence over a server configuration.
