@@ -84,7 +84,9 @@ impl Auto {
         let data = match tokio::fs::read(&path).await {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(auto_path = ?self.path, trust_path = ?path, err = ?e, "Failed to read trust");
+                if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                    tracing::warn!(auto_path = ?self.path, trust_path = ?path, err = ?e, "Failed to read trust");
+                }
                 return None;
             }
         };
