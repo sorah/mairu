@@ -182,6 +182,7 @@ async fn get_server(
         .get_server(tonic::Request::new(crate::proto::GetServerRequest {
             query: query.to_owned(),
             no_cache: true,
+            check_session: false,
         }))
         .await?
         .into_inner()

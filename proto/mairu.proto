@@ -44,10 +44,12 @@ message PingAgentResponse {
 message GetServerRequest {
   string query = 1;
   bool no_cache = 2;
+  bool check_session = 3;
 }
 message GetServerResponse {
   string json = 1;
   bool cached = 2;
+  Session session = 3;
 }
 
 message AssumeRoleRequest {
