@@ -35,6 +35,7 @@ pub async fn run(args: &SetupSsoArgs) -> Result<(), anyhow::Error> {
             .get_server(tonic::Request::new(crate::proto::GetServerRequest {
                 query: args.server_id.clone(),
                 no_cache: true,
+                check_session: false,
             }))
             .await;
         match server_resp {
