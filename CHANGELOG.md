@@ -1,3 +1,7 @@
+## 0.6.0
+
+- New subcomand `mairu show` dumps informations about 'auto' role.
+
 ## 0.5.1
 
 - debian: Debian package was missing `setcap` call on post installation, which results into mlockall failure on `mairu agent`.

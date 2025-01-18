@@ -1,6 +1,6 @@
 [package]
 name = "mairu"
-version = "0.5.1"
+version = "0.6.0"
 authors = ["Sorah Fukumori <her@sorah.jp>"]
 description = "on-memory AWS credentials agent and executor"
 keywords = ["aws", "security", "cli"]
