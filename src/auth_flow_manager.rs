@@ -76,7 +76,7 @@ pub struct AuthFlowRetrieval<'a> {
     manager: &'a AuthFlowManager,
 }
 
-impl<'a> AuthFlowRetrieval<'a> {
+impl AuthFlowRetrieval<'_> {
     pub fn mark_as_done(mut self) {
         self.inner = None;
     }
@@ -86,7 +86,7 @@ impl<'a> AuthFlowRetrieval<'a> {
     }
 }
 
-impl<'a> std::ops::Deref for AuthFlowRetrieval<'a> {
+impl std::ops::Deref for AuthFlowRetrieval<'_> {
     type Target = AuthFlow;
 
     fn deref(&self) -> &Self::Target {
@@ -94,13 +94,13 @@ impl<'a> std::ops::Deref for AuthFlowRetrieval<'a> {
     }
 }
 
-impl<'a> std::convert::AsRef<AuthFlow> for AuthFlowRetrieval<'a> {
+impl std::convert::AsRef<AuthFlow> for AuthFlowRetrieval<'_> {
     fn as_ref(&self) -> &AuthFlow {
         self.inner.as_ref().unwrap()
     }
 }
 
-impl<'a> std::ops::Drop for AuthFlowRetrieval<'a> {
+impl std::ops::Drop for AuthFlowRetrieval<'_> {
     fn drop(&mut self) {
         if let Some(x) = self.inner.take() {
             self.manager.store(x);
