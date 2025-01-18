@@ -3,6 +3,10 @@ pub struct ShowArgs {
     /// Exit as failure when .mairu.json is missing (auto role)
     #[arg(short = 'f', long, default_value_t = false)]
     fail_when_missing_auto: bool,
+
+    /// Quiet mode
+    #[arg(short = 'q', long, default_value_t = false)]
+    quiet: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -44,11 +48,13 @@ pub async fn run(args: &ShowArgs) -> Result<(), anyhow::Error> {
         auto_trusted,
     };
 
-    let json = serde_json::to_string_pretty(&output).unwrap();
-    let mut stdout = tokio::io::stdout();
-    stdout.write_all(json.as_bytes()).await.unwrap();
-    stdout.write_all(b"\n").await.unwrap();
-    stdout.flush().await.unwrap();
+    if !args.quiet {
+        let json = serde_json::to_string_pretty(&output).unwrap();
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all(json.as_bytes()).await.unwrap();
+        stdout.write_all(b"\n").await.unwrap();
+        stdout.flush().await.unwrap();
+    }
 
     if args.fail_when_missing_auto && auto.is_none() {
         return Err(crate::Error::SilentlyExitWithCode(std::process::ExitCode::from(1)).into());
