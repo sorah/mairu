@@ -1,5 +1,9 @@
 #[derive(clap::Args)]
-pub struct ShowArgs {}
+pub struct ShowArgs {
+    /// Exit as failure when .mairu.json is missing (auto role)
+    #[arg(short = 'f', long, default_value_t = false)]
+    fail_when_missing_auto: bool,
+}
 
 #[derive(Debug, serde::Serialize)]
 struct ShowOutput {
@@ -11,7 +15,7 @@ struct ShowOutput {
 }
 
 #[tokio::main]
-pub async fn run(_args: &ShowArgs) -> Result<(), anyhow::Error> {
+pub async fn run(args: &ShowArgs) -> Result<(), anyhow::Error> {
     use tokio::io::AsyncWriteExt;
 
     let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("Failed to get cwd: {}", e))?;
@@ -45,6 +49,10 @@ pub async fn run(_args: &ShowArgs) -> Result<(), anyhow::Error> {
     stdout.write_all(json.as_bytes()).await.unwrap();
     stdout.write_all(b"\n").await.unwrap();
     stdout.flush().await.unwrap();
+
+    if args.fail_when_missing_auto && auto.is_none() {
+        return Err(crate::Error::SilentlyExitWithCode(std::process::ExitCode::from(1)).into());
+    }
 
     Ok(())
 }
