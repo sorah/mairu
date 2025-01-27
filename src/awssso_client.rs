@@ -109,56 +109,6 @@ impl crate::client::CredentialVendor for Client {
                     Box::new(crate::Error::UserError("".to_string())), // XXX:
                 )));
             }
-            Err(aws_sdk_sso::error::SdkError::ServiceError(e)) => {
-                use aws_sdk_sso::error::ProvideErrorMetadata;
-                tracing::error!(
-                    account_id = account_id,
-                    role_name = role_name,
-                    server_id = &self.server_id,
-                    err = ?e,
-                    "sso:GetRoleCredentials returned error"
-                );
-
-                match e.into_err() {
-                    aws_sdk_sso::operation::get_role_credentials::GetRoleCredentialsError::ResourceNotFoundException(e1) => {
-                        return Err(crate::Error::RemoteError(crate::client::Error::NotFound(
-                            format!("AWS SSO says for '{}': {:?} (ResourceNotFoundException)", rolespec, e1.message()),
-                            Box::new(e1),
-                        )))
-                    }
-                    aws_sdk_sso::operation::get_role_credentials::GetRoleCredentialsError::InvalidRequestException(e1) => {
-                        return Err(crate::Error::RemoteError(crate::client::Error::InvalidArgument(
-                            format!("AWS SSO says for '{}': {:?} (InvalidRequestException)", rolespec, e1.message()),
-                            Box::new(e1),
-                        )))
-                    }
-                    aws_sdk_sso::operation::get_role_credentials::GetRoleCredentialsError::UnauthorizedException(e1) => {
-                        return Err(crate::Error::RemoteError(crate::client::Error::Unauthenticated(
-                            format!("AWS SSO says for '{}': {:?} (UnauthorizedException)", rolespec, e1.message()),
-                            Box::new(e1),
-                        )))
-                    }
-                    aws_sdk_sso::operation::get_role_credentials::GetRoleCredentialsError::TooManyRequestsException(e1) => {
-                        return Err(crate::Error::RemoteError(crate::client::Error::ResourceExhausted(
-                            format!("AWS SSO says for '{}': {:?} (TooManyRequestsException)", rolespec, e1.message()),
-                            Box::new(e1),
-                        )))
-                    }
-                    e if e.code() == Some("ForbiddenException") => {
-                        return Err(crate::Error::RemoteError(crate::client::Error::PermissionDenied(
-                            format!("AWS SSO says for '{}': {:?} ({:?})", rolespec, e.message(), e.code()),
-                            Box::new(e),
-                        )))
-                    }
-                    e => {
-                        return Err(crate::Error::RemoteError(crate::client::Error::Unknown(
-                            format!("AWS SSO says for '{}': {:?} ({:?})", rolespec, e.message(), e.code()),
-                            Box::new(e),
-                        )))
-                    }
-
-                }
-            }
             Err(e) => {
                 tracing::error!(
                     account_id = account_id,
@@ -167,12 +117,58 @@ impl crate::client::CredentialVendor for Client {
                     err = ?e,
                     "sso:GetRoleCredentials failed"
                 );
-                return Err(crate::Error::RemoteError(crate::client::Error::Unknown(
-                    format!("sso:GetRoleCredentials failed for '{rolespec}': {e}"),
-                    Box::new(e),
-                )));
+                return Err(sdk_error_to_crate_error("GetRoleCredentials", e));
             }
         }
+    }
+
+}
+
+fn sdk_error_to_crate_error<E, R>(
+    context: &str,
+    err: aws_sdk_sso::error::SdkError<E, R>,
+) -> crate::Error
+where
+    E: std::marker::Send
+        + std::marker::Sync
+        + std::error::Error
+        + aws_sdk_sso::error::ProvideErrorMetadata
+        + 'static,
+    R: std::marker::Send + std::marker::Sync + std::fmt::Debug + 'static,
+{
+    use aws_sdk_sso::error::ProvideErrorMetadata;
+    macro_rules! match_map_error {
+        (
+            $e:expr,
+             $(
+                $c:literal => $t:ident,
+             )*
+        ) => {
+            match $e {
+                $(
+                    e1 if err.code() == Some($c) => {
+                        crate::Error::RemoteError(crate::client::Error::$t(
+                            format!("AWS SSO says {code} for {context}: {message:?}", code=e1.code().unwrap(), message=e1.message(), ),
+                            Box::new(e1),
+                        ))
+                    }
+                )*
+                e => {
+                    crate::Error::RemoteError(crate::client::Error::Unknown(
+                        format!("AWS SSO says {code:?} for {context}: {message:?}", code=e.code(), message=e.message(), ),
+                        Box::new(e),
+                    ))
+                }
+            }
+        }
+    }
+    match_map_error! {
+        err,
+        "ResourceNotFoundException" => NotFound,
+        "InvalidRequestException" => InvalidArgument,
+        "UnauthorizedException" => Unauthenticated,
+        "TooManyRequestsException" => ResourceExhausted,
+        "ForbiddenException" => PermissionDenied,
     }
 }
 
