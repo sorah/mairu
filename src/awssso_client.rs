@@ -122,6 +122,90 @@ impl crate::client::CredentialVendor for Client {
         }
     }
 
+    #[tracing::instrument]
+    async fn list_roles(&self) -> crate::Result<crate::client::ListRolesResponse> {
+        use secrecy::ExposeSecret;
+        let sso = sso_config_to_sso(&self.sso).await;
+        tracing::debug!(server_id = &self.server_id, "requesting");
+
+        let mut roles = vec![];
+
+        let mut list_accounts = sso
+            .list_accounts()
+            .access_token(self.access_token.expose_secret().to_owned())
+            .into_paginator()
+            .send();
+        loop {
+            let page = match list_accounts.try_next().await {
+                Ok(Some(x)) => x,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::error!(
+                        server_id = &self.server_id,
+                        err = ?e,
+                        "sso:ListAccounts failed"
+                    );
+                    return Err(sdk_error_to_crate_error("ListAccounts", e));
+                }
+            };
+            for account in page.account_list.unwrap_or_default().iter() {
+                let Some(account_id) = account.account_id() else {
+                    tracing::warn!(
+                        server_id = &self.server_id,
+                        account = ?account,
+                        "sso:ListAccounts returned an item with empty account_id"
+                    );
+                    continue;
+                };
+                let account_name = account.account_name().unwrap_or("?");
+                let account_email = account.email_address().unwrap_or("?");
+
+                let mut list_account_roles = sso
+                    .list_account_roles()
+                    .account_id(account_id)
+                    .access_token(self.access_token.expose_secret().to_owned())
+                    .into_paginator()
+                    .send();
+                loop {
+                    let page = match list_account_roles.try_next().await {
+                        Ok(Some(x)) => x,
+                        Ok(None) => break,
+                        Err(e) => {
+                            tracing::error!(
+                                server_id = &self.server_id,
+                                account = ?account,
+                                err = ?e,
+                                "sso:ListAccountsRoles failed"
+                            );
+                            return Err(sdk_error_to_crate_error(
+                                &format!("ListAccountRoles on {account_id}"),
+                                e,
+                            ));
+                        }
+                    };
+                    let list = page.role_list.unwrap_or_default();
+                    roles.reserve(list.len());
+                    for role in list.iter() {
+                        let Some(role_name) = role.role_name() else {
+                            tracing::warn!(
+                                server_id = &self.server_id,
+                                account = ?account,
+                                role = ?role,
+                                "sso:ListAccountsRoles returned an item with empty role_name"
+                            );
+                            continue;
+                        };
+                        roles.push(crate::client::ListRolesItem {
+                            name: format!("{account_id}/{role_name}"),
+                            description: Some(format!("{account_name} ({account_email})")),
+                        })
+                    }
+                }
+            }
+        }
+
+        Ok(crate::client::ListRolesResponse { roles })
+    }
 }
 
 fn sdk_error_to_crate_error<E, R>(

@@ -5,6 +5,14 @@ pub struct Session {
     pub credential_cache: crate::credential_cache::CredentialCache,
 }
 
+impl Session {
+    #[inline]
+    pub fn server(&self) -> &crate::config::Server {
+        // TODO: utilize this more
+        &self.token.server
+    }
+}
+
 impl From<&Session> for crate::proto::Session {
     fn from(item: &Session) -> crate::proto::Session {
         crate::proto::Session {
@@ -69,7 +77,7 @@ impl SessionManager {
             return Ok(items[i].clone());
         }
         Err(crate::Error::UserError(
-            "specified server not found".to_owned(),
+            "specified server not found or not logged in".to_owned(),
         ))
     }
 

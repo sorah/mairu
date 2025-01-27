@@ -38,7 +38,7 @@ Authorization: Bearer {access_token}
 
 ##### Response
 
-Compatible as https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html
+Compatible with https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html
 
 ```jsonc
 {
@@ -57,4 +57,28 @@ Compatible as https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-cr
 
 Mairu will prompt reauthentication for a response with `401 Unauthorized` HTTP status code.
 
+### List Roles API (optional)
 
+`mairu list-roles` uses this API to allow users to list their allowed roles.
+
+##### Request
+
+```
+GET {url}/roles
+Content-Type: application/json
+Authorization: Bearer {access_token}
+```
+
+##### Response
+
+```jsonc
+{
+    "Roles": [
+        {"Name": "..."}, // Return possible role name (which will be passed to .Role in assume-role API)
+        {"Name": "..."}
+        // ...
+    ]
+}
+```
+
+- Mairu considers it is unimplemented if a server returns `404 Not Found` or `405 Method Not Allowed` response.

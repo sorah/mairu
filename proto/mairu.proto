@@ -33,6 +33,8 @@ service Agent {
   rpc CompleteOauthDeviceCode(CompleteOAuthDeviceCodeRequest) returns (CompleteOAuthDeviceCodeResponse);
 
   rpc RefreshAwsSsoClientRegistration(RefreshAwsSsoClientRegistrationRequest) returns (RefreshAwsSsoClientRegistrationResponse);
+
+  rpc ListRoles(ListRolesRequest) returns (ListRolesResponse);
 }
 
 message PingAgentRequest {
@@ -112,6 +114,23 @@ message RefreshAwsSsoClientRegistrationRequest {
   string server_id = 1;
 }
 message RefreshAwsSsoClientRegistrationResponse {
+}
+
+message ListRolesRequest {
+  string server_id = 1;
+}
+message ListRolesResponse {
+  message Item {
+    message Role {
+      string name = 1;
+      string description = 2;
+    }
+    string server_id = 1;
+    string server_url = 2;
+    bool logged_in = 3;
+    repeated Role roles = 4;
+  }
+  repeated Item servers = 1;
 }
 
 //----- The following is used for mairu-exec subprocess IPC
