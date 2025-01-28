@@ -148,64 +148,111 @@ impl crate::client::CredentialVendor for Client {
                     return Err(sdk_error_to_crate_error("ListAccounts", e));
                 }
             };
-            for account in page.account_list.unwrap_or_default().iter() {
-                let Some(account_id) = account.account_id() else {
-                    tracing::warn!(
-                        server_id = &self.server_id,
-                        account = ?account,
-                        "sso:ListAccounts returned an item with empty account_id"
-                    );
-                    continue;
-                };
-                let account_name = account.account_name().unwrap_or("?");
-                let account_email = account.email_address().unwrap_or("?");
+            let rs = self.list_accounts_page(sso.clone(), page).await?;
+            roles.extend(rs.into_iter());
+        }
 
-                let mut list_account_roles = sso
-                    .list_account_roles()
-                    .account_id(account_id)
-                    .access_token(self.access_token.expose_secret().to_owned())
-                    .into_paginator()
-                    .send();
-                loop {
-                    let page = match list_account_roles.try_next().await {
-                        Ok(Some(x)) => x,
-                        Ok(None) => break,
-                        Err(e) => {
-                            tracing::error!(
-                                server_id = &self.server_id,
-                                account = ?account,
-                                err = ?e,
-                                "sso:ListAccountsRoles failed"
-                            );
-                            return Err(sdk_error_to_crate_error(
-                                &format!("ListAccountRoles on {account_id}"),
-                                e,
-                            ));
-                        }
-                    };
-                    let list = page.role_list.unwrap_or_default();
-                    roles.reserve(list.len());
-                    for role in list.iter() {
-                        let Some(role_name) = role.role_name() else {
-                            tracing::warn!(
-                                server_id = &self.server_id,
-                                account = ?account,
-                                role = ?role,
-                                "sso:ListAccountsRoles returned an item with empty role_name"
-                            );
-                            continue;
-                        };
-                        roles.push(crate::client::ListRolesItem {
-                            name: format!("{account_id}/{role_name}"),
-                            description: Some(format!("{account_name} ({account_email})")),
-                        })
-                    }
+        roles.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(crate::client::ListRolesResponse { roles })
+    }
+}
+
+impl Client {
+    async fn list_accounts_page(
+        &self,
+        sso: aws_sdk_sso::Client,
+        page: aws_sdk_sso::operation::list_accounts::ListAccountsOutput,
+    ) -> crate::Result<Vec<crate::client::ListRolesItem>> {
+        let mut roles = vec![];
+
+        let mut set = tokio::task::JoinSet::new();
+        for account in page.account_list.unwrap_or_default().into_iter() {
+            set.spawn(list_accounts_account(
+                self.server_id.to_owned(),
+                self.access_token.clone(),
+                sso.clone(),
+                account,
+            ));
+        }
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok(Ok(rs)) => roles.extend(rs.into_iter()),
+                Ok(Err(e)) => return Err(e),
+                Err(e) => {
+                    return Err(crate::Error::UnknownError(format!(
+                        "list_accounts_account failed: {e:?}"
+                    )))
                 }
             }
         }
 
-        Ok(crate::client::ListRolesResponse { roles })
+        Ok(roles)
     }
+}
+
+async fn list_accounts_account(
+    server_id: String,
+    access_token: secrecy::SecretString,
+    sso: aws_sdk_sso::Client,
+    account: aws_sdk_sso::types::AccountInfo,
+) -> crate::Result<Vec<crate::client::ListRolesItem>> {
+    use secrecy::ExposeSecret;
+    let Some(account_id) = account.account_id() else {
+        tracing::warn!(
+            server_id = server_id,
+            account = ?account,
+            "sso:ListAccounts returned an item with empty account_id"
+        );
+        return Ok(vec![]);
+    };
+    let account_name = account.account_name().unwrap_or("?");
+    let account_email = account.email_address().unwrap_or("?");
+
+    let mut roles = vec![];
+
+    let mut list_account_roles = sso
+        .list_account_roles()
+        .account_id(account_id)
+        .access_token(access_token.expose_secret().to_owned())
+        .into_paginator()
+        .send();
+    loop {
+        let page = match list_account_roles.try_next().await {
+            Ok(Some(x)) => x,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::error!(
+                    server_id = server_id,
+                    account = ?account,
+                    err = ?e,
+                    "sso:ListAccountsRoles failed"
+                );
+                return Err(sdk_error_to_crate_error(
+                    &format!("ListAccountRoles on {account_id}"),
+                    e,
+                ));
+            }
+        };
+        let list = page.role_list.unwrap_or_default();
+        roles.reserve(list.len());
+        for role in list.iter() {
+            let Some(role_name) = role.role_name() else {
+                tracing::warn!(
+                    server_id = server_id,
+                    account = ?account,
+                    role = ?role,
+                    "sso:ListAccountsRoles returned an item with empty role_name"
+                );
+                continue;
+            };
+            roles.push(crate::client::ListRolesItem {
+                name: format!("{account_id}/{role_name}"),
+                description: Some(format!("{account_name} ({account_email})")),
+            })
+        }
+    }
+    Ok(roles)
 }
 
 fn sdk_error_to_crate_error<E, R>(

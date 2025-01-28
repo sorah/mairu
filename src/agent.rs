@@ -420,6 +420,10 @@ impl crate::proto::agent_server::Agent for Agent {
             })?;
             match client.list_roles().await {
                 Ok(x) => servers.push(x.to_proto(session.server())),
+                Err(crate::Error::RemoteError(crate::client::Error::Unauthenticated(_m, e))) => {
+                    tracing::warn!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, err = ?e, "list_roles returned unauthenticated");
+                    // do nothing
+                }
                 Err(e) => {
                     tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, err = ?e, "Failed to list_roles");
                     return Err(tonic::Status::internal(e.to_string()));
