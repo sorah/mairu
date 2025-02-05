@@ -72,11 +72,11 @@ pub async fn run(args: &ListRolesArgs) -> Result<(), anyhow::Error> {
                     }
                 } else {
                     stdout
-                        .write_all(format!("    not logged in\n").as_bytes())
+                        .write_all("    not logged in\n".to_string().as_bytes())
                         .await
                         .unwrap();
                 }
-                stdout.write_all(format!("\n").as_bytes()).await.unwrap();
+                stdout.write_all("\n".to_string().as_bytes()).await.unwrap();
             }
         }
         ListRolesFormat::Oneline => {

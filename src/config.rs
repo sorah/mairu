@@ -133,13 +133,13 @@ impl Server {
             match Self::read_from_file(&entry.path()).await {
                 Ok(c) => {
                     let id = c.id().to_owned();
-                    if map.contains_key(&id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = map.entry(id) {
+                        e.insert(c);
+                    } else {
                         return Err(crate::Error::ConfigError(format!(
                             "server id is duplicated: {}",
                             c.id(),
                         )));
-                    } else {
-                        map.insert(id, c);
                     }
                 }
                 Err(e) => {

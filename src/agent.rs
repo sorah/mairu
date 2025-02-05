@@ -412,9 +412,10 @@ impl crate::proto::agent_server::Agent for Agent {
         let mut map = std::collections::HashMap::new();
         let mut servers = std::vec::Vec::with_capacity(configured_servers.len());
 
-        for session in sessions.iter() {
-            map.insert(session.server().id(), true);
-            let client = crate::client::make_credential_vendor(session).map_err(|e| {
+        for session in sessions.into_iter() {
+            let session = self.ensure_session_freshness(session).await;
+            map.insert(session.server().id().to_owned(), true);
+            let client = crate::client::make_credential_vendor(&session).map_err(|e| {
                 tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, err = ?e, "Failed to make_credential_vendor");
                 tonic::Status::internal(e.to_string())
             })?;
@@ -570,9 +571,25 @@ pub async fn connect_to_agent_with_path(
         .await?;
 
     let mut client = crate::proto::agent_client::AgentClient::new(ch);
-    client
+    let pong = client
         .ping_agent(tonic::Request::new(crate::proto::PingAgentRequest {}))
-        .await?;
+        .await?
+        .into_inner();
+    if pong.version != env!("CARGO_PKG_VERSION") {
+        tracing::warn!(
+            agent_version = pong.version,
+            client_version = env!("CARGO_PKG_VERSION"),
+            "agent version is diverged; you may want to restart your agent"
+        );
+        let product = env!("CARGO_PKG_NAME");
+        crate::terminal::send(
+            &format!(
+                ":: {product} :: agent version is diverged; you may want to restart your agent (client={client_version}, agent={agent_version})",
+                agent_version = pong.version,
+                client_version = env!("CARGO_PKG_VERSION"),
+            )
+        ).await;
+    }
 
     Ok(client)
 }
