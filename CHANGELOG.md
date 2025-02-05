@@ -1,5 +1,6 @@
 ## 0.7.0
 
+- redirect_uri endpoint returns fancier HTML page during OAuth 2.0 Authorization Code flow.
 - New subcomand `mairu list-roles` lists possible `role` parameter for a server. Corresponding HTTP API is added to the spec.
 - `mairu` command now suggets user to restart agent when a connected agent reports different version.
 

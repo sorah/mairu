@@ -186,6 +186,8 @@ struct CallbackQuery {
 /// HTML <head> to supress favicon.ico request
 const HTML_PREAMBLE: &str = r#"<!DOCTYPE html><html><head><link rel="icon" href="data:;base64,iVBORw0KGgo="><style>body { font-family: monospace; }</style></head><body>"#;
 
+const HTML_OK: &str = include_str!("oauth_code_ok.html");
+
 #[allow(clippy::type_complexity)]
 #[tracing::instrument(skip_all)]
 async fn callback(
@@ -233,6 +235,6 @@ async fn callback(
     Ok((
         axum::http::StatusCode::OK,
         [("content-type", "text/html; charset=utf-8")],
-        format!("{}ok", HTML_PREAMBLE),
+        HTML_OK.to_string(),
     ))
 }
