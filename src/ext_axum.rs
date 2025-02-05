@@ -17,7 +17,6 @@ pub(crate) enum BearerSource {
 
 const ACCESS_TOKEN: &str = "access_token";
 
-#[async_trait::async_trait]
 impl<S> axum::extract::FromRequestParts<S> for ExtractBearer
 where
     S: Send + Sync,
