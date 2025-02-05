@@ -35,55 +35,55 @@ native-tls = ["reqwest/default-tls"]
 rustls = ["reqwest/rustls-tls-native-roots"]
 
 [dependencies]
-anyhow = { version = "1.0.91", features = ["backtrace"] }
+anyhow = { version = "1.0.95", features = ["backtrace"] }
 async-recursion = "1.0.5"
 async-stream = "0.3.6"
-async-trait = "0.1.77"
-aws-config = { version = "1.5.9", features = ["behavior-version-latest"] }
-aws-sdk-sso = "1.47.0"
-aws-sdk-ssooidc = "1.48.0"
+async-trait = "0.1.86"
+aws-config = { version = "1.5.16", features = ["behavior-version-latest"] }
+aws-sdk-sso = "1.58.0"
+aws-sdk-ssooidc = "1.59.0"
 aws-smithy-runtime-api = { version = "1.7.3", features = ["client"] }
-aws-smithy-types = "1.2.9"
-axum = { version = "0.7.4", features = ["tracing", "macros", "query"] }
+aws-smithy-types = "1.2.13"
+axum = { version = "0.8.1", features = ["tracing", "macros", "query"] }
 base64 = "0.22.1"
 base64ct = { version = "1.6.0", features = ["alloc", "std"] }
 cfg-if = "1.0.0"
-chrono = { version = "0.4.34", features = ["serde"] }
-clap = { version = "4.5.1", features = ["cargo", "derive", "env"] }
+chrono = { version = "0.4.39", features = ["serde"] }
+clap = { version = "4.5.28", features = ["cargo", "derive", "env"] }
 daemonize = "0.5.0"
 futures = "0.3.31"
 futures-core = "0.3.31"
 headers = "0.4.0"
-hyper = { version = "1.1.0", features = ["http1", "server"] }
+hyper = { version = "1.6.0", features = ["http1", "server"] }
 hyper-util = "0.1.10"
 indoc = "2.0.5"
-libc = "0.2.153"
+libc = "0.2.169"
 nix = { version = "0.29.0", features = ["resource", "process", "ptrace", "mman", "fs", "signal", "hostname"] }
-oauth2 = "5.0.0-rc.1"
+oauth2 = "5.0.0"
 once_cell = { version = "1.19.0", features = ["parking_lot"] }
 parking_lot = "0.12.1"
-pin-project = "1.1.7"
+pin-project = "1.1.9"
 process_path = "0.1.4"
-prost = "0.13.3"
-prost-types = "0.13.3"
-rand = "0.8.5"
-reqwest = { version = "0.12.9", default-features = false, features = ["charset", "http2", "macos-system-configuration", "json"] }
+prost = "0.13.4"
+prost-types = "0.13.4"
+rand = "0.9.0"
+reqwest = { version = "0.12.12", default-features = false, features = ["charset", "http2", "macos-system-configuration", "json"] }
 secrecy = { version = "0.10.0", features = ["serde"] }
-serde = { version = "1.0.214", features = ["derive"] }
-serde_json = "1.0.132"
-serde_with = { version = "3.11.0", features = ["base64"] }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.138"
+serde_with = { version = "3.12.0", features = ["base64"] }
 sha2 = "0.10.8"
 subtle = { version = "2.5.0", features = ["core_hint_black_box"] }
-thiserror = "1.0.65"
-tokio = { version = "1.41.0", features = ["full"] }
-tokio-stream = { version = "0.1.14", features = ["net", "signal"] }
+thiserror = "1.0.69"
+tokio = { version = "1.43.0", features = ["full"] }
+tokio-stream = { version = "0.1.17", features = ["net", "signal"] }
 tonic = "0.12.3"
-tower = { version = "0.5.1", features = ["tracing"] }
-tracing = { version = "0.1.40", features = ["attributes"] }
+tower = { version = "0.5.2", features = ["tracing"] }
+tracing = { version = "0.1.41", features = ["attributes"] }
 tracing-appender = "0.2.3"
-tracing-subscriber = { version = "0.3.18", features = ["fmt", "env-filter", "local-time", "json", "time"] }
-url = { version = "2.5.0", features = ["serde"] }
+tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "local-time", "json", "time"] }
+url = { version = "2.5.4", features = ["serde"] }
 zeroize = { version = "1.7.0", features = ["std", "aarch64", "zeroize_derive", "serde", "derive"] }
 
 [target.'cfg(any(target_os = "freebsd", target_os = "dragonfly"))'.dependencies]
-rustix = { version = "0.38.38", default-features = false, features = ["std", "process"] }
+rustix = { version = "0.38.44", default-features = false, features = ["std", "process"] }

@@ -188,7 +188,7 @@ fn generate_bearer_token() -> secrecy::SecretString {
     use base64ct::Encoding;
     use rand::RngCore;
     let mut buf = zeroize::Zeroizing::new([0u8; 64]);
-    rand::thread_rng().fill_bytes(buf.as_mut());
+    rand::rng().fill_bytes(buf.as_mut());
     base64ct::Base64UrlUnpadded::encode_string(buf.as_ref()).into()
 }
 
