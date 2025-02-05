@@ -3,6 +3,10 @@ pub(crate) trait CredentialVendor {
         &self,
         role: &str,
     ) -> impl std::future::Future<Output = crate::Result<crate::client::AssumeRoleResponse>> + Send;
+
+    fn list_roles(
+        &self,
+    ) -> impl std::future::Future<Output = crate::Result<crate::client::ListRolesResponse>> + Send;
 }
 
 pub(crate) enum CredentialClient {
@@ -15,6 +19,13 @@ impl CredentialVendor for CredentialClient {
         match self {
             CredentialClient::Api(c) => c.assume_role(role).await,
             CredentialClient::AwsSso(c) => c.assume_role(role).await,
+        }
+    }
+
+    async fn list_roles(&self) -> crate::Result<crate::client::ListRolesResponse> {
+        match self {
+            CredentialClient::Api(c) => c.list_roles().await,
+            CredentialClient::AwsSso(c) => c.list_roles().await,
         }
     }
 }
@@ -67,6 +78,46 @@ impl From<&AssumeRoleResponse> for crate::proto::AssumeRoleResponse {
 pub struct AssumeRoleResponseMairuExt {
     #[serde(default)]
     pub no_cache: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ListRolesResponse {
+    pub roles: Vec<ListRolesItem>,
+}
+
+impl ListRolesResponse {
+    pub fn to_proto(
+        &self,
+        server: &crate::config::Server,
+    ) -> crate::proto::list_roles_response::Item {
+        crate::proto::list_roles_response::Item {
+            server_id: server.id().to_owned(),
+            server_url: server.url.to_string(),
+            logged_in: true,
+            roles: self
+                .roles
+                .iter()
+                .map(crate::proto::list_roles_response::item::Role::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ListRolesItem {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+impl From<&ListRolesItem> for crate::proto::list_roles_response::item::Role {
+    fn from(role: &ListRolesItem) -> crate::proto::list_roles_response::item::Role {
+        crate::proto::list_roles_response::item::Role {
+            name: role.name.clone(),
+            description: role.description.clone().unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

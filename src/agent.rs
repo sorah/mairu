@@ -380,6 +380,73 @@ impl crate::proto::agent_server::Agent for Agent {
             RefreshAwsSsoClientRegistrationResponse {},
         ))
     }
+
+    #[tracing::instrument(skip_all)]
+    async fn list_roles(
+        &self,
+        request: tonic::Request<ListRolesRequest>,
+    ) -> Result<tonic::Response<ListRolesResponse>, tonic::Status> {
+        use crate::client::CredentialVendor;
+
+        let req = request.get_ref();
+        let (sessions, configured_servers) = if req.server_id.is_empty() {
+            (
+                self.session_manager.list(),
+                match crate::config::Server::find_all_from_fs().await {
+                    Ok(x) => x,
+                    Err(e) => return Err(tonic::Status::internal(e.to_string())),
+                },
+            )
+        } else {
+            (
+                match self.session_manager.get(&req.server_id) {
+                    Ok(x) => vec![x],
+                    Err(crate::Error::ConfigError(e)) => return Err(tonic::Status::internal(e)),
+                    Err(crate::Error::UserError(e)) => return Err(tonic::Status::not_found(e)),
+                    Err(e) => return Err(tonic::Status::internal(e.to_string())),
+                },
+                vec![],
+            )
+        };
+
+        let mut map = std::collections::HashMap::new();
+        let mut servers = std::vec::Vec::with_capacity(configured_servers.len());
+
+        for session in sessions.iter() {
+            map.insert(session.server().id(), true);
+            let client = crate::client::make_credential_vendor(session).map_err(|e| {
+                tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, err = ?e, "Failed to make_credential_vendor");
+                tonic::Status::internal(e.to_string())
+            })?;
+            match client.list_roles().await {
+                Ok(x) => servers.push(x.to_proto(session.server())),
+                Err(crate::Error::RemoteError(crate::client::Error::Unauthenticated(_m, e))) => {
+                    tracing::warn!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, err = ?e, "list_roles returned unauthenticated");
+                    // do nothing
+                }
+                Err(e) => {
+                    tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, err = ?e, "Failed to list_roles");
+                    return Err(tonic::Status::internal(e.to_string()));
+                }
+            }
+        }
+        for server in configured_servers.into_iter() {
+            if map.contains_key(server.id()) {
+                continue;
+            }
+            servers.push(crate::proto::list_roles_response::Item {
+                server_id: server.id().to_owned(),
+                server_url: server.url.to_string(),
+                logged_in: false,
+                roles: vec![],
+            });
+        }
+        tracing::debug!("done");
+
+        Ok(tonic::Response::new(crate::proto::ListRolesResponse {
+            servers,
+        }))
+    }
 }
 
 impl Agent {
