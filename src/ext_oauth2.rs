@@ -187,7 +187,7 @@ pub(crate) fn generate_pkce_challenge() -> (oauth2::PkceCodeChallenge, secrecy::
     use secrecy::ExposeSecret;
 
     let mut buf = [0u8; 64];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     let verifier_raw =
         secrecy::SecretString::new(base64::engine::general_purpose::URL_SAFE.encode(buf).into());
     let verifier = oauth2::PkceCodeVerifier::new(verifier_raw.expose_secret().to_owned());

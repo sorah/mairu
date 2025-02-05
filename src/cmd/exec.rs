@@ -694,7 +694,7 @@ mod auto_refresh {
         use rand::Rng;
         let initial_backoff = 1.0f64;
         let max_backoff = tokio::time::Duration::from_secs(120);
-        let base: f64 = rand::thread_rng().gen();
+        let base: f64 = rand::rng().random();
 
         let wait = match 2u32
             .checked_pow(retries)
