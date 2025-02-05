@@ -571,9 +571,25 @@ pub async fn connect_to_agent_with_path(
         .await?;
 
     let mut client = crate::proto::agent_client::AgentClient::new(ch);
-    client
+    let pong = client
         .ping_agent(tonic::Request::new(crate::proto::PingAgentRequest {}))
-        .await?;
+        .await?
+        .into_inner();
+    if pong.version != env!("CARGO_PKG_VERSION") {
+        tracing::warn!(
+            agent_version = pong.version,
+            client_version = env!("CARGO_PKG_VERSION"),
+            "agent version is diverged; you may want to restart your agent"
+        );
+        let product = env!("CARGO_PKG_NAME");
+        crate::terminal::send(
+            &format!(
+                ":: {product} :: agent version is diverged; you may want to restart your agent (client={client_version}, agent={agent_version})",
+                agent_version = pong.version,
+                client_version = env!("CARGO_PKG_VERSION"),
+            )
+        ).await;
+    }
 
     Ok(client)
 }
