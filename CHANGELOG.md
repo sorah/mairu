@@ -1,3 +1,8 @@
+## 0.7.0
+
+- New subcomand `mairu list-roles` lists possible `role` parameter for a server. Corresponding HTTP API is added to the spec.
+
+
 ## 0.6.0
 
 - New subcomand `mairu show` dumps informations about 'auto' role.
