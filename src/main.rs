@@ -20,6 +20,8 @@ enum Commands {
     ListSessions(mairu::cmd::list_sessions::ListSessionsArgs),
     /// List available roles
     ListRoles(mairu::cmd::list_roles::ListRolesArgs),
+    /// Refresh existing session
+    Refresh(mairu::cmd::refresh::RefreshArgs),
 
     /// Show current 'auto' role
     Show(mairu::cmd::show::ShowArgs),
@@ -56,6 +58,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::CredentialProcess(args) => mairu::cmd::credential_process::run(args),
         Commands::ListSessions(args) => mairu::cmd::list_sessions::run(args),
         Commands::ListRoles(args) => mairu::cmd::list_roles::run(args),
+        Commands::Refresh(args) => mairu::cmd::refresh::run(args),
         Commands::Show(args) => mairu::cmd::show::run(args),
         Commands::Exec(args) => mairu::cmd::exec::run(args),
         Commands::SetupSso(args) => mairu::cmd::setup_sso::run(args),

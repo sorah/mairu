@@ -160,6 +160,26 @@ impl crate::proto::agent_server::Agent for Agent {
     }
 
     #[tracing::instrument(skip_all)]
+    async fn refresh_session(
+        &self,
+        request: tonic::Request<RefreshSessionRequest>,
+    ) -> Result<tonic::Response<RefreshSessionResponse>, tonic::Status> {
+        let query = &request.get_ref().query;
+        let session = match self.session_manager.get(query) {
+            Ok(x) => x,
+            Err(crate::Error::ConfigError(e)) => return Err(tonic::Status::internal(e)),
+            Err(crate::Error::UserError(e)) => return Err(tonic::Status::not_found(e)),
+            Err(e) => return Err(tonic::Status::internal(e.to_string())),
+        };
+        match self.refresh_session(&session).await {
+            Ok(new) => Ok(tonic::Response::new(RefreshSessionResponse {
+                session: Some((&new).into()),
+            })),
+            Err(e) => Err(tonic::Status::internal(e.to_string())),
+        }
+    }
+
+    #[tracing::instrument(skip_all)]
     async fn initiate_oauth_code(
         &self,
         request: tonic::Request<InitiateOAuthCodeRequest>,
@@ -500,26 +520,37 @@ impl Agent {
         if !session.token.has_active_refresh_token() {
             return session;
         }
+        let result = self.refresh_session(&session).await;
+        match result {
+            Ok(new) => new,
+            Err(_) => session,
+        }
+    }
 
-        // =====
+    async fn refresh_session(
+        &self,
+        session: &crate::session_manager::Session,
+    ) -> crate::Result<crate::session_manager::Session> {
         let maybe_new = if session.token.server.aws_sso.is_some() {
-            refresh_token_using_awssso(&session).await
+            refresh_token_using_awssso(session).await
         } else {
-            refresh_token_using_oauth2(&session).await
+            refresh_token_using_oauth2(session).await
         };
-        if let Some(new) = maybe_new {
-            self.session_manager.add(new).unwrap() // XXX: unwrap()
-        } else {
-            session
+        match maybe_new {
+            Ok(new) => {
+                let sess = self.session_manager.add(new).unwrap(); // XXX: unwrap()
+                Ok(sess)
+            }
+            Err(e) => Err(e),
         }
     }
 }
 
 async fn refresh_token_using_oauth2(
     session: &crate::session_manager::Session,
-) -> Option<crate::token::ServerToken> {
+) -> crate::Result<crate::token::ServerToken> {
     match crate::oauth_refresh_token::refresh_token(&session.token).await {
-        Ok(token) => Some(token),
+        Ok(token) => Ok(token),
         Err(e) => {
             tracing::warn!(
                 server_id = session.token.server.id(),
@@ -527,16 +558,16 @@ async fn refresh_token_using_oauth2(
                 err = ?e,
                 "Failed to refresh session using refresh_token"
             );
-            None
+            Err(e)
         }
     }
 }
 
 async fn refresh_token_using_awssso(
     session: &crate::session_manager::Session,
-) -> Option<crate::token::ServerToken> {
+) -> crate::Result<crate::token::ServerToken> {
     match crate::ext_awssso::refresh_token(&session.token).await {
-        Ok(token) => Some(token),
+        Ok(token) => Ok(token),
         Err(e) => {
             tracing::warn!(
                 server_id = session.token.server.id(),
@@ -544,7 +575,7 @@ async fn refresh_token_using_awssso(
                 err = ?e,
                 "Failed to refresh session using refresh_token against AWS sso-oidc"
             );
-            None
+            Err(e)
         }
     }
 }

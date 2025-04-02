@@ -14,34 +14,38 @@ pub async fn run(args: &ListSessionsArgs) -> Result<(), anyhow::Error> {
         .into_inner();
 
     for session in list.sessions.iter() {
-        let expiring = match session.expiration() {
-            Ok(Some(e)) => {
-                let t = format_time(e, args.utc);
-                if session.refreshable {
-                    format!(" [renews after {t}]")
-                } else {
-                    format!(" [until {t}]")
-                }
-            }
-            Ok(None) => {
-                if session.refreshable {
-                    "[refreshable]".to_string()
-                } else {
-                    "".to_string()
-                }
-            }
-            Err(e) => {
-                tracing::warn!(err = ?e, session = ?session, "Invalid expiration timestamp");
-                "".to_string()
-            }
-        };
-        println!(
-            "{}. {}: {}{}",
-            session.id, session.server_id, session.server_url, expiring
-        );
+        print_session(session, args.utc);
     }
 
     Ok(())
+}
+
+pub(crate) fn print_session(session: &crate::proto::Session, utc: bool) {
+    let expiring = match session.expiration() {
+        Ok(Some(e)) => {
+            let t = format_time(e, utc);
+            if session.refreshable {
+                format!(" [renews after {t}]")
+            } else {
+                format!(" [until {t}]")
+            }
+        }
+        Ok(None) => {
+            if session.refreshable {
+                "[refreshable]".to_string()
+            } else {
+                "".to_string()
+            }
+        }
+        Err(e) => {
+            tracing::warn!(err = ?e, session = ?session, "Invalid expiration timestamp");
+            "".to_string()
+        }
+    };
+    println!(
+        "{}. {}: {}{}",
+        session.id, session.server_id, session.server_url, expiring
+    );
 }
 
 fn format_time(t: chrono::DateTime<chrono::Utc>, utc: bool) -> String {

@@ -4,5 +4,6 @@ pub mod exec;
 pub mod list_roles;
 pub mod list_sessions;
 pub mod login;
+pub mod refresh;
 pub mod setup_sso;
 pub mod show;

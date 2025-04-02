@@ -25,6 +25,7 @@ service Agent {
   rpc AssumeRole(AssumeRoleRequest) returns (AssumeRoleResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   // rpc RemoveSession(RemoveSessionRequest) returns (RemoveSessionResponse)
+  rpc RefreshSession(RefreshSessionRequest) returns (RefreshSessionResponse);
 
   rpc InitiateOauthCode(InitiateOAuthCodeRequest) returns (InitiateOAuthCodeResponse);
   rpc CompleteOauthCode(CompleteOAuthCodeRequest) returns (CompleteOAuthCodeResponse);
@@ -73,6 +74,12 @@ message RemoveSessionRequest {
   string query = 1;
 }
 message RemoveSessionResponse {
+}
+message RefreshSessionRequest {
+  string query = 1;
+}
+message RefreshSessionResponse {
+  Session session = 1;
 }
 
 message InitiateOAuthCodeRequest {
