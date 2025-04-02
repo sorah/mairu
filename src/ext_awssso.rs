@@ -57,18 +57,9 @@ pub async fn register_client(
 pub async fn refresh_token(
     token: &crate::token::ServerToken,
 ) -> crate::Result<crate::token::ServerToken> {
-    let sso = token.server.aws_sso.as_ref().ok_or_else(|| {
-        crate::Error::UserError(format!(
-            "Server '{}' is not an aws_sso server",
-            token.server.id(),
-        ))
-    })?;
-    let oauth = token.server.oauth.as_ref().ok_or_else(|| {
-        crate::Error::ConfigError(format!(
-            "Server '{}' is missing client registration",
-            token.server.id(),
-        ))
-    })?;
+    let (sso, oauth) = token
+        .server
+        .try_oauth_awssso(crate::config::OAuthGrantType::Code)?;
     let refresh_token = token.refresh_token.as_ref().ok_or_else(|| {
         crate::Error::ConfigError(format!(
             "Server '{}' session has no refresh_token",
