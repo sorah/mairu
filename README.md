@@ -143,7 +143,7 @@ Mairu supports the following methods to provide credentials to AWS SDK. Choose y
 Your preferred method can be specified in `--mode`:
 
 ```
-$ mariu exec --mode=static auto rails server
+$ mairu exec --mode=static auto rails server
 ```
 
 Alternatively, you can use Mairu `mairu credential-process` command for [process credential provider](https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html).
