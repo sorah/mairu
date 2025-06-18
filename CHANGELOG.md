@@ -1,3 +1,7 @@
+## Unreleased
+
+- login: during OAuth 2.0 Authorization Code flow, mairu now shows localhost URL that redirects to an actual authorize url. This allows to show shorter URLs, which ease opening URLs by avoiding line wrapping.
+
 ## 0.7.0
 
 - redirect_uri endpoint returns fancier HTML page during OAuth 2.0 Authorization Code flow.

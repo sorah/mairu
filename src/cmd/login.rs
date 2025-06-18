@@ -94,20 +94,22 @@ pub async fn do_oauth_code(
     let product = env!("CARGO_PKG_NAME");
     let server_id = server.id();
     let server_url = &server.url;
-    let authorize_url = &session.authorize_url;
+
+    let (auth_route, short_authorize_url) =
+        crate::oauth_code::generate_short_authorize_url(&listener, use_localhost)?;
 
     crate::terminal::send(&indoc::formatdoc! {"
         :: {product} :: Login to {server_id} ({server_url}) ::::::::
         :: {product} ::
         :: {product} ::
         :: {product} :: Open the following URL to continue
-        :: {product} :: {authorize_url}
+        :: {product} :: >   {short_authorize_url}
         :: {product} ::
         :: {product} ::
     "})
     .await;
 
-    crate::oauth_code::listen_for_callback(listener, session, agent).await?;
+    crate::oauth_code::listen_for_callback(listener, session, agent, auth_route).await?;
     tracing::info!("Logged in");
     Ok(())
 }
