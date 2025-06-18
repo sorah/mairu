@@ -103,6 +103,21 @@ fn oauth2_client_from_server(
     Ok(client)
 }
 
+fn build_local_url(
+    listener: &tokio::net::TcpListener,
+    path: &str,
+    use_localhost: bool,
+) -> crate::Result<url::Url> {
+    let addr = listener.local_addr()?;
+    let mut url = url::Url::parse("http://127.0.0.1/")?;
+    if use_localhost {
+        url.set_host(Some("localhost")).unwrap();
+    }
+    url.set_path(path);
+    url.set_port(Some(addr.port())).unwrap();
+    Ok(url)
+}
+
 pub async fn bind_tcp_for_callback(
     path: &str,
     port: Option<u16>,
@@ -112,13 +127,7 @@ pub async fn bind_tcp_for_callback(
     let bindaddr =
         std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), port.unwrap_or(0));
     let sock = tokio::net::TcpListener::bind(bindaddr).await?;
-    let addr = sock.local_addr()?;
-    let mut url = url::Url::parse("http://127.0.0.1/")?;
-    if use_localhost {
-        url.set_host(Some("localhost")).unwrap();
-    }
-    url.set_path(path);
-    url.set_port(Some(addr.port())).unwrap();
+    let url = build_local_url(&sock, path, use_localhost)?;
     tracing::debug!(url = %url, "Listening TCP for Callback");
     Ok((sock, url))
 }
@@ -128,10 +137,21 @@ struct OneoffServerContext {
     session: crate::proto::InitiateOAuthCodeResponse,
 }
 
+pub fn generate_short_authorize_url(
+    listener: &tokio::net::TcpListener,
+    use_localhost: bool,
+) -> crate::Result<(String, url::Url)> {
+    let random_path = crate::utils::generate_flow_handle();
+    let auth_route = format!("/auth/{}", random_path);
+    let short_authorize_url = build_local_url(listener, &auth_route, use_localhost)?;
+    Ok((auth_route, short_authorize_url))
+}
+
 pub async fn listen_for_callback(
     listener: tokio::net::TcpListener,
     session: crate::proto::InitiateOAuthCodeResponse,
     agent: &crate::agent::AgentConn,
+    short_authorize_url_route: String,
 ) -> crate::Result<()> {
     use std::future::IntoFuture;
 
@@ -139,11 +159,18 @@ pub async fn listen_for_callback(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<()>(1);
 
+    let authorize_url_for_route = session.authorize_url.clone();
     let context = std::sync::Arc::new(OneoffServerContext { result_tx, session });
     let conn = agent.clone();
     let app = axum::Router::new()
         .route("/oauth/callback", axum::routing::get(callback))
         .route("/oauth2callback", axum::routing::get(callback))
+        .route(
+            &short_authorize_url_route,
+            axum::routing::get(move || async move {
+                axum::response::Redirect::temporary(&authorize_url_for_route)
+            }),
+        )
         .layer(axum::extract::Extension(conn))
         .layer(axum::extract::Extension(context));
 
