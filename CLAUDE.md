@@ -1,63 +1,101 @@
-# Mairu Project Guide
+# CLAUDE.md
 
-## Project Overview
-Mairu is a secure AWS credentials management tool written in Rust that allows seamless use of multiple AWS roles and accounts concurrently.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Development Commands
-- Build: `cargo build`
-- Test: `cargo test`
-- Type check: `cargo clippy` (preferred over `cargo check` for extensive linting)
-- Format: `cargo fmt`
-- Lint: `cargo clippy`
+## Build and Development Commands
 
-## Key Architecture Notes
-- Agent-based architecture with gRPC communication
-- Credentials stored only in memory (never persisted to disk)
-- Uses Protocol Buffers for IPC (definitions in `proto/`)
-- Heavy use of async/await with Tokio runtime
+### Prerequisites
+- Install Rust toolchain
+- Install `protobuf-compiler` package (required for building proto files)
+- For musl builds: Install `musl-tools` package
 
-## Code Style
-- Follow standard Rust conventions
-- Use `thiserror` for error types
-- Use `zeroize` and `secrecy` for sensitive data handling
-- Prefer explicit error handling over panics
-- **Always run `cargo fmt` after writing or modifying code**
-- **Always run `cargo clippy` after writing or modifying code for extensive linting checks**
-- **Import (`use`) statements**: 
-  - Global `use` statements at the top of files are discouraged (except in `mod.rs` and `lib.rs`)
-  - Avoid `use` for structs and enums - prefer full paths (e.g., `std::collections::HashMap` instead of `use std::collections::HashMap`)
-  - `use` is allowed for frequently used modules within the same crate (e.g., `use crate::error::Error`)
-  - When importing traits, place the `use` statement in the most specific scope where they're needed
-  - Default: Don't use `use` unless explicitly requested by humans
+### Common Commands
 
-## Testing
-- Write unit tests in `#[cfg(test)]` modules
-- Run `cargo test` before committing changes
-- Tests require `protobuf-compiler` installed on the system
+```bash
+# Run tests
+cargo test
 
-## Security Considerations
-- AWS credentials are stored only in memory, never persisted to disk
-- Use `zeroize` for secure cleanup of sensitive data
-- OAuth 2.0 with PKCE is required for authorization code grant
-- Report security issues to security@sorah.jp and security@cookpad.com (not GitHub Issues)
+# Build debug version
+cargo build
 
-## Feature Flags
-- `default`: Uses native TLS implementation
-- `rustls`: Uses Rust TLS implementation (used for Debian packages)
-- Choose features with `cargo build --features rustls --no-default-features`
+# Build release version
+cargo build --release
 
-## Release Process
-- Version is in `Cargo.toml`
-- Create tags as `v{VERSION}` (e.g., `v0.7.0`)
-- CI automatically builds releases for multiple architectures
+# Build with rustls feature (instead of native-tls)
+cargo build --no-default-features --features rustls
 
-## Important Files
-- Server configs: `~/.config/mairu/servers.d/*.json`
-- Agent socket: `$XDG_RUNTIME_DIR/mairu-agent.sock`
-- Auto role config: `.mairu.json` in project directories
-- HTTP API spec: `HTTP_API_SPEC.md`
+# Build for musl target (static binary)
+cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls
 
-## CI/CD
-- GitHub Actions runs tests on push/PR
-- Tests multiple targets: Linux (x86_64/aarch64, glibc/musl), macOS (aarch64)
-- Release workflow builds binaries and Debian packages
+# Build Debian package
+cargo install cargo-deb --locked
+cargo deb --target=x86_64-unknown-linux-musl
+
+# Run a single test
+cargo test test_name
+```
+
+## Architecture Overview
+
+Mairu is an on-memory AWS credentials agent that manages and provides AWS credentials to CLI tools. It consists of several key components:
+
+### Core Components
+
+1. **Agent Process** (`src/agent.rs`): Background daemon that manages sessions and credentials
+   - Communicates via gRPC protocol defined in `proto/mairu.proto`
+   - Listens on Unix domain socket at `$XDG_RUNTIME_DIR/mairu-agent.sock`
+   - Handles OAuth flows, session management, and credential caching
+
+2. **CLI Interface** (`src/main.rs`): Command-line interface with subcommands
+   - `exec`: Execute commands with AWS credentials
+   - `login`: Authenticate with credential servers
+   - `credential-process`: AWS SDK credential process provider
+   - `agent`: Manually start agent process
+
+3. **Credential Providers**:
+   - **AWS SSO** (`src/awssso_client.rs`): Integration with AWS IAM Identity Center
+   - **API Client** (`src/api_client.rs`): Generic client for custom credential servers
+
+4. **ECS Server** (`src/ecs_server.rs`): HTTP server that emulates ECS credential endpoint
+   - Provides credentials to AWS SDKs via container credential provider protocol
+   - Protected by bearer token authentication
+
+5. **Session Management** (`src/session_manager.rs`): In-memory session storage
+   - Manages authentication tokens and credential cache per server
+
+6. **Auto Role Selection** (`src/auto.rs`): Reads `.mairu.json` files for automatic role selection
+   - Trust verification with SHA-384 digest
+
+### Key Design Patterns
+
+- **Agent-Client Separation**: Agent runs as background process, CLI commands communicate via gRPC
+- **Protocol Abstraction**: gRPC interface allows different credential provider implementations
+- **Credential Provider Modes**: Support for ECS (default), static, and credential process modes
+- **Security**: Uses `zeroize` for secure memory handling, bearer tokens for authentication
+
+### Configuration
+
+Server configurations are stored in `~/.config/mairu/servers.d/*.json`. Supports:
+- AWS SSO configuration with region
+- Custom OAuth servers with flexible endpoint configuration
+
+### Protocol
+
+The gRPC protocol (`proto/mairu.proto`) defines the agent communication interface. Key service methods:
+- `AssumeRole`: Get AWS credentials for a role
+- `GetServer`: Retrieve server configuration
+- `InitiateOauth*`: Start OAuth flows
+- `RefreshSession`: Renew sessions
+
+## Coding Guidelines
+
+### Import (`use`) Statements
+- Global `use` statements at the top of files are discouraged (except in `mod.rs` and `lib.rs`)
+- Avoid `use` for structs and enums - prefer full paths (e.g., `std::collections::HashMap` instead of `use std::collections::HashMap`)
+- `use` is allowed for frequently used modules within the same crate (e.g., `use crate::error::Error`)
+- When importing traits, place the `use` statement in the most specific scope where they're needed
+- Default: Don't use `use` unless explicitly requested by humans
+
+## Development Practices
+
+- Must pass cargo clippy before commit
