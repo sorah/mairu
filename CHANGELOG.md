@@ -2,6 +2,7 @@
 
 ### Enhancements
 
+- kill-agent: New subcommand `mairu kill-agent` stops the running agent process. This is useful when upgrading mairu. [#31](https://github.com/sorah/mairu/pull/31)
 - oauth_code: OAuth 2.0 callback page gained a dark mode and enabled when a browser configured to prefer dark mode. [#32](https://github.com/sorah/mairu/pull/32)
 
 ### Miscellaneous

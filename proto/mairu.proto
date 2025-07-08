@@ -36,6 +36,8 @@ service Agent {
   rpc RefreshAwsSsoClientRegistration(RefreshAwsSsoClientRegistrationRequest) returns (RefreshAwsSsoClientRegistrationResponse);
 
   rpc ListRoles(ListRolesRequest) returns (ListRolesResponse);
+
+  rpc ShutdownAgent(ShutdownAgentRequest) returns (ShutdownAgentResponse);
 }
 
 message PingAgentRequest {
@@ -138,6 +140,11 @@ message ListRolesResponse {
     repeated Role roles = 4;
   }
   repeated Item servers = 1;
+}
+
+message ShutdownAgentRequest {
+}
+message ShutdownAgentResponse {
 }
 
 //----- The following is used for mairu-exec subprocess IPC

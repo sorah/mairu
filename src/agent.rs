@@ -1,16 +1,17 @@
 use crate::proto::*;
 
-#[derive(Default)]
 pub struct Agent {
     auth_flow_manager: crate::auth_flow_manager::AuthFlowManager,
     session_manager: crate::session_manager::SessionManager,
+    shutdown_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Agent {
-    pub fn new() -> Self {
+    pub fn new(shutdown_tx: tokio::sync::oneshot::Sender<()>) -> Self {
         Self {
             auth_flow_manager: crate::auth_flow_manager::AuthFlowManager::new(),
             session_manager: crate::session_manager::SessionManager::new(),
+            shutdown_tx: tokio::sync::Mutex::new(Some(shutdown_tx)),
         }
     }
 }
@@ -467,6 +468,33 @@ impl crate::proto::agent_server::Agent for Agent {
         Ok(tonic::Response::new(crate::proto::ListRolesResponse {
             servers,
         }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn shutdown_agent(
+        &self,
+        _request: tonic::Request<ShutdownAgentRequest>,
+    ) -> Result<tonic::Response<ShutdownAgentResponse>, tonic::Status> {
+        tracing::debug!("Shutdown requested");
+
+        match self.shutdown_tx.lock().await.take() {
+            Some(tx) => match tx.send(()) {
+                Ok(()) => {
+                    tracing::info!("Shutdown signal sent successfully");
+                    Ok(tonic::Response::new(ShutdownAgentResponse {}))
+                }
+                Err(_) => {
+                    tracing::error!("Failed to send shutdown signal - receiver already dropped");
+                    Err(tonic::Status::internal("Failed to send shutdown signal"))
+                }
+            },
+            None => {
+                tracing::warn!("Shutdown already requested or not available");
+                Err(tonic::Status::unavailable(
+                    "Shutdown already requested or not available",
+                ))
+            }
+        }
     }
 }
 
