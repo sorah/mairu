@@ -27,12 +27,16 @@ impl Session {
 }
 
 impl ExecEnvironment {
-    pub(crate) fn apply(&self) {
+    pub(crate) unsafe fn apply(&self) {
         for name in self.remove_vars.iter() {
-            std::env::remove_var(name);
+            unsafe {
+                std::env::remove_var(name);
+            }
         }
         for ExecEnvVar { name, value } in self.set_vars.iter() {
-            std::env::set_var(name, value);
+            unsafe {
+                std::env::set_var(name, value);
+            }
         }
     }
 }

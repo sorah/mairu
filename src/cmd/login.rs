@@ -67,20 +67,25 @@ pub async fn do_oauth_code(
         )
     };
 
-    if let Ok(x) = std::env::var("MAIRU_LOCAL_PORT") {
-        if let Ok(i) = x.parse() {
-            local_port = Some(i);
-        }
+    if let Ok(x) = std::env::var("MAIRU_LOCAL_PORT")
+        && let Ok(i) = x.parse()
+    {
+        local_port = Some(i);
     }
 
-    let (listener, url) =
-        match crate::oauth_code::bind_tcp_for_callback(path, local_port, use_localhost).await {
-            Ok(t) => t,
-            Err(e) => anyhow::bail!(
-                "Failed to bind TCP server for OAuth 2.0 callback acceptance, perhaps there is concurrent mairu-exec call waitng for login, or occupied by oher process; {}",
-                e
-            ),
-        };
+    let (listener, url) = match crate::oauth_code::bind_tcp_for_callback(
+        path,
+        local_port,
+        use_localhost,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => anyhow::bail!(
+            "Failed to bind TCP server for OAuth 2.0 callback acceptance, perhaps there is concurrent mairu-exec call waitng for login, or occupied by oher process; {}",
+            e
+        ),
+    };
 
     let session = agent
         .initiate_oauth_code(crate::proto::InitiateOAuthCodeRequest {

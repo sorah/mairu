@@ -182,7 +182,7 @@ impl Client {
                 Err(e) => {
                     return Err(crate::Error::UnknownError(format!(
                         "list_accounts_account failed: {e:?}"
-                    )))
+                    )));
                 }
             }
         }

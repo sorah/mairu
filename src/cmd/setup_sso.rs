@@ -46,7 +46,9 @@ pub async fn run(args: &SetupSsoArgs) -> Result<(), anyhow::Error> {
                 return Err(e.into());
             }
             Ok(_) => {
-                anyhow::bail!("Server configuration already exist with save id, confirm overwrite using --overwrite (-y)");
+                anyhow::bail!(
+                    "Server configuration already exist with save id, confirm overwrite using --overwrite (-y)"
+                );
             }
         }
     }

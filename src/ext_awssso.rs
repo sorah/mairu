@@ -190,7 +190,7 @@ impl aws_smithy_runtime_api::client::interceptors::Intercept for EndpointStealin
                 return Err(Box::new(crate::Error::UnknownError(
                     "error during aws-ssooidc endpoint resolution; it was not instantly Ready"
                         .to_string(),
-                )))
+                )));
             }
         }
         Err(Box::new(crate::Error::UnknownError(

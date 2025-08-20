@@ -1,3 +1,9 @@
+## [not yet released]
+
+### Miscellaneous
+
+- Rust edition upgraded to 2024 [#34](https://github.com/sorah/mairu/pull/34)
+
 ## 0.9.0
 
 ### Enhancements

@@ -467,7 +467,11 @@ mod provider {
             crate::config::ProviderMode::Ecs => ecs_provider_start(rx, agent, args).await?,
             crate::config::ProviderMode::Static => static_provider_set(agent, args).await?,
         };
-        environment.apply();
+        // SAFETY: Called during process initialization before any threads are spawned.
+        // No other threads can be accessing environment variables at this point.
+        unsafe {
+            environment.apply();
+        }
         Ok(ProviderHandle {
             shutdown: tx,
             environment,
@@ -784,7 +788,11 @@ mod executor {
     ) -> Result<(), anyhow::Error> {
         use std::os::unix::process::CommandExt;
         if let Some(env) = info.environment {
-            env.apply();
+            // SAFETY: Called during exec preparation in the executor process.
+            // No other threads exist at this point as we're about to exec.
+            unsafe {
+                env.apply();
+            }
         }
         let arg0 = args
             .command
@@ -799,7 +807,7 @@ mod executor {
 
 #[cfg(unix)]
 fn start_ignoring_signals() {
-    use nix::sys::signal::{signal, SigHandler, Signal};
+    use nix::sys::signal::{SigHandler, Signal, signal};
     if let Err(e) = unsafe { signal(Signal::SIGINT, SigHandler::SigIgn) } {
         tracing::warn!(err = ?e, "failed to ignore SIGINT")
     }

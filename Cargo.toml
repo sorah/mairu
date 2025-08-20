@@ -8,7 +8,7 @@ categories = ["command-line-utilities", "development-tools"]
 documentation = "https://github.com/sorah/mairu"
 homepage = "https://github.com/sorah/mairu"
 repository = "https://github.com/sorah/mairu"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 
 [profile.deb]
