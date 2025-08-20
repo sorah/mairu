@@ -1,16 +1,17 @@
 use crate::proto::*;
 
-#[derive(Default)]
 pub struct Agent {
     auth_flow_manager: crate::auth_flow_manager::AuthFlowManager,
     session_manager: crate::session_manager::SessionManager,
+    shutdown_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Agent {
-    pub fn new() -> Self {
+    pub fn new(shutdown_tx: tokio::sync::oneshot::Sender<()>) -> Self {
         Self {
             auth_flow_manager: crate::auth_flow_manager::AuthFlowManager::new(),
             session_manager: crate::session_manager::SessionManager::new(),
+            shutdown_tx: tokio::sync::Mutex::new(Some(shutdown_tx)),
         }
     }
 }
@@ -468,6 +469,33 @@ impl crate::proto::agent_server::Agent for Agent {
             servers,
         }))
     }
+
+    #[tracing::instrument(skip_all)]
+    async fn shutdown_agent(
+        &self,
+        _request: tonic::Request<ShutdownAgentRequest>,
+    ) -> Result<tonic::Response<ShutdownAgentResponse>, tonic::Status> {
+        tracing::debug!("Shutdown requested");
+
+        match self.shutdown_tx.lock().await.take() {
+            Some(tx) => match tx.send(()) {
+                Ok(()) => {
+                    tracing::info!("Shutdown signal sent successfully");
+                    Ok(tonic::Response::new(ShutdownAgentResponse {}))
+                }
+                Err(_) => {
+                    tracing::error!("Failed to send shutdown signal - receiver already dropped");
+                    Err(tonic::Status::internal("Failed to send shutdown signal"))
+                }
+            },
+            None => {
+                tracing::warn!("Shutdown already requested or not available");
+                Err(tonic::Status::unavailable(
+                    "Shutdown already requested or not available",
+                ))
+            }
+        }
+    }
 }
 
 impl Agent {
@@ -610,12 +638,12 @@ pub async fn connect_to_agent_with_path(
         tracing::warn!(
             agent_version = pong.version,
             client_version = env!("CARGO_PKG_VERSION"),
-            "agent version is diverged; you may want to restart your agent"
+            "agent version is diverged; you may want to restart your agent via `mairu kill-agent` command."
         );
         let product = env!("CARGO_PKG_NAME");
         crate::terminal::send(
             &format!(
-                ":: {product} :: agent version is diverged; you may want to restart your agent (client={client_version}, agent={agent_version})",
+                ":: {product} :: Warning | agent version is diverged; Restart your agent via `mairu kill-agent` command. (client={client_version}, agent={agent_version})",
                 agent_version = pong.version,
                 client_version = env!("CARGO_PKG_VERSION"),
             )

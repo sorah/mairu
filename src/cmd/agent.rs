@@ -166,12 +166,23 @@ pub async fn serve_on_path_daemon2(
 
 pub async fn serve(uds: tokio::net::UnixListener) -> Result<(), anyhow::Error> {
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
-    let agent = crate::agent::Agent::new();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let agent = crate::agent::Agent::new(shutdown_tx);
 
-    tonic::transport::Server::builder()
+    tracing::info!("Agent server starting");
+
+    let server = tonic::transport::Server::builder()
         .add_service(crate::proto::agent_server::AgentServer::new(agent))
-        .serve_with_incoming(uds_stream)
-        .await?;
+        .serve_with_incoming_shutdown(uds_stream, async move {
+            match shutdown_rx.await {
+                Ok(_) => tracing::info!("Shutdown signal received successfully"),
+                Err(_) => tracing::warn!("Shutdown receiver dropped"),
+            }
+        });
+
+    server.await?;
+
+    tracing::info!("Agent server stopped");
 
     Ok(())
 }

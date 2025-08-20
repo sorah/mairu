@@ -6,8 +6,9 @@ By using as a executor, you can seamlessly switch between IAM roles per-project 
 
 ## Installation
 
-* __Cargo:__ `cargo install --locked mairu`
+* __Cargo:__ `cargo install --locked mairu` <sup>[[crate](https://crates.io/crates/mairu)]</sup>
 * __Mise:__ `mise use -g ubi:sorah/mairu`
+* __Aqua:__ sorah/mairu <sup>[[source](https://github.com/aquaproj/aqua-registry/tree/main/pkgs/sorah/mairu)]</sup>
 * __Homebrew Tap:__ `brew install sorah/sorah/mairu` <sup>[[tap](https://github.com/sorah/homebrew-sorah)]</sup>
 * __Arch Linux AUR:__ [mairu](https://aur.archlinux.org/packages/mairu), [mairu-bin](https://aur.archlinux.org/packages/mairu-bin)
 * __Binary:__ Binaries for Linux and macOS are available at https://github.com/sorah/mairu/releases

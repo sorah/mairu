@@ -29,6 +29,9 @@ enum Commands {
     /// Manually start agent process; it is automatically spawned when not present
     Agent(mairu::cmd::agent::AgentArgs),
 
+    /// Instruct the agent to shut down
+    KillAgent,
+
     /// Setup Mairu for your AWS SSO (AWS IAM Identity Center) instance
     SetupSso(mairu::cmd::setup_sso::SetupSsoArgs),
 }
@@ -50,6 +53,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         }
         Commands::Exec(_) => enable_log(LogType::Custom),
         Commands::CredentialProcess(_) => enable_log(LogType::Custom),
+        Commands::KillAgent => enable_log(LogType::Custom),
         _ => enable_log(LogType::Default),
     }
     let retval = match &cli.command {
@@ -61,6 +65,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::Refresh(args) => mairu::cmd::refresh::run(args),
         Commands::Show(args) => mairu::cmd::show::run(args),
         Commands::Exec(args) => mairu::cmd::exec::run(args),
+        Commands::KillAgent => mairu::cmd::kill_agent::run(),
         Commands::SetupSso(args) => mairu::cmd::setup_sso::run(args),
     };
     match retval {
