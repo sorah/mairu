@@ -638,12 +638,12 @@ pub async fn connect_to_agent_with_path(
         tracing::warn!(
             agent_version = pong.version,
             client_version = env!("CARGO_PKG_VERSION"),
-            "agent version is diverged; you may want to restart your agent"
+            "agent version is diverged; you may want to restart your agent via `mairu kill-agent` command."
         );
         let product = env!("CARGO_PKG_NAME");
         crate::terminal::send(
             &format!(
-                ":: {product} :: agent version is diverged; you may want to restart your agent (client={client_version}, agent={agent_version})",
+                ":: {product} :: Warning | agent version is diverged; Restart your agent via `mairu kill-agent` command. (client={client_version}, agent={agent_version})",
                 agent_version = pong.version,
                 client_version = env!("CARGO_PKG_VERSION"),
             )
