@@ -6,11 +6,11 @@ By using as a executor, you can seamlessly switch between IAM roles per-project 
 
 ## Installation
 
-* __Cargo:__ `cargo install --locked mairu` (recommended)
-- __Mise:__ `mise use -g ubi:sorah/sorah`
-- __Homebrew Tap:__ `brew install sorah/sorah/mairu` https://github.com/sorah/homebrew-sorah
-* __Binary:__ Binaries for Linux and macOS are available at https://github.com/sorah/mairu/releases
+* __Cargo:__ `cargo install --locked mairu`
+- __Mise:__ `mise use -g ubi:sorah/mairu`
+- __Homebrew Tap:__ `brew install sorah/sorah/mairu` <sup>[[https://github.com/sorah/homebrew-sorah](tap)]</sup>
 * __Arch Linux AUR:__ https://aur.archlinux.org/packages/mairu
+* __Binary:__ Binaries for Linux and macOS are available at https://github.com/sorah/mairu/releases
 
 ## Quick Introduction
 
