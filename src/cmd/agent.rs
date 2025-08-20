@@ -73,11 +73,13 @@ fn daemonize_reexec(
     // We're avoiding by re-exec(2)-ing itself to prevent the issue at all.
     //
     // See also: https://www.sealiesoftware.com/blog/archive/2017/6/5/Objective-C_and_fork_in_macOS_1013.html
-    use std::os::fd::IntoRawFd;
+    use std::os::fd::{BorrowedFd, IntoRawFd};
     use std::os::unix::process::CommandExt;
 
     let raw_fd = uds.into_raw_fd();
-    crate::os::set_cloexec(&raw_fd, false)?;
+    // SAFETY: we're borrowing the fd just to set CLOEXEC flag
+    let borrowed_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+    crate::os::set_cloexec(&borrowed_fd, false)?;
 
     let args = std::env::args()
         .skip(1)
@@ -122,12 +124,17 @@ pub async fn serve_on_path(path: std::path::PathBuf) -> Result<(), anyhow::Error
 
 #[tokio::main]
 pub async fn serve_on_fd(raw_fd: std::os::fd::RawFd) -> Result<(), anyhow::Error> {
-    use std::os::fd::FromRawFd;
+    use std::os::fd::{BorrowedFd, FromRawFd};
     tracing::info!(raw_fd = ?raw_fd, "Server starting using given fd");
-    crate::os::set_cloexec(&raw_fd, true)?;
-    // SAFETY: we validate liveness roughly by resetting O_CLOXEC
+
+    // SAFETY: we're borrowing the fd just to set flag
+    let borrowed_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+    crate::os::set_cloexec(&borrowed_fd, true)?;
+
+    // SAFETY: we validate liveness roughly by resetting O_CLOEXEC and O_NONBLOCK flags
     let uds = unsafe { std::os::unix::net::UnixListener::from_raw_fd(raw_fd) };
     uds.set_nonblocking(true)?;
+
     serve(tokio::net::UnixListener::from_std(uds)?).await
 }
 
