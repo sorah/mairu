@@ -1,8 +1,15 @@
 # Mairu
 
-Mairu is a tool to securely grant AWS credentials to command-line tools and scripts, with allowing __seamless use of multiple AWS roles and accounts__ concurrently. Mairu can retrieve credentials from __AWS SSO (AWS IAM Identity Center),__ or a credential vending server implements the Mairu API.
+Mairu is a AWS credentials manager to securely grant AWS access to command-line tools and scripts __providing a right fine-grained IAM role access to scripts and commands, per-project.__
 
-By using as a executor, you can seamlessly switch between IAM roles per-project and give explicit intent to allow a command line to access your AWS resources. Plus, Mairu's __auto role selector__ allows reading a desired IAM role from `.mairu.json` under your working directory, so you as an admin don't have to tell detailed configuration such as IAM role ARN per project to your colleagues.
+Mairu can retrieve credentials from __AWS SSO (AWS IAM Identity Center),__ or a credential vending server implements the Mairu API.
+
+## Key features
+
+- __Grant credentials explicitly via `mairu exec` command__ - instead of implicit global configuration or AWS profiles
+- __In-memory credentials storage__ - No credentials left on disk
+- __AWS SSO support__ (and you can bring your own server)
+- __Automatic role switching__ - per-workspace configuration `.mairu.json` instructs a correct IAM role to assume
 
 ## Installation
 
@@ -13,17 +20,17 @@ By using as a executor, you can seamlessly switch between IAM roles per-project 
 * __Arch Linux AUR:__ [mairu](https://aur.archlinux.org/packages/mairu), [mairu-bin](https://aur.archlinux.org/packages/mairu-bin)
 * __Binary:__ Binaries for Linux and macOS are available at https://github.com/sorah/mairu/releases
 
-## Quick Introduction
+## Get started
 
 Mairu can be used like the following cases. In any case, Mairu automatically retrieves a AWS credential for specified role and prompts user to login when server token is expired or doesn't exist yet.
 
-### Configure AWS SSO
+### 1. Configure Mairu for your AWS SSO instance
 
 ```
 $ mairu setup-sso contoso --region ${aws_sso_region} --start-url https://my-aws-sso-domain.awsapps.com/start
 ```
 
-### Use as a executor
+### 2. Use as a executor
 
 ```
 $ mairu exec --server=contoso 123456789999/AmazingAppDevelopment rails server
@@ -37,7 +44,7 @@ $ cd my-project
 $ mairu exec auto rails server
 ```
 
-### Use as a credential process provider
+### 3. Use as a credential process provider
 
 ```ini
 # ~/.aws/config
@@ -75,8 +82,6 @@ Or create by hand:
 }
 ```
 
-You may specify `--local-port` (or `.aws_sso.local_port`) to fix Authorization Code grant callback port.
-
 ### Mairu Assume Role Credentials API
 
 ```jsonc
@@ -98,8 +103,8 @@ You may specify `--local-port` (or `.aws_sso.local_port`) to fix Authorization C
         },
         "code_grant": {
             "authorization_endpoint": "...", // Omit if it is at ${url}/oauth/authorize
-            "local_port": 16624, // Optional. Static port number to listen for oauth2 redirect_uri, otherwise ephemeral port is assigned and used.
-            "use_localhost": false, // Optional, default to false. Use http://localhost for redirect_uri. Has to be true for some issuers, i.e. Microsoft (public client).
+            "local_port": 16624, // Optional. default to ephemeral port.
+            "use_localhost": false, // Optional, default to false (http://127.0.0.1). Use http://localhost for redirect_uri. Has to be true for some issuers, i.e. Microsoft (public client).
         },
         "default_grant_type": "code_grant", // Optional
     }
@@ -111,6 +116,10 @@ You may specify `--local-port` (or `.aws_sso.local_port`) to fix Authorization C
 It is recommended to use the same `id` for your entire organisation. Personal preferences can be stored in other location, so it is safe to distribute the servers.d file with MDM or something else.
 
 To learn how to prepare your credential server, continue reading at [Credential Server](#credential-server) section.
+
+### Local port for callback URL
+
+Mairu uses ephemeral port number for OAuth 2.0 callback URLs. Otherwise, you can specify `--local-port` (or `.oauth.local_port`, `.aws_sso.local_port`) to use fixed port number.
 
 ## Usage in detail
 
@@ -136,7 +145,7 @@ If your session with a credential server expired, Mairu prompts you to reauthent
 
 ### Credential provider modes
 
-Mairu supports the following methods to provide credentials to AWS SDK. Choose your best way to pass obtained credentials to your app or tools you love:
+`mairu exec` supports the following methods to provide credentials to AWS SDK. Choose your best way to pass obtained credentials to your app or tools you love:
 
 - `ecs` (default): Run ephemeral server to emulate [container provider](https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html). AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN environment variable will be exposed and supports automatic renewal.
 - `static`: Expose traditional AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN environment variables ([static credentials](https://docs.aws.amazon.com/sdkref/latest/guide/feature-static-credentials.html)). This method doesn't support automatic renewal, so you have to restart `mairu exec` when credentials have expired.
