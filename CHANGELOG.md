@@ -1,4 +1,4 @@
-## [not yet released]
+## 0.9.0
 
 ### Enhancements
 
