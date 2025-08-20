@@ -232,19 +232,19 @@ impl Server {
         };
 
         // Load client cache as .oauth when aws_sso
-        if parsed.oauth.is_none() {
-            if let Some(ref aws_sso) = parsed.aws_sso {
-                internal.aws_sso_oauth_code = AwsSsoClientRegistrationCache::try_from_file(
-                    &parsed.aws_sso_client_registration_cache_key(OAuthGrantType::Code)?,
-                )
-                .await
-                .map(|x| x.into_server_oauth(aws_sso));
-                internal.aws_sso_oauth_device = AwsSsoClientRegistrationCache::try_from_file(
-                    &parsed.aws_sso_client_registration_cache_key(OAuthGrantType::DeviceCode)?,
-                )
-                .await
-                .map(|x| x.into_server_oauth(aws_sso));
-            }
+        if parsed.oauth.is_none()
+            && let Some(ref aws_sso) = parsed.aws_sso
+        {
+            internal.aws_sso_oauth_code = AwsSsoClientRegistrationCache::try_from_file(
+                &parsed.aws_sso_client_registration_cache_key(OAuthGrantType::Code)?,
+            )
+            .await
+            .map(|x| x.into_server_oauth(aws_sso));
+            internal.aws_sso_oauth_device = AwsSsoClientRegistrationCache::try_from_file(
+                &parsed.aws_sso_client_registration_cache_key(OAuthGrantType::DeviceCode)?,
+            )
+            .await
+            .map(|x| x.into_server_oauth(aws_sso));
         }
 
         parsed.internal = Some(internal);

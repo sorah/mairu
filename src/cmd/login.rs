@@ -67,10 +67,10 @@ pub async fn do_oauth_code(
         )
     };
 
-    if let Ok(x) = std::env::var("MAIRU_LOCAL_PORT") {
-        if let Ok(i) = x.parse() {
-            local_port = Some(i);
-        }
+    if let Ok(x) = std::env::var("MAIRU_LOCAL_PORT")
+        && let Ok(i) = x.parse()
+    {
+        local_port = Some(i);
     }
 
     let (listener, url) = match crate::oauth_code::bind_tcp_for_callback(

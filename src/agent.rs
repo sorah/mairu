@@ -44,16 +44,16 @@ impl crate::proto::agent_server::Agent for Agent {
 
         let maybe_session = self.session_manager.get(query);
 
-        if !request.get_ref().no_cache {
-            if let Ok(session) = maybe_session.as_ref() {
-                let json = serde_json::to_string(&session.token.server)
-                    .map_err(|e| tonic::Status::internal(e.to_string()))?;
-                return Ok(tonic::Response::new(GetServerResponse {
-                    json,
-                    cached: true,
-                    session: Some(session.into()),
-                }));
-            }
+        if !request.get_ref().no_cache
+            && let Ok(session) = maybe_session.as_ref()
+        {
+            let json = serde_json::to_string(&session.token.server)
+                .map_err(|e| tonic::Status::internal(e.to_string()))?;
+            return Ok(tonic::Response::new(GetServerResponse {
+                json,
+                cached: true,
+                session: Some(session.into()),
+            }));
         }
 
         let session = if *check_session {
@@ -100,11 +100,11 @@ impl crate::proto::agent_server::Agent for Agent {
 
         // tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        if request.get_ref().cached {
-            if let Some(cache) = session.credential_cache.get(role) {
-                tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?cache.credentials.access_key_id, ext = ?cache.credentials.mairu, "Vending credentials from cache");
-                return Ok(tonic::Response::new(cache.credentials.as_ref().into()));
-            }
+        if request.get_ref().cached
+            && let Some(cache) = session.credential_cache.get(role)
+        {
+            tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?cache.credentials.access_key_id, ext = ?cache.credentials.mairu, "Vending credentials from cache");
+            return Ok(tonic::Response::new(cache.credentials.as_ref().into()));
         }
         tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Obtaining credentials from server");
         let session = self.ensure_session_freshness(session).await;

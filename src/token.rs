@@ -47,10 +47,9 @@ impl ServerToken {
             client_expires_at: Some(ref expiry),
             ..
         }) = self.server.oauth
+            && *expiry <= chrono::Utc::now()
         {
-            if *expiry <= chrono::Utc::now() {
-                return false;
-            }
+            return false;
         }
         true
     }
