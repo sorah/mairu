@@ -105,7 +105,10 @@ impl SessionManager {
         for item in items.iter() {
             if item.token.server.id() == token.server.id() {
                 tracing::warn!(token = ?token, "Rejecting due to a duplicate with the existing server token");
-                return Err(crate::Error::AuthError(format!("Server is duplicate or ambiguous ({}); If server id is unspecified, then specify .id in a configuration. If you have changed configuration file name for the server, then remove a existing token from agent first", token.server.id())));
+                return Err(crate::Error::AuthError(format!(
+                    "Server is duplicate or ambiguous ({}); If server id is unspecified, then specify .id in a configuration. If you have changed configuration file name for the server, then remove a existing token from agent first",
+                    token.server.id()
+                )));
             }
         }
 

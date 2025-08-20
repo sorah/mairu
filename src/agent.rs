@@ -255,10 +255,10 @@ impl crate::proto::agent_server::Agent for Agent {
         };
         tracing::debug!(flow = ?flow0.as_ref(), "Completing OAuth 2.0 Authorization Code flow...");
         let completion = match flow0.as_ref() {
-            crate::auth_flow_manager::AuthFlow::OAuthCode(ref flow) => {
+            crate::auth_flow_manager::AuthFlow::OAuthCode(flow) => {
                 flow.complete(request.into_inner()).await
             }
-            crate::auth_flow_manager::AuthFlow::AwsSsoCode(ref flow) => {
+            crate::auth_flow_manager::AuthFlow::AwsSsoCode(flow) => {
                 flow.complete(request.into_inner()).await
             }
             _ => {
@@ -345,8 +345,8 @@ impl crate::proto::agent_server::Agent for Agent {
         };
         tracing::trace!(flow = ?flow0.as_ref(), "Completing OAuth 2.0 Device Code Grant flow...");
         let completion = match flow0.as_ref() {
-            crate::auth_flow_manager::AuthFlow::OAuthDeviceCode(ref flow) => flow.complete().await,
-            crate::auth_flow_manager::AuthFlow::AwsSsoDevice(ref flow) => flow.complete().await,
+            crate::auth_flow_manager::AuthFlow::OAuthDeviceCode(flow) => flow.complete().await,
+            crate::auth_flow_manager::AuthFlow::AwsSsoDevice(flow) => flow.complete().await,
             _ => {
                 return Err(tonic::Status::invalid_argument(
                     "flow handle is not for the grant type",
@@ -529,7 +529,7 @@ impl Agent {
         };
 
         flow.mark_as_done(); // authorization codes cannot be reused, so mark as done now (whlist
-                             // later lines may fail)
+        // later lines may fail)
         self.session_manager
             .add(token)
             .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;

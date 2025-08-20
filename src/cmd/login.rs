@@ -73,14 +73,19 @@ pub async fn do_oauth_code(
         }
     }
 
-    let (listener, url) =
-        match crate::oauth_code::bind_tcp_for_callback(path, local_port, use_localhost).await {
-            Ok(t) => t,
-            Err(e) => anyhow::bail!(
-                "Failed to bind TCP server for OAuth 2.0 callback acceptance, perhaps there is concurrent mairu-exec call waitng for login, or occupied by oher process; {}",
-                e
-            ),
-        };
+    let (listener, url) = match crate::oauth_code::bind_tcp_for_callback(
+        path,
+        local_port,
+        use_localhost,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => anyhow::bail!(
+            "Failed to bind TCP server for OAuth 2.0 callback acceptance, perhaps there is concurrent mairu-exec call waitng for login, or occupied by oher process; {}",
+            e
+        ),
+    };
 
     let session = agent
         .initiate_oauth_code(crate::proto::InitiateOAuthCodeRequest {

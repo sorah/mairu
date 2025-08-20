@@ -43,7 +43,11 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
     match &cli.command {
         Commands::Agent(a) => {
             if let Ok(l) = std::env::var("MAIRU_AGENT_LOG") {
-                std::env::set_var("MAIRU_LOG", l);
+                // SAFETY: Called during program initialization in single-threaded context
+                // before any threads are spawned.
+                unsafe {
+                    std::env::set_var("MAIRU_LOG", l);
+                }
             }
             if a.log_to_file {
                 enable_log(LogType::File)
@@ -88,15 +92,27 @@ fn enable_log(kind: LogType) {
     let rust_log = std::env::var_os("RUST_LOG");
 
     #[cfg(not(debug_assertions))]
-    std::env::remove_var("RUST_LOG");
+    // SAFETY: Called during program initialization in single-threaded context
+    // before any threads are spawned.
+    unsafe {
+        std::env::remove_var("RUST_LOG");
+    }
 
     if let Ok(l) = std::env::var("MAIRU_LOG") {
-        std::env::set_var("RUST_LOG", l);
+        // SAFETY: Called during program initialization in single-threaded context
+        // before any threads are spawned.
+        unsafe {
+            std::env::set_var("RUST_LOG", l);
+        }
     }
     match kind {
         LogType::Default => {
             if std::env::var_os("RUST_LOG").is_none() {
-                std::env::set_var("RUST_LOG", "mairu=info");
+                // SAFETY: Called during program initialization in single-threaded context
+                // before any threads are spawned.
+                unsafe {
+                    std::env::set_var("RUST_LOG", "mairu=info");
+                }
             }
             tracing_subscriber::fmt::init();
         }
@@ -108,7 +124,11 @@ fn enable_log(kind: LogType) {
         }
         LogType::File => {
             if std::env::var_os("RUST_LOG").is_none() {
-                std::env::set_var("RUST_LOG", "mairu=info");
+                // SAFETY: Called during program initialization in single-threaded context
+                // before any threads are spawned.
+                unsafe {
+                    std::env::set_var("RUST_LOG", "mairu=info");
+                }
             }
             let log_dir = mairu::config::log_dir_mkpath().expect("can't create log directory");
             nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o077).unwrap());
@@ -121,8 +141,16 @@ fn enable_log(kind: LogType) {
     }
 
     if let Some(v) = rust_log {
-        std::env::set_var("RUST_LOG", v);
+        // SAFETY: Called during program initialization in single-threaded context
+        // before any threads are spawned.
+        unsafe {
+            std::env::set_var("RUST_LOG", v);
+        }
     } else {
-        std::env::remove_var("RUST_LOG");
+        // SAFETY: Called during program initialization in single-threaded context
+        // before any threads are spawned.
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+        }
     }
 }

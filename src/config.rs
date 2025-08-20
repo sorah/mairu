@@ -209,9 +209,9 @@ impl Server {
             }
             std::cmp::Ordering::Greater => {
                 return Err(crate::Error::UserError(format!(
-                "server is ambiguous (multiple configuration for the same URL found, use .id to specify): {}",
-                query
-            )));
+                    "server is ambiguous (multiple configuration for the same URL found, use .id to specify): {}",
+                    query
+                )));
             }
             std::cmp::Ordering::Less => {}
         }

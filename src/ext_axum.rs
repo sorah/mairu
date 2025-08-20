@@ -46,7 +46,7 @@ where
         let query_value = match query_values_maybe {
             Ok(vs) => Some(vs),
             Err(ExtractBearerRejection::Unambiguous) => {
-                return Err(ExtractBearerRejection::Unambiguous)
+                return Err(ExtractBearerRejection::Unambiguous);
             }
             Err(ExtractBearerRejection::Error(_)) => {
                 unreachable!("ExtractBearerRejection::Error shouldn't appear at this point")
@@ -94,7 +94,9 @@ where
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ExtractBearerRejection {
     /// no bearer token was given
-    #[error("bearer token was missing, must be given through Authorization header or access_token query parameter")]
+    #[error(
+        "bearer token was missing, must be given through Authorization header or access_token query parameter"
+    )]
     Missing,
     /// multiple tokens were given, had to decline per [RFC 6750 Section 2.](https://datatracker.ietf.org/doc/html/rfc6750#section-2)
     #[error("multiple bearer tokens were given")]

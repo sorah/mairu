@@ -209,7 +209,7 @@ impl std::fmt::Display for TrustDigest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use base64::Engine;
         let hash = match self {
-            TrustDigest::Sha384 { ref hash } => hash,
+            TrustDigest::Sha384 { hash } => hash,
         };
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
         write!(f, "{b64}")
