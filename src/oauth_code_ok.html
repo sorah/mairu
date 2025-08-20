@@ -4,11 +4,29 @@
     <!--  HTML <head> to supress favicon.ico request -->
     <link rel="icon" href="data:;base64,iVBORw0KGgo=">
     <style>
+      :root {
+        --mairu-bg-color: #ffffff;
+        --mairu-text-color: #000000;
+        --mairu-footer-color: #767676;
+        --mairu-link-color: #0066cc;
+      }
+      
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --mairu-bg-color: #1a1a1a;
+          --mairu-text-color: #e0e0e0;
+          --mairu-footer-color: #a0a0a0;
+          --mairu-link-color: #66b3ff;
+        }
+      }
+      
       body, p {
         font-family: sans-serif;
       }
       body {
         text-align: center;
+        background-color: var(--mairu-bg-color);
+        color: var(--mairu-text-color);
       }
       main {
         width: 450px;
@@ -23,8 +41,11 @@
         font-size: 16px;
       }
       main footer p {
-        color: #767676;
+        color: var(--mairu-footer-color);
         font-size: 12px;
+      }
+      a {
+        color: var(--mairu-link-color);
       }
     </style>
   </head>
