@@ -153,6 +153,7 @@ pub fn serve_on_path_daemon(path: std::path::PathBuf) -> Result<(), anyhow::Erro
 pub async fn serve_on_path_daemon2(
     uds: std::os::unix::net::UnixListener,
 ) -> Result<(), anyhow::Error> {
+    uds.set_nonblocking(true)?;
     serve(tokio::net::UnixListener::from_std(uds)?).await
 }
 
