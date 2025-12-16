@@ -107,7 +107,8 @@ jobs:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
 
   publish-crate:
-    needs: create-release
+    # Publish to crates.io at very last step, as other upload-* can fail, but reverting a crate publish can be complicated.
+    needs: [create-release, upload-binaries, upload-debs]
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
