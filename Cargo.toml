@@ -50,6 +50,7 @@ base64ct = { version = "1.8.1", features = ["alloc", "std"] }
 cfg-if = "1.0.4"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.53", features = ["cargo", "derive", "env"] }
+clap_complete = { version = "4.5.61", features = ["unstable-dynamic"] }
 daemonize = { version = "0.1.0", package = "daemonix" } # https://rustsec.org/advisories/RUSTSEC-2025-0069
 futures = "0.3.31"
 futures-core = "0.3.31"

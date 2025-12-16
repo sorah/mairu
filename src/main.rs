@@ -37,7 +37,9 @@ enum Commands {
 }
 
 fn main() -> Result<std::process::ExitCode, anyhow::Error> {
+    use clap::CommandFactory;
     use clap::Parser;
+    clap_complete::env::CompleteEnv::with_factory(|| Cli::command()).complete();
     let cli = Cli::parse();
 
     match &cli.command {
