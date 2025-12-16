@@ -1,4 +1,5 @@
 name: ci
+
 on: 
   push:
     branches: [main,ci]
@@ -6,34 +7,8 @@ on:
       - 'v[0-9]+.*'
   pull_request:
 
-env:
-  MACOSX_DEPLOYMENT_TARGET: '11.0' # Big Sur, first macOS release with Apple Silicon support
-
 jobs:
   test:
-    name: cargo test
-    runs-on: "${{ matrix.os || 'ubuntu-latest' }}"
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            features: "rustls"
-          - target: aarch64-apple-darwin
-            os: macos-latest
-    steps:
-      - run: sudo apt-get install -y musl-tools
-        if: "${{ contains(matrix.target, '-musl') }}"
-      - run: sudo apt-get install -y protobuf-compiler
-        if: "${{ contains(matrix.target, '-linux-') }}"
-      - run: brew install protobuf
-        if: "${{ contains(matrix.target, '-apple-darwin') }}"
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: "${{ matrix.target }}"
-      - run: "cargo test --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features || 'default' }}"
-      - run: "cargo build --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features || 'default' }}"
+    uses: ./.github/workflows/_test.yml
+    with:
+      build: true
