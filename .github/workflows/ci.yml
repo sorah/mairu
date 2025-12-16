@@ -3,8 +3,6 @@ name: ci
 on: 
   push:
     branches: [main,ci]
-    tags:
-      - 'v[0-9]+.*'
   pull_request:
 
 jobs:
