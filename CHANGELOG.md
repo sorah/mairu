@@ -1,5 +1,7 @@
 ## [not yet released]
 
+## 0.10.0
+
 ### Enhancements
 
 - exec: Recognises `$MAIRU_SERVER` environment variable in addition to `--server` CLI argument  [#38](https://github.com/sorah/mairu/pull/38)
@@ -9,6 +11,7 @@
 - Rust edition upgraded to 2024 [#34](https://github.com/sorah/mairu/pull/34)
 - Rolled Rust dependencies to latest versions (16 Dec 2025) [#35](https://github.com/sorah/mairu/pull/35)
 - `daemonize` crate used for daemonizing agent process was replaced with `daemonix` due to [RUSTSEC-2025-0069](https://rustsec.org/advisories/RUSTSEC-2025-0069) [#37](https://github.com/sorah/mairu/pull/37)
+- https://crates.io/crates/mairu now published via GitHub Actions and Trusted Publishing [#40](https://github.com/sorah/mairu/pull/40)
 
 ## 0.9.0
 
