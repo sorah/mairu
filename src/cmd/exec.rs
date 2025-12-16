@@ -7,7 +7,7 @@ pub struct ExecArgs {
     role: String,
 
     /// Credential server ID or URL to use. Not required when using 'auto' role.
-    #[arg(long)]
+    #[arg(long, env = "MAIRU_SERVER")]
     server: Option<String>,
 
     /// Disable credential cache on mairu agent. Implies --no-auto-refresh.
