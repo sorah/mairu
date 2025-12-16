@@ -807,7 +807,7 @@ mod executor {
 
 #[cfg(unix)]
 fn start_ignoring_signals() {
-    use nix::sys::signal::{SigHandler, Signal, signal};
+    use nix::sys::signal::{signal, SigHandler, Signal};
     if let Err(e) = unsafe { signal(Signal::SIGINT, SigHandler::SigIgn) } {
         tracing::warn!(err = ?e, "failed to ignore SIGINT")
     }
