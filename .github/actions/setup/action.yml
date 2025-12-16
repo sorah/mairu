@@ -1,0 +1,27 @@
+name: setup
+
+inputs:
+  target:
+    description: ''
+    required: true
+  rust-toolchain:
+    description: ''
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - run: sudo apt-get install -y musl-tools
+      shell: bash
+      if: "${{ contains(inputs.target, '-musl') }}"
+    - run: sudo apt-get install -y protobuf-compiler
+      shell: bash
+      if: "${{ contains(inputs.target, '-linux-') }}"
+    - run: brew install protobuf
+      shell: bash
+      if: "${{ contains(inputs.target, '-apple-darwin') }}"
+    - uses: dtolnay/rust-toolchain@stable
+      if: "${{ inputs.rust-toolchain == 'true' }}"
+      with:
+        targets: "${{ inputs.target }}"

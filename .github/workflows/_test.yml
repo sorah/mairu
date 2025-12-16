@@ -1,0 +1,48 @@
+name: Test
+
+on:
+  workflow_call:
+    inputs:
+      build:
+        description: 'Whether to run cargo build'
+        required: false
+        type: boolean
+        default: false
+
+
+env:
+  MACOSX_DEPLOYMENT_TARGET: '11.0' # Big Sur, first macOS release with Apple Silicon support
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: "${{ matrix.os || 'ubuntu-latest' }}"
+    strategy:
+      fail-fast: false
+      matrix: &matrix
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            features: "rustls"
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with: { target: "${{ matrix.target }}" }
+      - run: "cargo test --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features || 'default' }}"
+
+  build:
+    if: ${{ inputs.build }}
+    name: cargo build
+    runs-on: "${{ matrix.os || 'ubuntu-latest' }}"
+    strategy:
+      fail-fast: false
+      matrix: *matrix
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with: { target: "${{ matrix.target }}" }
+      - run: "cargo build --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features || 'default' }}"
