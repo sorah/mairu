@@ -86,40 +86,81 @@ impl crate::proto::agent_server::Agent for Agent {
 
         let query = &request.get_ref().server_id;
         let role = &request.get_ref().role;
+        let assume_role_arn = &request.get_ref().assume_role_arn;
         let Ok(session) = self.session_manager.get(query) else {
             if let Err(e) = crate::config::Server::find_from_fs(query).await {
-                tracing::warn!(server_id = ?query, role = ?role, err = ?e, "requested server doesn't exist or is invalid");
+                tracing::warn!(server_id = ?query, role = ?role, assume_role_arn = ?assume_role_arn, err = ?e, "requested server doesn't exist or is invalid");
                 return Err(tonic::Status::not_found(
                     "requested server doesn't exist or is invalid",
                 ));
             } else {
-                tracing::warn!(server_id = ?query, role = ?role, "session doesn't exist, require authentication");
+                tracing::warn!(server_id = ?query, role = ?role, assume_role_arn = ?assume_role_arn, "session doesn't exist, require authentication");
                 return Err(tonic::Status::unauthenticated("authentication needed"));
             }
+        };
+
+        let cache_key = if assume_role_arn.is_empty() {
+            role.to_string()
+        } else {
+            format!("{}::{}", role, assume_role_arn)
         };
 
         // tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         if request.get_ref().cached
-            && let Some(cache) = session.credential_cache.get(role)
+            && let Some(cache) = session.credential_cache.get(&cache_key)
         {
-            tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?cache.credentials.access_key_id, ext = ?cache.credentials.mairu, "Vending credentials from cache");
+            tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, assume_role_arn = ?assume_role_arn, aws_access_key_id = ?cache.credentials.access_key_id, ext = ?cache.credentials.mairu, "Vending credentials from cache");
             return Ok(tonic::Response::new(cache.credentials.as_ref().into()));
         }
-        tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Obtaining credentials from server");
+        tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, assume_role_arn = ?assume_role_arn, "Obtaining credentials from server");
         let session = self.ensure_session_freshness(session).await;
         let client = crate::client::make_credential_vendor(&session).map_err(|e| {
-            tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, err = ?e, "Failed to make_credential_vendor");
+            tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, assume_role_arn = ?assume_role_arn, err = ?e, "Failed to make_credential_vendor");
             tonic::Status::internal(e.to_string())
         })?;
 
         match client.assume_role(role).await {
-            Ok(r) => {
+            Ok(base_creds) => {
+                // Perform AssumeRole chain if requested
+                let final_creds = if !assume_role_arn.is_empty() {
+                    let region = session
+                        .token
+                        .server
+                        .aws_sso
+                        .as_ref()
+                        .map(|sso| sso.region.as_str())
+                        .unwrap_or("us-east-1");
+
+                    match crate::sts_assume_role::perform_assume_role_chain(
+                        region,
+                        base_creds,
+                        assume_role_arn,
+                    )
+                    .await
+                    {
+                        Ok(chained_creds) => chained_creds,
+                        Err(e) => {
+                            tracing::error!(
+                                server_id = ?session.token.server.id(),
+                                server_url = %session.token.server.url,
+                                role = ?role,
+                                assume_role_arn = ?assume_role_arn,
+                                err = ?e,
+                                "AssumeRole chain failed"
+                            );
+                            return Err(Self::map_error_to_status(e));
+                        }
+                    }
+                } else {
+                    base_creds
+                };
+
                 if request.get_ref().cached {
-                    session.credential_cache.store(role.to_owned(), &r);
+                    session.credential_cache.store(cache_key, &final_creds);
                 }
-                tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?r.access_key_id, ext = ?r.mairu, "Vending credentials from server");
-                Ok(tonic::Response::new((&r).into()))
+                tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, assume_role_arn = ?assume_role_arn, aws_access_key_id = ?final_creds.access_key_id, ext = ?final_creds.mairu, "Vending credentials from server");
+                Ok(tonic::Response::new((&final_creds).into()))
             }
             Err(crate::Error::RemoteError(crate::client::Error::InvalidArgument(message, _))) => {
                 Err(tonic::Status::invalid_argument(message))
@@ -499,6 +540,31 @@ impl crate::proto::agent_server::Agent for Agent {
 }
 
 impl Agent {
+    /// Map crate::Error to tonic::Status for gRPC responses
+    fn map_error_to_status(err: crate::Error) -> tonic::Status {
+        match err {
+            crate::Error::RemoteError(crate::client::Error::InvalidArgument(message, _)) => {
+                tonic::Status::invalid_argument(message)
+            }
+            crate::Error::RemoteError(crate::client::Error::Unauthenticated(message, _)) => {
+                tonic::Status::unauthenticated(message)
+            }
+            crate::Error::RemoteError(crate::client::Error::PermissionDenied(message, _)) => {
+                tonic::Status::permission_denied(message)
+            }
+            crate::Error::RemoteError(crate::client::Error::ResourceExhausted(message, _)) => {
+                tonic::Status::resource_exhausted(message)
+            }
+            crate::Error::RemoteError(crate::client::Error::NotFound(message, _)) => {
+                tonic::Status::not_found(message)
+            }
+            crate::Error::RemoteError(crate::client::Error::Unknown(message, _)) => {
+                tonic::Status::unknown(message)
+            }
+            e => tonic::Status::unknown(e.to_string()),
+        }
+    }
+
     fn accept_completed_auth_flow(
         &self,
         flow: crate::auth_flow_manager::AuthFlowRetrieval,

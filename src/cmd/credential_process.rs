@@ -7,6 +7,10 @@ pub struct CredentialProcessArgs {
     /// For AWS SSO servers, this is formatted like "${account_id}/${permission_set_name}"
     role: String,
 
+    /// AssumeRole ARN to assume after getting credentials from the server.
+    #[arg(long)]
+    assume_role: Option<String>,
+
     /// Disable credential cache on mairu agent.
     #[arg(long, default_value_t = false)]
     no_cache: bool,
@@ -21,6 +25,7 @@ pub async fn run(args: &CredentialProcessArgs) -> Result<(), anyhow::Error> {
             server_id: args.server.clone(),
             role: args.role.clone(),
             cached: !args.no_cache,
+            assume_role_arn: args.assume_role.clone().unwrap_or_default(),
         })
         .await;
 

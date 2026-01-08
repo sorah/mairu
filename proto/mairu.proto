@@ -61,6 +61,7 @@ message AssumeRoleRequest {
   string server_id = 1;
   string role = 2;
   bool cached = 3;
+  string assume_role_arn = 4;
 }
 message AssumeRoleResponse {
   Credentials credentials = 1;

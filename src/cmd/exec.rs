@@ -10,6 +10,11 @@ pub struct ExecArgs {
     #[arg(long, env = "MAIRU_SERVER")]
     server: Option<String>,
 
+    /// AssumeRole ARN to assume after getting credentials from the server.
+    /// This enables role chaining for cross-account or privilege escalation scenarios.
+    #[arg(long)]
+    assume_role: Option<String>,
+
     /// Disable credential cache on mairu agent. Implies --no-auto-refresh.
     #[arg(long, default_value_t = false)]
     no_cache: bool,
@@ -262,6 +267,11 @@ async fn resolve_auto(args: &mut ExecArgs) -> Result<(), anyhow::Error> {
     //   args.mode = auto.inner.mode
     //}
 
+    // Set assume_role if not already specified via CLI
+    if args.assume_role.is_none() {
+        args.assume_role = auto.inner.assume_role.clone();
+    }
+
     if args.show_auto {
         crate::terminal::send(&indoc::formatdoc! {"
             :: {product} :: Using server={server:?} role={role:?}
@@ -362,6 +372,7 @@ async fn preflight_check(
         server_id: args.server.as_ref().unwrap().to_owned(),
         role: args.role.clone(),
         cached: !args.no_cache,
+        assume_role_arn: args.assume_role.clone().unwrap_or_default(),
     };
     let mut resp = assume_role_with_long_attempt_notice(agent, req.clone()).await;
 
@@ -491,6 +502,7 @@ mod provider {
                 server_id: args.server.as_ref().unwrap().to_owned(),
                 role: args.role.clone(),
                 cached: !args.no_cache,
+                assume_role_arn: args.assume_role.clone().unwrap_or_default(),
             },
             ExecEcsUserFeedback::from(args),
         );
@@ -571,6 +583,7 @@ mod provider {
                 server_id: args.server.as_ref().unwrap().to_owned(),
                 role: args.role.clone(),
                 cached: !args.no_cache,
+                assume_role_arn: args.assume_role.clone().unwrap_or_default(),
             })
             .await?
             .into_inner();
@@ -725,6 +738,7 @@ mod auto_refresh {
             server_id: args.server.as_ref().unwrap().to_owned(),
             role: args.role.clone(),
             cached: true,
+            assume_role_arn: args.assume_role.clone().unwrap_or_default(),
         };
         let resp = match agent.assume_role(req.clone()).await {
             Ok(r) => r.into_inner(),

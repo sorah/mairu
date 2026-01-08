@@ -11,6 +11,7 @@ pub struct AutoData {
     pub server: String,
     pub role: String,
     pub mode: Option<crate::config::ProviderMode>,
+    pub assume_role: Option<String>,
 }
 
 impl Auto {

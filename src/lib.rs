@@ -24,6 +24,7 @@ pub mod oauth_refresh_token;
 pub mod api_client;
 pub mod awssso_client;
 pub mod client;
+pub mod sts_assume_role;
 
 pub mod auth_flow_manager;
 pub mod credential_cache;
