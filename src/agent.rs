@@ -100,7 +100,7 @@ impl crate::proto::agent_server::Agent for Agent {
         };
 
         let cache_key = if assume_role_arn.is_empty() {
-            role.to_string()
+            role.to_owned()
         } else {
             format!("{}::{}", role, assume_role_arn)
         };

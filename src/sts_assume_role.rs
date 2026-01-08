@@ -1,40 +1,12 @@
-/// AssumeRole chain implementation using AWS STS
-///
-/// This module provides functionality to perform sts:AssumeRole after obtaining
-/// base credentials from AWS SSO or other credential sources.
+//! STS AssumeRole chain for cross-account access or privilege escalation.
 
-/// # Arguments
-///
-/// * `region` - AWS region for the STS API call (typically from AWS SSO configuration)
-/// * `base_credentials` - Credentials obtained from the credential server
-/// * `target_role_arn` - ARN of the IAM role to assume (e.g., `arn:aws:iam::123456789012:role/RoleName`)
-///
-/// # Returns
-///
-/// Returns temporary credentials for the target role.
-///
-/// # Errors
-///
-/// Returns `crate::Error` if:
-/// - STS AssumeRole API call fails (e.g., AccessDenied, InvalidClientTokenId)
-/// - Base credentials are expired or invalid
-/// - Target role ARN is malformed
-/// - Trust policy doesn't allow the base role to assume the target role
-/// - Response parsing fails
-///
-/// # Session Name
-///
-/// The role session is created with an auto-generated name in the format `mairu-{YYYYMMDDHHMMSS}`.
-/// This appears in CloudTrail logs and can be used for auditing.
+/// Perform sts:AssumeRole using base credentials to obtain credentials for a target role.
 pub(crate) async fn perform_assume_role_chain(
     region: &str,
     base_credentials: crate::client::AssumeRoleResponse,
     target_role_arn: &str,
 ) -> crate::Result<crate::client::AssumeRoleResponse> {
-    // Create STS client with base credentials
     let sts = create_sts_client(region, &base_credentials).await;
-
-    // Generate session name
     let session_name = generate_session_name();
 
     tracing::debug!(
@@ -44,17 +16,16 @@ pub(crate) async fn perform_assume_role_chain(
         "Performing AssumeRole chain"
     );
 
-    // Call AssumeRole API
     let resp = sts
         .assume_role()
         .role_arn(target_role_arn)
         .role_session_name(session_name)
-        .duration_seconds(3600) // 1 hour (maximum for role chaining)
+        // Role chaining has a maximum duration of 1 hour (AWS limitation)
+        .duration_seconds(3600)
         .send()
         .await
         .map_err(|e| sdk_error_to_crate_error("AssumeRole", e))?;
 
-    // Extract credentials from response
     let creds = resp.credentials().ok_or_else(|| {
         crate::Error::RemoteError(crate::client::Error::Unknown(
             "STS AssumeRole returned empty credentials".to_string(),
@@ -62,18 +33,14 @@ pub(crate) async fn perform_assume_role_chain(
         ))
     })?;
 
-    // Parse expiration timestamp (aws_smithy_types::DateTime -> chrono::DateTime)
-    // Note: Different from awssso_client.rs which uses from_timestamp_millis().
-    // STS returns DateTime type (not i64 millis), so we convert via as_secs_f64().
-    let epoch_secs = creds.expiration().as_secs_f64();
-    let secs = epoch_secs.floor() as i64;
-    let nsecs = ((epoch_secs - secs as f64) * 1_000_000_000.0) as u32;
-    let expiration = chrono::DateTime::from_timestamp(secs, nsecs).ok_or_else(|| {
-        crate::Error::UnknownError(format!(
-            "Failed to parse expiration timestamp: {}",
-            creds.expiration()
-        ))
-    })?;
+    let exp = creds.expiration();
+    let expiration = chrono::DateTime::from_timestamp(exp.secs(), exp.subsec_nanos())
+        .ok_or_else(|| {
+            crate::Error::UnknownError(format!(
+                "Failed to parse expiration timestamp: {}",
+                exp
+            ))
+        })?;
 
     tracing::debug!(
         target_role_arn = target_role_arn,
@@ -82,7 +49,6 @@ pub(crate) async fn perform_assume_role_chain(
         "AssumeRole chain completed successfully"
     );
 
-    // Convert to AssumeRoleResponse
     Ok(crate::client::AssumeRoleResponse {
         version: 1,
         access_key_id: creds.access_key_id().to_owned(),
@@ -93,20 +59,13 @@ pub(crate) async fn perform_assume_role_chain(
     })
 }
 
-/// Generate session name in the format: mairu-{timestamp}-{random}
-///
-/// AWS session name requirements:
-/// - Length: 2-64 characters
-/// - Pattern: `[\w+=,.@-]+`
-///
-/// Format: `mairu-{YYYYMMDDHHMMSS}-{hex}` (e.g., `mairu-20260108100639-a3f`)
+/// Session name appears in CloudTrail logs for auditing.
 fn generate_session_name() -> String {
     let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
     let random: u16 = rand::random();
     format!("mairu-{}-{:x}", timestamp, random)
 }
 
-/// Create STS client with the given credentials
 async fn create_sts_client(
     region: &str,
     credentials: &crate::client::AssumeRoleResponse,
@@ -125,6 +84,7 @@ async fn create_sts_client(
         .await
         .to_builder()
         .region(Some(aws_config::Region::new(region.to_owned())))
+        // Disable cache to always use the provided credentials
         .identity_cache(aws_config::identity::IdentityCache::no_cache())
         .credentials_provider(aws_sdk_sts::config::SharedCredentialsProvider::new(creds))
         .build();
@@ -132,19 +92,7 @@ async fn create_sts_client(
     aws_sdk_sts::Client::new(&config)
 }
 
-/// Map AWS STS SDK errors to crate::Error
-///
-/// This follows the same pattern as `awssso_client::sdk_error_to_crate_error`,
-/// but maps STS-specific error codes.
-///
-/// Mapped error codes:
-/// - `AccessDeniedException` → `PermissionDenied`
-/// - `ExpiredTokenException` → `Unauthenticated`
-/// - `InvalidClientTokenId` → `Unauthenticated`
-/// - `MalformedPolicyDocumentException` → `InvalidArgument`
-/// - `PackedPolicyTooLargeException` → `InvalidArgument`
-/// - `RegionDisabledException` → `InvalidArgument`
-/// - Other errors → `Unknown`
+/// Maps STS SDK errors to crate::Error, following awssso_client pattern.
 fn sdk_error_to_crate_error<E, R>(
     context: &str,
     err: aws_sdk_sts::error::SdkError<E, R>,
@@ -199,11 +147,11 @@ where
 
     match_map_error! {
         err,
-        "AccessDeniedException" => PermissionDenied,
+        "AccessDenied" => PermissionDenied,
         "ExpiredTokenException" => Unauthenticated,
         "InvalidClientTokenId" => Unauthenticated,
-        "MalformedPolicyDocumentException" => InvalidArgument,
-        "PackedPolicyTooLargeException" => InvalidArgument,
+        "MalformedPolicyDocument" => InvalidArgument,
+        "PackedPolicyTooLarge" => InvalidArgument,
         "RegionDisabledException" => InvalidArgument,
     }
 }
@@ -216,16 +164,13 @@ mod tests {
     fn test_generate_session_name() {
         let name = generate_session_name();
         assert!(name.starts_with("mairu-"));
-        assert!(name.len() >= 22); // "mairu-" (6) + 14 digits + "-" + hex (1-4 chars)
         assert!(name.len() <= 64); // AWS session name limit
 
-        // Check format: mairu-{14 digits}-{hex}
         let parts: Vec<&str> = name.split('-').collect();
-        assert_eq!(parts.len(), 3, "Expected 3 parts separated by '-'");
+        assert_eq!(parts.len(), 3);
         assert_eq!(parts[0], "mairu");
-        assert_eq!(parts[1].len(), 14, "Timestamp should be 14 digits");
-        assert!(parts[1].chars().all(|c| c.is_ascii_digit()), "Timestamp should be all digits");
-        assert!(parts[2].chars().all(|c| c.is_ascii_hexdigit()), "Random suffix should be hexadecimal");
+        assert_eq!(parts[1].len(), 14);
+        assert!(parts[1].chars().all(|c| c.is_ascii_digit()));
+        assert!(parts[2].chars().all(|c| c.is_ascii_hexdigit()));
     }
-
 }
