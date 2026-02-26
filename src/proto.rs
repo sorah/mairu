@@ -26,6 +26,26 @@ impl Session {
     }
 }
 
+impl AssumeRoleRequest {
+    pub fn rolespec(&self) -> Rolespec {
+        match self.query {
+            Some(assume_role_request::Query::Role(ref role)) => Rolespec { role: role.clone() },
+            Some(assume_role_request::Query::Rolespec(ref rs)) => rs.clone(),
+            None => Rolespec {
+                role: String::new(),
+            },
+        }
+    }
+
+    pub fn with_role(server_id: String, role: String, cached: bool) -> Self {
+        Self {
+            server_id,
+            query: Some(assume_role_request::Query::Role(role)),
+            cached,
+        }
+    }
+}
+
 impl ExecEnvironment {
     pub(crate) unsafe fn apply(&self) {
         for name in self.remove_vars.iter() {

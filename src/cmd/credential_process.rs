@@ -17,11 +17,11 @@ pub async fn run(args: &CredentialProcessArgs) -> Result<(), anyhow::Error> {
     let mut agent = crate::cmd::agent::connect_or_start().await?;
 
     let resp = agent
-        .assume_role(crate::proto::AssumeRoleRequest {
-            server_id: args.server.clone(),
-            role: args.role.clone(),
-            cached: !args.no_cache,
-        })
+        .assume_role(crate::proto::AssumeRoleRequest::with_role(
+            args.server.clone(),
+            args.role.clone(),
+            !args.no_cache,
+        ))
         .await;
 
     match resp {

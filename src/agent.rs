@@ -85,7 +85,8 @@ impl crate::proto::agent_server::Agent for Agent {
         use crate::client::CredentialVendor;
 
         let query = &request.get_ref().server_id;
-        let role = &request.get_ref().role;
+        let rolespec = request.get_ref().rolespec();
+        let role = &rolespec.role;
         let Ok(session) = self.session_manager.get(query) else {
             if let Err(e) = crate::config::Server::find_from_fs(query).await {
                 tracing::warn!(server_id = ?query, role = ?role, err = ?e, "requested server doesn't exist or is invalid");
@@ -384,7 +385,6 @@ impl crate::proto::agent_server::Agent for Agent {
         //        e,
         //    ))
         //})?;
-
 
         server.ensure_aws_sso_oauth_client_registration(force, crate::config::OAuthGrantType::Code)
             .await

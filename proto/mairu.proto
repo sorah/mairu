@@ -57,9 +57,16 @@ message GetServerResponse {
   Session session = 3;
 }
 
+message Rolespec {
+  string role = 1;
+}
+
 message AssumeRoleRequest {
   string server_id = 1;
-  string role = 2;
+  oneof query {
+    string role = 2;
+    Rolespec rolespec = 4;
+  }
   bool cached = 3;
 }
 message AssumeRoleResponse {

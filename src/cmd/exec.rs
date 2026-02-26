@@ -358,11 +358,11 @@ async fn preflight_check(
     agent: &mut crate::agent::AgentConn,
     args: &ExecArgs,
 ) -> Result<Option<crate::proto::AssumeRoleResponse>, anyhow::Error> {
-    let req = crate::proto::AssumeRoleRequest {
-        server_id: args.server.as_ref().unwrap().to_owned(),
-        role: args.role.clone(),
-        cached: !args.no_cache,
-    };
+    let req = crate::proto::AssumeRoleRequest::with_role(
+        args.server.as_ref().unwrap().to_owned(),
+        args.role.clone(),
+        !args.no_cache,
+    );
     let mut resp = assume_role_with_long_attempt_notice(agent, req.clone()).await;
 
     if let Err(ref e) = resp {
@@ -487,11 +487,11 @@ mod provider {
         let (listener, url) = crate::ecs_server::bind_tcp(None).await?;
         let server = crate::ecs_server::EcsServer::new_with_agent(
             agent.clone(),
-            crate::proto::AssumeRoleRequest {
-                server_id: args.server.as_ref().unwrap().to_owned(),
-                role: args.role.clone(),
-                cached: !args.no_cache,
-            },
+            crate::proto::AssumeRoleRequest::with_role(
+                args.server.as_ref().unwrap().to_owned(),
+                args.role.clone(),
+                !args.no_cache,
+            ),
             ExecEcsUserFeedback::from(args),
         );
         let environment = {
@@ -567,11 +567,11 @@ mod provider {
         args: &ExecArgs,
     ) -> Result<crate::proto::ExecEnvironment, anyhow::Error> {
         let resp = agent
-            .assume_role(crate::proto::AssumeRoleRequest {
-                server_id: args.server.as_ref().unwrap().to_owned(),
-                role: args.role.clone(),
-                cached: !args.no_cache,
-            })
+            .assume_role(crate::proto::AssumeRoleRequest::with_role(
+                args.server.as_ref().unwrap().to_owned(),
+                args.role.clone(),
+                !args.no_cache,
+            ))
             .await?
             .into_inner();
         let creds = resp
@@ -721,11 +721,11 @@ mod auto_refresh {
         agent: &mut crate::agent::AgentConn,
         args: &ExecArgs,
     ) -> crate::Result<Option<chrono::DateTime<chrono::Utc>>> {
-        let req = crate::proto::AssumeRoleRequest {
-            server_id: args.server.as_ref().unwrap().to_owned(),
-            role: args.role.clone(),
-            cached: true,
-        };
+        let req = crate::proto::AssumeRoleRequest::with_role(
+            args.server.as_ref().unwrap().to_owned(),
+            args.role.clone(),
+            true,
+        );
         let resp = match agent.assume_role(req.clone()).await {
             Ok(r) => r.into_inner(),
             Err(e) => {
@@ -807,7 +807,7 @@ mod executor {
 
 #[cfg(unix)]
 fn start_ignoring_signals() {
-    use nix::sys::signal::{signal, SigHandler, Signal};
+    use nix::sys::signal::{SigHandler, Signal, signal};
     if let Err(e) = unsafe { signal(Signal::SIGINT, SigHandler::SigIgn) } {
         tracing::warn!(err = ?e, "failed to ignore SIGINT")
     }
