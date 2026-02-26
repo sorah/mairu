@@ -15,6 +15,18 @@ pub struct CredentialProcessArgs {
     /// to assume a different role ARN using the obtained credentials.
     #[arg(long)]
     assume_role: Option<String>,
+
+    /// Override role session name for sts:AssumeRole (used with --assume-role).
+    #[arg(long)]
+    assume_role_session_name: Option<String>,
+
+    /// Override duration in seconds for sts:AssumeRole (used with --assume-role).
+    #[arg(long)]
+    assume_role_duration_seconds: Option<i32>,
+
+    /// External ID for sts:AssumeRole (used with --assume-role).
+    #[arg(long)]
+    assume_role_external_id: Option<String>,
 }
 
 #[tokio::main]
@@ -25,7 +37,12 @@ pub async fn run(args: &CredentialProcessArgs) -> Result<(), anyhow::Error> {
         Some(ref assume_role) => Some(crate::proto::assume_role_request::Query::Rolespec(
             crate::proto::Rolespec {
                 role: args.role.clone(),
-                assume_role: assume_role.clone(),
+                assume_role: Some(crate::proto::AssumeRole {
+                    role_arn: assume_role.clone(),
+                    duration_seconds: args.assume_role_duration_seconds,
+                    external_id: args.assume_role_external_id.clone(),
+                    role_session_name: args.assume_role_session_name.clone(),
+                }),
             },
         )),
         None => Some(crate::proto::assume_role_request::Query::Role(

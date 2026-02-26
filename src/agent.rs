@@ -107,7 +107,7 @@ impl crate::proto::agent_server::Agent for Agent {
             return Ok(tonic::Response::new(cache.credentials.as_ref().into()));
         }
 
-        let has_next_role = !rolespec.assume_role.is_empty();
+        let has_next_role = rolespec.assume_role.is_some();
         let base_rolespec = rolespec.base();
 
         let first_hop_cache = if cacheable {
@@ -141,7 +141,8 @@ impl crate::proto::agent_server::Agent for Agent {
             Ok(r) => {
                 let final_credentials = if has_next_role {
                     tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, assume_role = ?rolespec.assume_role, aws_access_key_id = ?r.access_key_id, ext = ?r.mairu, "calling sts:AssumeRole to the next role using the first hop credentials");
-                    let second_hop = assume_next_role(&r, &rolespec.assume_role).await?;
+                    let second_hop =
+                        assume_next_role(&r, rolespec.assume_role.as_ref().unwrap()).await?;
                     if request.get_ref().cached {
                         session
                             .credential_cache
@@ -644,7 +645,7 @@ async fn refresh_token_using_awssso(
 
 async fn assume_next_role(
     first_hop: &crate::client::AssumeRoleResponse,
-    next_role_arn: &str,
+    assume_role: &crate::proto::AssumeRole,
 ) -> Result<crate::client::AssumeRoleResponse, tonic::Status> {
     use secrecy::ExposeSecret;
 
@@ -663,14 +664,21 @@ async fn assume_next_role(
         .build();
     let sts = aws_sdk_sts::Client::new(&config);
 
-    let resp = sts
+    let mut req = sts
         .assume_role()
-        .role_arn(next_role_arn)
-        .role_session_name("mairu")
+        .role_arn(&assume_role.role_arn)
+        .role_session_name(assume_role.role_session_name.as_deref().unwrap_or("mairu"));
+    if let Some(secs) = assume_role.duration_seconds {
+        req = req.duration_seconds(secs);
+    }
+    if let Some(ref eid) = assume_role.external_id {
+        req = req.external_id(eid);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| {
-            tracing::error!(next_role_arn = ?next_role_arn, err = ?e, "assume_next_role STS call failed");
+            tracing::error!(role_arn = ?assume_role.role_arn, err = ?e, "assume_next_role STS call failed");
             tonic::Status::unknown(format!("assume_next_role failed: {e}"))
         })?;
 

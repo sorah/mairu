@@ -48,6 +48,18 @@ pub struct ExecArgs {
     #[arg(long)]
     assume_role: Option<String>,
 
+    /// Override role session name for sts:AssumeRole (used with --assume-role).
+    #[arg(long)]
+    assume_role_session_name: Option<String>,
+
+    /// Override duration in seconds for sts:AssumeRole (used with --assume-role).
+    #[arg(long)]
+    assume_role_duration_seconds: Option<i32>,
+
+    /// External ID for sts:AssumeRole (used with --assume-role).
+    #[arg(long)]
+    assume_role_external_id: Option<String>,
+
     /// Command line to execute.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<std::ffi::OsString>,
@@ -59,7 +71,12 @@ impl ExecArgs {
             Some(ref assume_role) => Some(crate::proto::assume_role_request::Query::Rolespec(
                 crate::proto::Rolespec {
                     role: self.role.clone(),
-                    assume_role: assume_role.clone(),
+                    assume_role: Some(crate::proto::AssumeRole {
+                        role_arn: assume_role.clone(),
+                        duration_seconds: self.assume_role_duration_seconds,
+                        external_id: self.assume_role_external_id.clone(),
+                        role_session_name: self.assume_role_session_name.clone(),
+                    }),
                 },
             )),
             None => Some(crate::proto::assume_role_request::Query::Role(
@@ -284,8 +301,19 @@ async fn resolve_auto(args: &mut ExecArgs) -> Result<(), anyhow::Error> {
     // Resolve
     args.server = Some(auto.inner.server.clone());
     args.role = auto.inner.role.clone();
-    if args.assume_role.is_none() {
-        args.assume_role = auto.inner.assume_role.clone();
+    if args.assume_role.is_none()
+        && let Some(ref ar) = auto.inner.assume_role
+    {
+        args.assume_role = Some(ar.role_arn.clone());
+        if args.assume_role_duration_seconds.is_none() {
+            args.assume_role_duration_seconds = ar.duration_seconds;
+        }
+        if args.assume_role_external_id.is_none() {
+            args.assume_role_external_id = ar.external_id.clone();
+        }
+        if args.assume_role_session_name.is_none() {
+            args.assume_role_session_name = ar.role_session_name.clone();
+        }
     }
     //TODO: if args.mode.is_none() {
     //   args.mode = auto.inner.mode
@@ -297,10 +325,20 @@ async fn resolve_auto(args: &mut ExecArgs) -> Result<(), anyhow::Error> {
         let role = &auto.inner.role;
         match args.assume_role {
             Some(ref assume_role) => {
-                crate::terminal::send(&format!(
-                    ":: {product} :: Using server={server:?} role={role:?} assume_role={assume_role:?}\n"
-                ))
-                .await;
+                let mut msg = format!(
+                    ":: {product} :: Using server={server:?} role={role:?} assume_role={assume_role:?}"
+                );
+                if let Some(ref name) = args.assume_role_session_name {
+                    msg.push_str(&format!(" assume_role_session_name={name:?}"));
+                }
+                if let Some(secs) = args.assume_role_duration_seconds {
+                    msg.push_str(&format!(" assume_role_duration_seconds={secs}"));
+                }
+                if let Some(ref eid) = args.assume_role_external_id {
+                    msg.push_str(&format!(" assume_role_external_id={eid:?}"));
+                }
+                msg.push('\n');
+                crate::terminal::send(&msg).await;
             }
             None => {
                 crate::terminal::send(&format!(

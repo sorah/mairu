@@ -57,9 +57,16 @@ message GetServerResponse {
   Session session = 3;
 }
 
+message AssumeRole {
+  string role_arn = 1;
+  optional int32 duration_seconds = 2;
+  optional string external_id = 3;
+  optional string role_session_name = 4;
+}
+
 message Rolespec {
   string role = 1;
-  string assume_role = 2;
+  AssumeRole assume_role = 2;
 }
 
 message AssumeRoleRequest {

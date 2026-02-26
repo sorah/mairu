@@ -30,7 +30,7 @@ impl Rolespec {
     pub fn base(&self) -> Rolespec {
         Rolespec {
             role: self.role.clone(),
-            assume_role: String::new(),
+            assume_role: None,
         }
     }
 }
@@ -40,12 +40,12 @@ impl AssumeRoleRequest {
         match self.query {
             Some(assume_role_request::Query::Role(ref role)) => Rolespec {
                 role: role.clone(),
-                assume_role: String::new(),
+                assume_role: None,
             },
             Some(assume_role_request::Query::Rolespec(ref rs)) => rs.clone(),
             None => Rolespec {
                 role: String::new(),
-                assume_role: String::new(),
+                assume_role: None,
             },
         }
     }
