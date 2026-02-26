@@ -26,13 +26,26 @@ impl Session {
     }
 }
 
+impl Rolespec {
+    pub fn base(&self) -> Rolespec {
+        Rolespec {
+            role: self.role.clone(),
+            assume_role: String::new(),
+        }
+    }
+}
+
 impl AssumeRoleRequest {
     pub fn rolespec(&self) -> Rolespec {
         match self.query {
-            Some(assume_role_request::Query::Role(ref role)) => Rolespec { role: role.clone() },
+            Some(assume_role_request::Query::Role(ref role)) => Rolespec {
+                role: role.clone(),
+                assume_role: String::new(),
+            },
             Some(assume_role_request::Query::Rolespec(ref rs)) => rs.clone(),
             None => Rolespec {
                 role: String::new(),
+                assume_role: String::new(),
             },
         }
     }

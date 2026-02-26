@@ -59,6 +59,7 @@ message GetServerResponse {
 
 message Rolespec {
   string role = 1;
+  string assume_role = 2;
 }
 
 message AssumeRoleRequest {
