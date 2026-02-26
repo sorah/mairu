@@ -24,6 +24,7 @@ pub async fn login(
             .refresh_aws_sso_client_registration(
                 crate::proto::RefreshAwsSsoClientRegistrationRequest {
                     server_id: server.id().to_owned(),
+                    force: false,
                 },
             )
             .await?;

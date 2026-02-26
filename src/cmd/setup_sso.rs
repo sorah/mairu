@@ -85,6 +85,7 @@ pub async fn run(args: &SetupSsoArgs) -> Result<(), anyhow::Error> {
     agent
         .refresh_aws_sso_client_registration(crate::proto::RefreshAwsSsoClientRegistrationRequest {
             server_id: id.clone(),
+            force: true,
         })
         .await?;
     Ok(())

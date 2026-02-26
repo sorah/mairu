@@ -195,7 +195,7 @@ impl crate::proto::agent_server::Agent for Agent {
         };
 
         if server.aws_sso.is_some() {
-            server.ensure_aws_sso_oauth_client_registration(true, crate::config::OAuthGrantType::Code)
+            server.ensure_aws_sso_oauth_client_registration(false, crate::config::OAuthGrantType::Code)
                 .await
                 .map_err(|e| {
                     tracing::error!(err = ?e, server_id = server.id(), "error while refreshing oauth client registration");
@@ -288,7 +288,7 @@ impl crate::proto::agent_server::Agent for Agent {
         };
 
         if server.aws_sso.is_some() {
-            server.ensure_aws_sso_oauth_client_registration(true, crate::config::OAuthGrantType::DeviceCode)
+            server.ensure_aws_sso_oauth_client_registration(false, crate::config::OAuthGrantType::DeviceCode)
                 .await
                 .map_err(|e| {
                     tracing::error!(err = ?e, server_id = server.id(), "error while refreshing oauth client registration");
@@ -373,7 +373,8 @@ impl crate::proto::agent_server::Agent for Agent {
             Err(e) => return Err(tonic::Status::internal(e.to_string())),
         };
 
-        tracing::info!(server_id = ?server.id(), server_url = %server.url, "Refreshing AWS SSO Client Registration");
+        let force = req.force;
+        tracing::info!(server_id = ?server.id(), server_url = %server.url, force = ?force, "refreshing AWS SSO Client Registration if needed");
 
         // XXX: validate checks .oauth existence...
         //server.validate().map_err(|e| {
@@ -384,13 +385,14 @@ impl crate::proto::agent_server::Agent for Agent {
         //    ))
         //})?;
 
-        server.ensure_aws_sso_oauth_client_registration(true, crate::config::OAuthGrantType::Code)
+
+        server.ensure_aws_sso_oauth_client_registration(force, crate::config::OAuthGrantType::Code)
             .await
             .map_err(|e| {
                 tracing::error!(err = ?e, server_id = server.id(), "error while refreshing oauth client registration (Code)");
                 tonic::Status::internal(format!("error while refreshing oauth client registration: {e}"))
             })?;
-        server.ensure_aws_sso_oauth_client_registration(true, crate::config::OAuthGrantType::DeviceCode)
+        server.ensure_aws_sso_oauth_client_registration(force, crate::config::OAuthGrantType::DeviceCode)
             .await
             .map_err(|e| {
                 tracing::error!(err = ?e, server_id = server.id(), "error while refreshing oauth client registration (DeviceCode)");
