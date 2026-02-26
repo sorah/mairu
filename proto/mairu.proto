@@ -121,6 +121,7 @@ message CompleteOAuthDeviceCodeResponse {
 
 message RefreshAwsSsoClientRegistrationRequest {
   string server_id = 1;
+  bool force = 2;
 }
 message RefreshAwsSsoClientRegistrationResponse {
 }
