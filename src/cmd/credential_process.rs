@@ -10,16 +10,49 @@ pub struct CredentialProcessArgs {
     /// Disable credential cache on mairu agent.
     #[arg(long, default_value_t = false)]
     no_cache: bool,
+
+    /// After obtaining credentials from the credential server, perform sts:AssumeRole
+    /// to assume a different role ARN using the obtained credentials.
+    #[arg(long)]
+    assume_role: Option<String>,
+
+    /// Override role session name for sts:AssumeRole (used with --assume-role).
+    #[arg(long)]
+    assume_role_session_name: Option<String>,
+
+    /// Override duration in seconds for sts:AssumeRole (used with --assume-role).
+    #[arg(long)]
+    assume_role_duration_seconds: Option<i32>,
+
+    /// External ID for sts:AssumeRole (used with --assume-role).
+    #[arg(long)]
+    assume_role_external_id: Option<String>,
 }
 
 #[tokio::main]
 pub async fn run(args: &CredentialProcessArgs) -> Result<(), anyhow::Error> {
     let mut agent = crate::cmd::agent::connect_or_start().await?;
 
+    let query = match args.assume_role {
+        Some(ref assume_role) => Some(crate::proto::assume_role_request::Query::Rolespec(
+            crate::proto::Rolespec {
+                role: args.role.clone(),
+                assume_role: Some(crate::proto::AssumeRole {
+                    role_arn: assume_role.clone(),
+                    duration_seconds: args.assume_role_duration_seconds,
+                    external_id: args.assume_role_external_id.clone(),
+                    role_session_name: args.assume_role_session_name.clone(),
+                }),
+            },
+        )),
+        None => Some(crate::proto::assume_role_request::Query::Role(
+            args.role.clone(),
+        )),
+    };
     let resp = agent
         .assume_role(crate::proto::AssumeRoleRequest {
             server_id: args.server.clone(),
-            role: args.role.clone(),
+            query,
             cached: !args.no_cache,
         })
         .await;

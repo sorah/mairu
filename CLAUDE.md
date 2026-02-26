@@ -2,39 +2,6 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Build and Development Commands
-
-### Prerequisites
-- Install Rust toolchain
-- Install `protobuf-compiler` package (required for building proto files)
-- For musl builds: Install `musl-tools` package
-
-### Common Commands
-
-```bash
-# Run tests
-cargo test
-
-# Build debug version
-cargo build
-
-# Build release version
-cargo build --release
-
-# Build with rustls feature (instead of native-tls)
-cargo build --no-default-features --features rustls
-
-# Build for musl target (static binary)
-cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls
-
-# Build Debian package
-cargo install cargo-deb --locked
-cargo deb --target=x86_64-unknown-linux-musl
-
-# Run a single test
-cargo test test_name
-```
-
 ## Architecture Overview
 
 Mairu is an on-memory AWS credentials agent that manages and provides AWS credentials to CLI tools. It consists of several key components:

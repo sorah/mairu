@@ -139,6 +139,35 @@ If it is read by a filesystem, Mairu prompts user to trust that file for the fir
 
 We recommend use `auto` role by default. This allows using per-project AWS role seamlessly, securely and concurrently! It would also be convenient to have `alias ae="mairu exec auto "` in your shell profile.
 
+### Role chaining
+
+You can chain an additional `sts:AssumeRole` call after obtaining credentials from the credential server. This is useful when your SSO role needs to assume a different IAM role (e.g. cross-account access).
+
+```
+$ mairu exec --server=contoso --assume-role=arn:aws:iam::123456789012:role/TargetRole 999999999999/SSORole rails server
+```
+
+The following options are available for both `mairu exec` and `mairu credential-process`:
+
+- `--assume-role` — ARN of the role to assume using the first-hop credentials
+- `--assume-role-session-name` — Override the role session name (default: derived from the first-hop caller identity, falling back to `$USER`, then `"mairu"`)
+- `--assume-role-duration-seconds` — Override session duration in seconds
+- `--assume-role-external-id` — External ID for the AssumeRole call
+
+This can also be configured in `.mairu.json` via the `assume_role` field:
+
+```jsonc
+{
+    // ... other fields
+    "assume_role": { // optional, see "Role chaining" section
+        "role_arn": "arn:aws:iam::123456789012:role/TargetRole",
+        "external_id": "...", // optional
+        "role_session_name": "...", // optional
+        "duration_seconds": 3600 // optional
+    }
+}
+```
+
 ### Reauthentication
 
 If your session with a credential server expired, Mairu prompts you to reauthenticate yourself. For existing processes under `mairu exec`, you'll see a warning message including a command line to start reauthentication flow. 

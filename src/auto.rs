@@ -11,6 +11,19 @@ pub struct AutoData {
     pub server: String,
     pub role: String,
     pub mode: Option<crate::config::ProviderMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assume_role: Option<AssumeRoleData>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct AssumeRoleData {
+    pub role_arn: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_session_name: Option<String>,
 }
 
 impl Auto {

@@ -1677,6 +1677,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-sso",
  "aws-sdk-ssooidc",
+ "aws-sdk-sts",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "axum",
