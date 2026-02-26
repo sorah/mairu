@@ -664,10 +664,15 @@ async fn assume_next_role(
         .build();
     let sts = aws_sdk_sts::Client::new(&config);
 
+    let role_session_name = match assume_role.role_session_name {
+        Some(ref name) => name.clone(),
+        None => resolve_role_session_name(&sts).await,
+    };
+
     let mut req = sts
         .assume_role()
         .role_arn(&assume_role.role_arn)
-        .role_session_name(assume_role.role_session_name.as_deref().unwrap_or("mairu"));
+        .role_session_name(role_session_name);
     if let Some(secs) = assume_role.duration_seconds {
         req = req.duration_seconds(secs);
     }
@@ -699,6 +704,24 @@ async fn assume_next_role(
         expiration: expiration_chrono,
         mairu: Default::default(),
     })
+}
+
+async fn resolve_role_session_name(sts: &aws_sdk_sts::Client) -> String {
+    if let Ok(identity) = sts.get_caller_identity().send().await
+        && let Some(arn) = identity.arn()
+    {
+        // arn:aws:sts::<account>:assumed-role/<role>/<session-name>
+        if let Some(session_name) = arn
+            .split(':')
+            .next_back()
+            .and_then(|resource| resource.strip_prefix("assumed-role/"))
+            .and_then(|rest| rest.split('/').nth(1))
+            && !session_name.is_empty()
+        {
+            return session_name.to_owned();
+        }
+    }
+    std::env::var("USER").unwrap_or_else(|_| "mairu".to_owned())
 }
 
 pub type AgentConn = crate::proto::agent_client::AgentClient<tonic::transport::Channel>;
