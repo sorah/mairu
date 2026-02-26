@@ -43,9 +43,35 @@ pub struct ExecArgs {
     #[arg(long, env = "MAIRU_SHOW_AUTO_ROLE", default_value_t = false)]
     show_auto: bool,
 
+    /// After obtaining credentials from the credential server, perform sts:AssumeRole
+    /// to assume a different role ARN using the obtained credentials.
+    #[arg(long)]
+    assume_role: Option<String>,
+
     /// Command line to execute.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<std::ffi::OsString>,
+}
+
+impl ExecArgs {
+    fn to_assume_role_request(&self, cached: bool) -> crate::proto::AssumeRoleRequest {
+        let query = match self.assume_role {
+            Some(ref assume_role) => Some(crate::proto::assume_role_request::Query::Rolespec(
+                crate::proto::Rolespec {
+                    role: self.role.clone(),
+                    assume_role: assume_role.clone(),
+                },
+            )),
+            None => Some(crate::proto::assume_role_request::Query::Role(
+                self.role.clone(),
+            )),
+        };
+        crate::proto::AssumeRoleRequest {
+            server_id: self.server.as_ref().unwrap().to_owned(),
+            query,
+            cached,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -258,15 +284,31 @@ async fn resolve_auto(args: &mut ExecArgs) -> Result<(), anyhow::Error> {
     // Resolve
     args.server = Some(auto.inner.server.clone());
     args.role = auto.inner.role.clone();
+    if args.assume_role.is_none() {
+        args.assume_role = auto.inner.assume_role.clone();
+    }
     //TODO: if args.mode.is_none() {
     //   args.mode = auto.inner.mode
     //}
 
     if args.show_auto {
-        crate::terminal::send(&indoc::formatdoc! {"
-            :: {product} :: Using server={server:?} role={role:?}
-        ", product = env!("CARGO_PKG_NAME"), server=auto.inner.server, role=auto.inner.role})
-        .await;
+        let product = env!("CARGO_PKG_NAME");
+        let server = &auto.inner.server;
+        let role = &auto.inner.role;
+        match args.assume_role {
+            Some(ref assume_role) => {
+                crate::terminal::send(&format!(
+                    ":: {product} :: Using server={server:?} role={role:?} assume_role={assume_role:?}\n"
+                ))
+                .await;
+            }
+            None => {
+                crate::terminal::send(&format!(
+                    ":: {product} :: Using server={server:?} role={role:?}\n"
+                ))
+                .await;
+            }
+        }
     }
 
     Ok(())
@@ -358,11 +400,7 @@ async fn preflight_check(
     agent: &mut crate::agent::AgentConn,
     args: &ExecArgs,
 ) -> Result<Option<crate::proto::AssumeRoleResponse>, anyhow::Error> {
-    let req = crate::proto::AssumeRoleRequest::with_role(
-        args.server.as_ref().unwrap().to_owned(),
-        args.role.clone(),
-        !args.no_cache,
-    );
+    let req = args.to_assume_role_request(!args.no_cache);
     let mut resp = assume_role_with_long_attempt_notice(agent, req.clone()).await;
 
     if let Err(ref e) = resp {
@@ -487,11 +525,7 @@ mod provider {
         let (listener, url) = crate::ecs_server::bind_tcp(None).await?;
         let server = crate::ecs_server::EcsServer::new_with_agent(
             agent.clone(),
-            crate::proto::AssumeRoleRequest::with_role(
-                args.server.as_ref().unwrap().to_owned(),
-                args.role.clone(),
-                !args.no_cache,
-            ),
+            args.to_assume_role_request(!args.no_cache),
             ExecEcsUserFeedback::from(args),
         );
         let environment = {
@@ -567,11 +601,7 @@ mod provider {
         args: &ExecArgs,
     ) -> Result<crate::proto::ExecEnvironment, anyhow::Error> {
         let resp = agent
-            .assume_role(crate::proto::AssumeRoleRequest::with_role(
-                args.server.as_ref().unwrap().to_owned(),
-                args.role.clone(),
-                !args.no_cache,
-            ))
+            .assume_role(args.to_assume_role_request(!args.no_cache))
             .await?
             .into_inner();
         let creds = resp
@@ -721,11 +751,7 @@ mod auto_refresh {
         agent: &mut crate::agent::AgentConn,
         args: &ExecArgs,
     ) -> crate::Result<Option<chrono::DateTime<chrono::Utc>>> {
-        let req = crate::proto::AssumeRoleRequest::with_role(
-            args.server.as_ref().unwrap().to_owned(),
-            args.role.clone(),
-            true,
-        );
+        let req = args.to_assume_role_request(true);
         let resp = match agent.assume_role(req.clone()).await {
             Ok(r) => r.into_inner(),
             Err(e) => {

@@ -11,6 +11,8 @@ pub struct AutoData {
     pub server: String,
     pub role: String,
     pub mode: Option<crate::config::ProviderMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assume_role: Option<String>,
 }
 
 impl Auto {

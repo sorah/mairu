@@ -10,18 +10,34 @@ pub struct CredentialProcessArgs {
     /// Disable credential cache on mairu agent.
     #[arg(long, default_value_t = false)]
     no_cache: bool,
+
+    /// After obtaining credentials from the credential server, perform sts:AssumeRole
+    /// to assume a different role ARN using the obtained credentials.
+    #[arg(long)]
+    assume_role: Option<String>,
 }
 
 #[tokio::main]
 pub async fn run(args: &CredentialProcessArgs) -> Result<(), anyhow::Error> {
     let mut agent = crate::cmd::agent::connect_or_start().await?;
 
-    let resp = agent
-        .assume_role(crate::proto::AssumeRoleRequest::with_role(
-            args.server.clone(),
+    let query = match args.assume_role {
+        Some(ref assume_role) => Some(crate::proto::assume_role_request::Query::Rolespec(
+            crate::proto::Rolespec {
+                role: args.role.clone(),
+                assume_role: assume_role.clone(),
+            },
+        )),
+        None => Some(crate::proto::assume_role_request::Query::Role(
             args.role.clone(),
-            !args.no_cache,
-        ))
+        )),
+    };
+    let resp = agent
+        .assume_role(crate::proto::AssumeRoleRequest {
+            server_id: args.server.clone(),
+            query,
+            cached: !args.no_cache,
+        })
         .await;
 
     match resp {
