@@ -1,13 +1,15 @@
 #[derive(Debug, Clone)]
 pub struct CachedCredential {
-    pub role: String,
+    pub rolespec: crate::proto::Rolespec,
     pub credentials: std::sync::Arc<crate::client::AssumeRoleResponse>,
 }
 
 /// Per-server credential cache
 #[derive(Clone)]
 pub struct CredentialCache {
-    items: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, CachedCredential>>>,
+    items: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<crate::proto::Rolespec, CachedCredential>>,
+    >,
 }
 
 impl std::fmt::Debug for CredentialCache {
@@ -32,23 +34,27 @@ impl CredentialCache {
         items.clear();
     }
 
-    pub fn store(&self, role: String, credentials: &crate::client::AssumeRoleResponse) {
+    pub fn store(
+        &self,
+        rolespec: crate::proto::Rolespec,
+        credentials: &crate::client::AssumeRoleResponse,
+    ) {
         if credentials.mairu.no_cache {
             return;
         }
 
         let mut items = self.items.write().unwrap();
         let item = CachedCredential {
-            role: role.clone(),
+            rolespec: rolespec.clone(),
             credentials: std::sync::Arc::new(credentials.to_owned()),
         };
-        items.insert(role, item);
+        items.insert(rolespec, item);
     }
 
-    pub fn get(&self, role: &str) -> Option<CachedCredential> {
+    pub fn get(&self, rolespec: &crate::proto::Rolespec) -> Option<CachedCredential> {
         let items = self.items.read().unwrap();
         items
-            .get(role)
+            .get(rolespec)
             .filter(|v| {
                 let now = chrono::Utc::now();
                 let thres = chrono::Duration::seconds(RENEW_CREDENTIALS_BEFORE_SEC);

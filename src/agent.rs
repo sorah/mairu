@@ -102,7 +102,7 @@ impl crate::proto::agent_server::Agent for Agent {
         // tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         if request.get_ref().cached
-            && let Some(cache) = session.credential_cache.get(role)
+            && let Some(cache) = session.credential_cache.get(&rolespec)
         {
             tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?cache.credentials.access_key_id, ext = ?cache.credentials.mairu, "Vending credentials from cache");
             return Ok(tonic::Response::new(cache.credentials.as_ref().into()));
@@ -117,7 +117,7 @@ impl crate::proto::agent_server::Agent for Agent {
         match client.assume_role(role).await {
             Ok(r) => {
                 if request.get_ref().cached {
-                    session.credential_cache.store(role.to_owned(), &r);
+                    session.credential_cache.store(rolespec.clone(), &r);
                 }
                 tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, aws_access_key_id = ?r.access_key_id, ext = ?r.mairu, "Vending credentials from server");
                 Ok(tonic::Response::new((&r).into()))
