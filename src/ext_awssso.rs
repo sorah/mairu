@@ -31,9 +31,14 @@ pub async fn register_client(
         .ok()
         .and_then(|x| x.into_string().ok())
         .unwrap_or_else(|| "?".to_string());
+    let client_name: String = format!("{} ({}@{})", product, server.id(), hostname)
+        .chars()
+        .filter(|c| c.is_ascii_graphic())
+        .take(128)
+        .collect();
     let mut req = ssooidc
         .register_client()
-        .client_name(format!("{} ({}@{})", product, server.id(), hostname))
+        .client_name(client_name)
         .client_type("public");
 
     if matches!(purpose, crate::config::OAuthGrantType::Code) {
