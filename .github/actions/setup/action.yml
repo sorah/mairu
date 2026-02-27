@@ -12,10 +12,10 @@ inputs:
 runs:
   using: composite
   steps:
-    - run: sudo apt-get install -y musl-tools
+    - run: sudo apt-get install -y musl-tools || (sudo apt-get update && sudo apt-get install -y musl-tools)
       shell: bash
       if: "${{ contains(inputs.target, '-musl') }}"
-    - run: sudo apt-get install -y protobuf-compiler
+    - run: sudo apt-get install -y protobuf-compiler || (sudo apt-get update && sudo apt-get install -y protobuf-compiler)
       shell: bash
       if: "${{ contains(inputs.target, '-linux-') }}"
     - run: brew install protobuf

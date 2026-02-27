@@ -1,5 +1,16 @@
 ## [not yet released]
 
+## 0.11.0
+
+### Enhancements
+
+- exec: gains `--assume-role` option to call `sts:AssumeRole` using vended credentials from remote server. This allows to use the first-hop credential as a jump role for a final IAM role. [#44](https://github.com/sorah/mairu/pull/44), [#42](https://github.com/sorah/mairu/pull/42)
+
+### Bug fixes
+
+- aws-sso: was always re-registering OAuth 2.0 dynamic client when logging in. Now consent prompt is only shown at the first login. [#43](https://github.com/sorah/mairu/pull/43)
+- aws-sso: was failing on a machine using a hostname with non-ASCII characters. [#45](https://github.com/sorah/mairu/pull/45)
+
 ## 0.10.0
 
 ### Enhancements
