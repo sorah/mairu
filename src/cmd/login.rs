@@ -4,6 +4,11 @@ pub struct LoginArgs {
     #[arg(long)]
     pub oauth_grant_type: Option<crate::config::OAuthGrantType>,
 
+    /// Do not automatically open the authentication URL in a browser.
+    /// Can also be requested by setting the MAIRU_NO_BROWSER environment variable.
+    #[arg(long, default_value_t = false)]
+    pub no_browser: bool,
+
     /// Credential server ID or URL to use.
     pub server_name: String,
 }
@@ -47,15 +52,24 @@ pub async fn login(
 
     tracing::debug!(oauth_grant_type = ?oauth_grant_type, server = ?server, "Using OAuth");
 
+    // The --no-browser flag and the MAIRU_NO_BROWSER environment variable both
+    // disable automatic browser opening. The env var is read here by presence
+    // (like MAIRU_NO_AUTO_AGENT), not via clap's `env =`, so that values like
+    // `1` never abort the command.
+    let no_browser = args.no_browser || std::env::var_os("MAIRU_NO_BROWSER").is_some();
+
     match oauth_grant_type {
-        crate::config::OAuthGrantType::Code => do_oauth_code(agent, server).await,
-        crate::config::OAuthGrantType::DeviceCode => do_oauth_device_code(agent, server).await,
+        crate::config::OAuthGrantType::Code => do_oauth_code(agent, server, no_browser).await,
+        crate::config::OAuthGrantType::DeviceCode => {
+            do_oauth_device_code(agent, server, no_browser).await
+        }
     }
 }
 
 pub async fn do_oauth_code(
     agent: &mut crate::agent::AgentConn,
     server: crate::config::Server,
+    no_browser: bool,
 ) -> Result<(), anyhow::Error> {
     let (path, mut local_port, use_localhost) = if let Some(ref aws_sso) = server.aws_sso {
         ("/oauth/callback", aws_sso.local_port, false)
@@ -115,6 +129,14 @@ pub async fn do_oauth_code(
     "})
     .await;
 
+    if crate::browser::should_open(no_browser, crate::terminal::is_terminal().await) {
+        crate::terminal::send(&indoc::formatdoc! {"
+            :: {product} :: Attempting to open the URL in your browser...
+        "})
+        .await;
+        crate::browser::open_url(short_authorize_url.as_str()).await;
+    }
+
     crate::oauth_code::listen_for_callback(listener, session, agent, auth_route).await?;
     tracing::info!("Logged in");
     Ok(())
@@ -123,6 +145,7 @@ pub async fn do_oauth_code(
 pub async fn do_oauth_device_code(
     agent: &mut crate::agent::AgentConn,
     server: crate::config::Server,
+    no_browser: bool,
 ) -> Result<(), anyhow::Error> {
     if server.aws_sso.is_none() {
         server.try_oauth_device_code_grant()?;
@@ -153,6 +176,14 @@ pub async fn do_oauth_device_code(
         :: {product} ::
     "})
     .await;
+
+    if crate::browser::should_open(no_browser, crate::terminal::is_terminal().await) {
+        crate::terminal::send(&indoc::formatdoc! {"
+            :: {product} :: Attempting to open the URL in your browser...
+        "})
+        .await;
+        crate::browser::open_url(authorize_url).await;
+    }
 
     let mut interval = session.interval as u64;
     loop {

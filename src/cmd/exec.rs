@@ -30,6 +30,11 @@ pub struct ExecArgs {
     #[arg(long)]
     oauth_grant_type: Option<crate::config::OAuthGrantType>,
 
+    /// Do not automatically open the authentication URL in a browser when logging in.
+    /// Can also be requested by setting the MAIRU_NO_BROWSER environment variable.
+    #[arg(long, default_value_t = false)]
+    no_browser: bool,
+
     /// Skip obtaining credentials before executing a command to verify valid configuration is given.
     /// Implies --no-auto-refresh.
     #[arg(long, default_value_t = false)]
@@ -508,6 +513,7 @@ async fn login(agent: &mut crate::agent::AgentConn, args: &ExecArgs) -> Result<(
     if !args.no_login {
         let login_args = crate::cmd::login::LoginArgs {
             oauth_grant_type: args.oauth_grant_type,
+            no_browser: args.no_browser,
             server_name: args.server.as_ref().unwrap().to_owned(),
         };
         crate::cmd::login::login(agent, &login_args).await

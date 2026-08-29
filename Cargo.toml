@@ -85,6 +85,7 @@ tracing = { version = "0.1.43", features = ["attributes"] }
 tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.22", features = ["fmt", "env-filter", "local-time", "json", "time"] }
 url = { version = "2.5.7", features = ["serde"] }
+webbrowser = "1.2.1"
 zeroize = { version = "1.8.2", features = ["std", "aarch64", "zeroize_derive", "serde", "derive"] }
 
 [target.'cfg(any(target_os = "freebsd", target_os = "dragonfly"))'.dependencies]

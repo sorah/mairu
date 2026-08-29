@@ -172,7 +172,9 @@ This can also be configured in `.mairu.json` via the `assume_role` field:
 
 ### Reauthentication
 
-If your session with a credential server expired, Mairu prompts you to reauthenticate yourself. For existing processes under `mairu exec`, you'll see a warning message including a command line to start reauthentication flow. 
+If your session with a credential server expired, Mairu prompts you to reauthenticate yourself. For existing processes under `mairu exec`, you'll see a warning message including a command line to start reauthentication flow.
+
+When you run `mairu login` (or when `mairu exec` triggers a login), Mairu automatically opens the authentication URL in your default browser. The URL is always printed as well, so you can copy it manually if needed (for example, over SSH without a display or in headless/CI environments). To disable automatic browser opening, pass `--no-browser` or set the `MAIRU_NO_BROWSER` environment variable (to any value).
 
 ### Credential provider modes
 
