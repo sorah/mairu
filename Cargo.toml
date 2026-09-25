@@ -68,7 +68,7 @@ pin-project = "1.1.10"
 process_path = "0.1.4"
 prost = "0.14.1"
 prost-types = "0.14.1"
-rand = "0.9.3"
+rand = "0.10.2"
 reqwest = { version = "0.12.26", default-features = false, features = ["charset", "http2", "macos-system-configuration", "json"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
