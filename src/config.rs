@@ -85,6 +85,39 @@ pub fn socket_path() -> std::path::PathBuf {
         .unwrap_or_else(|_| runtime_dir().join(format!("{}-agent.sock", env!("CARGO_PKG_NAME"))))
 }
 
+/// Personal configuration read from config.json.
+#[derive(serde::Deserialize, Default, Debug)]
+pub struct UserConfig {
+    #[serde(default)]
+    pub disallow_roles: Vec<DisallowedRole>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+pub struct DisallowedRole {
+    pub server: String,
+    pub role: String,
+}
+
+impl UserConfig {
+    pub fn path() -> std::path::PathBuf {
+        config_dir().join("config.json")
+    }
+
+    pub async fn load() -> crate::Result<Self> {
+        match tokio::fs::read(Self::path()).await {
+            Ok(data) => Ok(serde_json::from_slice(&data)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn is_role_disallowed(&self, server: &Server, role: &str) -> bool {
+        self.disallow_roles
+            .iter()
+            .any(|d| d.role == role && (d.server == server.id() || d.server == server.url.as_str()))
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Server {
     pub url: url::Url,
@@ -668,5 +701,30 @@ impl AwsSsoClientRegistrationCache {
                 .clone()
                 .ok_or_else(|| crate::Error::UserError("missing client_secret".to_owned()))?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_role_disallowed() {
+        let server: Server = serde_json::from_str(
+            r#"{"url": "https://sso.invalid/start", "id": "contoso", "aws_sso": {"region": "us-east-1"}}"#,
+        )
+        .unwrap();
+        let config: UserConfig = serde_json::from_str(
+            r#"{"disallow_roles": [
+                {"server": "contoso", "role": "111111111111/Admin"},
+                {"server": "https://sso.invalid/start", "role": "222222222222/Admin"},
+                {"server": "other", "role": "333333333333/Admin"}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(config.is_role_disallowed(&server, "111111111111/Admin"));
+        assert!(config.is_role_disallowed(&server, "222222222222/Admin"));
+        assert!(!config.is_role_disallowed(&server, "333333333333/Admin"));
+        assert!(!config.is_role_disallowed(&server, "111111111111/ReadOnly"));
     }
 }

@@ -117,6 +117,24 @@ It is recommended to use the same `id` for your entire organisation. Personal pr
 
 To learn how to prepare your credential server, continue reading at [Credential Server](#credential-server) section.
 
+### Personal configuration
+
+Mairu reads `~/.config/mairu/config.json` for personal preferences, separately from `servers.d`.
+
+#### Disallowing roles
+
+List roles in `disallow_roles` to make Mairu refuse to vend credentials for them (via `mairu exec` and `mairu credential-process`). `server` is a server ID or URL, and `role` must match exactly as shown in `mairu list-roles`.
+
+```jsonc
+{
+    "disallow_roles": [
+        {"server": "contoso", "role": "123456789999/AdministratorAccess"}
+    ]
+}
+```
+
+This is a local safety net against accidental use, not an access control; permissions are still governed by your credential server.
+
 ### Local port for callback URL
 
 Mairu uses ephemeral port number for OAuth 2.0 callback URLs. Otherwise, you can specify `--local-port` (or `.oauth.local_port`, `.aws_sso.local_port`) to use fixed port number.

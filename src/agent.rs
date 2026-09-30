@@ -88,16 +88,27 @@ impl crate::proto::agent_server::Agent for Agent {
         let cacheable = request.get_ref().cached;
         let rolespec = request.get_ref().rolespec();
         let role = &rolespec.role;
+        let server_config = crate::config::Server::find_from_fs(query).await.map_err(|e| {
+            tracing::warn!(server_id = ?query, role = ?role, err = ?e, "requested server doesn't exist or is invalid");
+            tonic::Status::not_found("requested server doesn't exist or is invalid")
+        })?;
+        let user_config = crate::config::UserConfig::load().await.map_err(|e| {
+            tracing::error!(err = ?e, "failed to load user configuration");
+            tonic::Status::internal(format!(
+                "failed to load {}: {e}",
+                crate::config::UserConfig::path().display()
+            ))
+        })?;
+        if user_config.is_role_disallowed(&server_config, role) {
+            tracing::warn!(server_id = ?query, role = ?role, "requested role is disallowed by user configuration");
+            return Err(tonic::Status::permission_denied(format!(
+                "role '{role}' is disallowed by disallow_roles in {}",
+                crate::config::UserConfig::path().display()
+            )));
+        }
         let Ok(session) = self.session_manager.get(query) else {
-            if let Err(e) = crate::config::Server::find_from_fs(query).await {
-                tracing::warn!(server_id = ?query, role = ?role, err = ?e, "requested server doesn't exist or is invalid");
-                return Err(tonic::Status::not_found(
-                    "requested server doesn't exist or is invalid",
-                ));
-            } else {
-                tracing::warn!(server_id = ?query, role = ?role, "session doesn't exist, require authentication");
-                return Err(tonic::Status::unauthenticated("authentication needed"));
-            }
+            tracing::warn!(server_id = ?query, role = ?role, "session doesn't exist, require authentication");
+            return Err(tonic::Status::unauthenticated("authentication needed"));
         };
 
         // tokio::time::sleep(std::time::Duration::from_secs(5)).await;
