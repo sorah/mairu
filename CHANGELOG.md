@@ -1,8 +1,23 @@
 ## [not yet released]
 
+## 0.12.0
+
 ### Enhancements
 
-- auto: Trust of `.mairu.json` is now shared across git worktrees. A configuration file in a linked worktree is trusted when the equivalent path in the repository's main checkout has been trusted with the same content. Set `MAIRU_NO_WORKTREE_TRUST=1` to opt out.
+- auto: Trust of `.mairu.json` is now shared across git worktrees. A configuration file in a linked worktree is trusted when the equivalent path in the repository's main checkout has been trusted with the same content. Set `MAIRU_NO_WORKTREE_TRUST=1` to opt out. [#54](https://github.com/sorah/mairu/pull/54)
+- `--version` now includes the git commit and dirty state. [#55](https://github.com/sorah/mairu/pull/55)
+- New personal configuration file `~/.config/mairu/config.json` gains `disallow_roles` to refuse vending credentials for listed roles via `mairu exec` and `mairu credential-process`. [#56](https://github.com/sorah/mairu/pull/56)
+- list-sessions: gains `--output json` option. [#57](https://github.com/sorah/mairu/pull/57)
+
+### Bug fixes
+
+- rustls build (`--features rustls`, used for Linux binaries and Debian packages on GitHub Releases): no longer trusts the `webpki-roots` set compiled into the binary in addition to the system CA store, so CA distrust such as the [eMudhra intermediate compromise](https://emudhra.we-have-a-problem.com/) follows OS CA updates. [#59](https://github.com/sorah/mairu/pull/59)
+- rustls-webpki rolled to 0.103.16, which rejects certificate paths through the compromised eMudhra intermediates. [#59](https://github.com/sorah/mairu/pull/59)
+
+### Miscellaneous
+
+- `mise.toml` added for development tools. [#58](https://github.com/sorah/mairu/pull/58)
+- Rolled Rust dependencies flagged by Dependabot. [#47](https://github.com/sorah/mairu/pull/47), [#48](https://github.com/sorah/mairu/pull/48), [#49](https://github.com/sorah/mairu/pull/49), [#51](https://github.com/sorah/mairu/pull/51)
 
 ## 0.11.0
 
