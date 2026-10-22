@@ -10,7 +10,7 @@ This spec adds three things:
 2. **Platform authorization.** The agent asks the human, through a platform facility, before vending credentials, and remembers the answer per terminal session for a short time. When to ask is decided by a [Cedar](https://www.cedarpolicy.com/) policy, in which a human check is just another condition, as MFA is in AWS IAM. The user's policy is integrity-protected.
 3. **A common platform protocol** (`mairu.platform`, protobuf) and a matching Rust trait, covering authorization prompts, integrity records, notifications and opening URLs, so the agent core stays platform-independent and an out-of-process helper can serve the same contract. Notifications and opening URLs carry no security weight, and each client chooses how they are delivered (§10).
 
-Linux is implemented first. macOS is designed here and implemented separately against this document. BSD is design-only.
+Linux is implemented first, with WSL2 as a first-class variant (§11a). macOS is designed here and implemented separately against this document. BSD is design-only.
 
 ### 1.1 Terminology
 
@@ -45,7 +45,7 @@ Code running **as the same Unix user** as the human, which the human did not int
 
 Root, kernel compromise, physical access, and malicious credential servers or IdPs.
 
-Escalation to root through the user's own `sudo` is also out of scope. If the user types the sudo password where same-user code can capture it (§8.4), that code can become root. mairu cannot defend against that, and its guarantees hold only on hosts where sudo is not used that way, or is backed by FIDO.
+Escalation to root through the user's own `sudo` is also out of scope. If the user types the sudo password where same-user code can capture it (§8.4), that code can become root. mairu cannot defend against that, and its guarantees hold only on hosts where sudo is not used that way, or is backed by FIDO. §2.4 covers this and the other routes to root.
 
 Credentials *after delivery* are also out of scope. Once `mairu exec` hands credentials to the user's command, same-user code that can inspect that command (its environment, its memory, or the ECS bearer token in its environment) can take them. This design protects the agent's ability to mint credentials for arbitrary roles and its session tokens. It does not protect credentials already given to an unprotected process.
 
@@ -59,6 +59,36 @@ Credentials *after delivery* are also out of scope. Once `mairu exec` hands cred
   - AI-agent detection (§8.6)
   - `disallow_roles` in `config.json`
   - the `.mairu.json` trust prompt
+
+### 2.4 Trust chain and the weakest link
+
+On a hardened Linux host every anchor is root-owned:
+- the setgid binary
+- the polkit action file
+- the integrity records in `/var/lib/mairu`, including the approval anchor that says which keys may approve policy changes (§9.7)
+
+Root can replace any of these, and can also read the agent's memory directly. **Every guarantee in this spec is therefore bounded by how hard it is for same-user code to become root.**
+
+Ways a same-user attacker reaches root:
+
+| Path | How |
+|---|---|
+| `sudo`, `su` | PAM, usually the user's password, which is capturable at a tty (§8.4). Also `NOPASSWD` rules and cached sudo timestamps. |
+| polkit administrator actions | `auth_admin` actions such as `pkexec` and systemd units; PAM again |
+| Root-equivalent group memberships | `docker`, `lxd`, `incus-admin`, `disk` |
+| WSL2 interop | `wsl.exe -u root` (§11a) |
+
+The effective strength of a deployment is the **weakest** of:
+1. becoming root
+2. approving a policy change (`approval_methods`, §9.5, anchored in the protected record)
+3. the presence methods that a role's `permit` policies accept (`context.presence.method`)
+
+Registering a FIDO or Windows Hello key strengthens 2 and 3. It does nothing for 1. A password that passes `sudo` also passes polkit `auth_self` (§8.4), so on a host where that password can be captured, key-based methods only add a guardrail.
+
+Recommendations (README; `mairu doctor` warns where it can detect the condition, §15):
+- Back `sudo` and the `polkit-1` PAM stack with FIDO: `pam_u2f` locally, `pam_ssh_agent_auth` with an `sk-` key over SSH, `pam_wsl_hello` on WSL2. Avoid `NOPASSWD` and root-equivalent groups for the user.
+- Once keys are registered, keep `approval_methods` key-only (the default, §9.5), and require a key-based `context.presence.method` in permits for sensitive roles.
+- On WSL2, disable interop for strong guarantees (§11a).
 
 ## 3. Trust anchors
 
@@ -184,6 +214,8 @@ Linux only (BSD later). It must run as root (`euid == 0`); otherwise it exits wi
 7. **Next steps.** Print them: the next hardened `mairu` invocation replaces the running unhardened agent automatically (§5.3), or the user can run `mairu kill-agent`.
 
 `mairu harden --uninstall` removes the files listed in the manifest. `--purge` also removes `/var/lib/mairu`. The group is left in place; `groupdel mairu` is documented.
+
+`mairu harden --reset-policy-record --user <name>` deletes that user's `/var/lib/mairu/users/<uid>/policy.record`, the recovery path for lost approval keys (§9.9).
 
 ### 4.5 Distribution packages
 
@@ -415,10 +447,23 @@ message NotifyResponse { bool delivered = 1; }
 message OpenUrlRequest { string url = 1; }
 message OpenUrlResponse { bool opened = 1; string detail = 2; }
 
+// What a store keeps for a name (§9.7).
+message IntegrityRecord {
+  bytes digest = 1;            // 32 bytes
+  ApprovalAnchor approval = 2;
+}
+
+// Who may approve the next change: the approval_methods and their keys at the time of approval.
+message ApprovalAnchor {
+  repeated string methods = 1;             // e.g. "ssh-agent", "windows-hello", "platform"
+  repeated string ssh_agent_keys = 2;      // OpenSSH public key lines
+  repeated bytes windows_hello_keys = 3;   // DER SubjectPublicKeyInfo
+}
+
 message RecordIntegrityRequest {
   string name = 1;   // "policy"
   uint32 uid = 2;
-  bytes digest = 3;  // 32 bytes
+  IntegrityRecord record = 3;
 }
 message RecordIntegrityResponse { repeated IntegrityStoreResult results = 1; }
 
@@ -434,6 +479,7 @@ message IntegrityStoreResult {
   // For record: MATCHED means written; UNAVAILABLE means skipped.
   IntegrityStatus status = 2;
   string detail = 3;
+  IntegrityRecord stored = 4;  // verify: the record the store holds, when it holds one
 }
 ```
 
@@ -523,8 +569,11 @@ message CredentialProcessIntent {}
 message AuthorizationChallenge {
   bytes challenge_id = 1;          // 16 random bytes
   bytes statement = 2;             // serialized AuthorizationStatement; signed byte-for-byte
-  repeated string key_fingerprints = 3;  // "SHA256:..." of acceptable registered keys
+  // Acceptable registered keys: OpenSSH "SHA256:..." fingerprints for ssh-agent,
+  // "wh:SHA256:..." (SHA-256 of the SubjectPublicKeyInfo) for Windows Hello.
+  repeated string key_fingerprints = 3;
   google.protobuf.Timestamp expires_at = 4;
+  string method = 5;               // "ssh-agent" | "windows-hello"
 }
 
 message AuthorizationStatement {
@@ -543,7 +592,8 @@ message AuthorizationResponse {
   bytes challenge_id = 1;
   oneof result {
     bytes sshsig = 2;              // binary SSHSIG blob
-    string declined = 3;           // why the client could not sign: "no-ssh-agent", "no-registered-key", "sign-failed"
+    string declined = 3;           // why the client could not sign: "no-ssh-agent", "no-helper", "no-registered-key", "sign-failed"
+    bytes windows_hello_signature = 4;  // §8.10
   }
 }
 
@@ -787,10 +837,10 @@ All authorization state is in memory only. Restarting the agent forgets every gr
    | the grant for (session, server, rolespec), if any | `{verified: true, scope: "session", method, age: now − created, idle: now − last_used}` |
 
 4. Otherwise, for each method `m` in the effective method order (§9.5) that is usable for this request, evaluate a **fresh** candidate: `{verified: true, scope: "request", method: m, age: 0, idle: 0}`. The first `m` whose candidate is `Allow` is the method to ask with:
-   - **ssh-agent**:
-     - The request carries a valid `authorization_response.sshsig` for an outstanding challenge → verify (§8.7) → permit.
+   - **ssh-agent** and **windows-hello**, the key-based methods (§8.7, §8.10):
+     - The request carries a valid response (`sshsig` or `windows_hello_signature`) for an outstanding challenge of that method → verify → permit.
      - It carries `declined` → continue with the next method.
-     - Otherwise → issue a challenge → `REASON_CHALLENGE`.
+     - Otherwise → issue a challenge for that method → `REASON_CHALLENGE`.
    - **platform** (`Platform::authorize`):
      - `ALLOWED` → permit.
      - `DENIED`/`CANCELLED` → `REASON_DENIED`.
@@ -890,6 +940,39 @@ The same keys go into polkit `details`:
 
 No authorization is required, since this only tightens.
 
+### 8.10 Windows Hello presence (WSL2)
+
+This is a key-based method, like ssh-agent (§8.7), for WSL2 distributions with interop enabled (§11a). It follows the pattern of WSL-Hello-sudo (`pam_wsl_hello`):
+- a TPM-backed Windows Hello key credential signs a challenge from Linux
+- Linux verifies the signature against a registered public key
+
+The helper's output is never trusted on its own; only the signature counts.
+
+**Helper.** `mairu-windows-hello.exe` is a small Rust binary in this repository (`windows-hello-helper/`), built for `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` with the `windows` crate. It is published with releases. It uses `Windows.Security.Credentials.KeyCredentialManager` with credential name `co.0w0.mairu`:
+- `create`: `RequestCreateAsync(…, FailIfExists)` creates the key, then prints the base64 SubjectPublicKeyInfo of the public key.
+- `public-key`: `OpenAsync` the existing key, then print its public key.
+- `sign`: read base64 bytes on stdin, `OpenAsync`, then `RequestSignAsync`, which shows the Windows Hello dialog. Print the base64 signature.
+
+The client locates the helper through its own unprotected configuration: `config.json` `windows_hello_helper`, default `$(wslpath "$(cmd.exe /c echo %LOCALAPPDATA%)")/mairu/mairu-windows-hello.exe`. A replaced helper can trigger prompts, but cannot forge a signature.
+
+**Registration.**
+1. `mairu policy enroll-windows-hello` runs `create` (or `public-key` if the key already exists).
+2. It prints the entry to add to `authorization.json` `windows_hello_keys` (§9.5).
+3. The user approves the new policy as usual.
+
+**Challenge and verification.** This is the same flow as §8.7, with `AuthorizationChallenge.method = "windows-hello"`:
+
+1. The client pipes the `statement` bytes to `sign` through WSL interop, and retries with `windows_hello_signature`.
+2. The agent verifies the signature over the statement bytes with the registered key: RSA-2048 with SHA-256. Microsoft's documentation contradicts itself on the padding ("PKCS #1 RSA PSS"), so the scheme is **Q-W2** (§11a). Implementation fixes it empirically and pins it with a test vector.
+3. Windows Hello itself requires the PIN or biometric, so a valid signature means a verified user.
+
+**Residual risk.** This is the same as ssh-agent:
+- Same-user code (Windows-side, or Linux-side through interop) can run its own program against the same key credential and cause a Windows Hello dialog. The human still has to pass it.
+- The challenge binds the signature to one request and peer.
+- Timing-based phishing remains possible.
+
+On WSL2 with interop enabled, the root path in §11a dominates anyway.
+
 ## 9. Protected policy (Cedar)
 
 Authorization policy is written in [Cedar](https://www.cedarpolicy.com/), the policy language behind Amazon Verified Permissions. It is evaluated with the `cedar-policy` crate (4.x, `default-features = false`, since no extension types are used).
@@ -944,7 +1027,7 @@ namespace Mairu {
     // "none"; "request": checked for this very request; "process": the lease of this running
     // `mairu exec`; "session": a grant for this terminal session.
     scope: String,
-    // "ssh-agent" or "platform"; absent when not verified.
+    // "ssh-agent", "windows-hello" or "platform"; absent when not verified.
     method?: String,
     // Seconds since the covering human check; 0 when not verified.
     age: Long,
@@ -965,6 +1048,8 @@ namespace Mairu {
       tty?: String,
       // Whether the agent runs hardened (§4.2).
       hardened: Bool,
+      // Present only on WSL2: whether Windows interop is enabled, which makes root reachable (§11a).
+      wsl_interop?: Bool,
       // Reported by the client: truthful about what it will do, but chosen by whoever runs it (§9.4).
       intent: String,
       exec_command?: String,
@@ -984,6 +1069,7 @@ Reference for the context attributes:
 | `ai_agent`, `ai_agent_names` | names that matched | agent ancestry + client env names |
 | `session`, `tty` | `"tty"` `"parent"` `"none"`, `/dev/pts/N` | agent, from the kernel |
 | `hardened` | | agent |
+| `wsl_interop` | present only on WSL2 | agent (§11a) |
 | `intent` | `"exec"` `"credential-process"` `"unknown"` | client |
 | `exec_command` | basename of `argv[0]` | client, `exec` only |
 | `exec_command_line` | shell-escaped argv, truncated to 4 KiB | client, `exec` only |
@@ -1049,7 +1135,7 @@ when { context.ai_agent };
 
 ### 9.4 Which context can be trusted
 
-- **Determined by the agent**: `presence`, `hardened`, `session`, `tty`, and the ancestry half of `ai_agent`. These cannot be influenced by the requester beyond actually being in that position.
+- **Determined by the agent**: `presence`, `hardened`, `wsl_interop`, `session`, `tty`, and the ancestry half of `ai_agent`. These cannot be influenced by the requester beyond actually being in that position.
 - **Reported by the client**: `intent`, `exec_command`, `exec_command_line`, `cwd`, `chained_role_arn`, and the environment half of `ai_agent`. A verified client reports them truthfully, but whoever runs `mairu` chooses them: same-user code can `cd` into any directory or exec any command. Use them to **narrow** a `permit` that also requires `context.presence.verified`, or in a `forbid`. Never rely on them alone to grant access.
 
 `mairu policy check` and `mairu policy approve` list every `permit` that can apply without a human check, so these are always visible at approval time.
@@ -1059,13 +1145,20 @@ when { context.ai_agent };
 ```jsonc
 {
   "version": 1,
-  // Order in which to try ways of asking the human.
-  // Default: ["ssh-agent", "platform"] when keys are registered, otherwise ["platform"].
+  // Order in which to try ways of asking the human for AssumeRole.
+  // Default: the key-based methods with registered keys ("ssh-agent", "windows-hello"), then "platform".
   "methods": ["ssh-agent", "platform"],
+  // Methods allowed to approve the next policy change (§9.9). Recorded in the approval anchor (§9.7).
+  // Default: the key-based methods with registered keys; ["platform"] only when no key is registered.
+  "approval_methods": ["ssh-agent"],
   "ssh_agent_keys": [
     {"key": "sk-ssh-ed25519@openssh.com AAAA... me@laptop"},
     {"key": "sk-ecdsa-sha2-nistp256@openssh.com AAAA... spare", "require_user_verification": true},
     {"key": "ssh-ed25519 AAAA... confirm-key", "presence": "unverified-confirm"}
+  ],
+  "windows_hello_keys": [
+    // base64 SubjectPublicKeyInfo (§8.10)
+    {"name": "desktop", "public_key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA..."}
   ],
   "ai_agent_detection": {
     "process_names": ["my-agent"],    // added to the built-in list (§8.6)
@@ -1078,7 +1171,12 @@ when { context.ai_agent };
 - The file is plain JSON; the comments are for documentation only.
 - Every field except `version` is optional.
 - Unknown fields are rejected, so a typo never silently weakens anything.
-- Method names: `"ssh-agent"` (§8.7), and `"platform"` for the platform's own facility (polkit on Linux, LocalAuthentication on macOS). A policy can require a specific method through `context.presence.method`.
+- Method names:
+  - `"ssh-agent"` (§8.7) and `"windows-hello"` (§8.10), the key-based methods
+  - `"platform"`, the platform's own facility: polkit on Linux, LocalAuthentication on macOS
+
+  A policy can require a specific method through `context.presence.method`.
+- Putting `"platform"` in `approval_methods` while keys are registered lets a captured password approve a policy that registers someone else's key. `check` warns about it (§2.4).
 
 ### 9.6 Built-in policies (`src/policy/builtin/*.cedar`)
 
@@ -1133,19 +1231,33 @@ when { context.ai_agent };
 
 ### 9.7 Integrity records and stores
 
-- **Digest**: `SHA-256("mairu.policy.v1\0" || part(policy.cedar) || part(authorization.json))`, where `part(f)` is `0x00` when the file is absent, and `0x01 || u64be(len) || bytes` otherwise. Record name `"policy"`.
+- **Digest**: `SHA-256("mairu.policy.v1- **Digest**: `SHA-256("mairu.policy.v1\0" || part(policy.cedar) || part(authorization.json))`, where `part(f)` is `0x00` when the file is absent, and `0x01 || u64be(len) || bytes` otherwise. Record name `"policy"`.
+" || part(policy.cedar) || part(authorization.json))`, where `part(f)` is `0x00` when the file is absent, and `0x01 || u64be(len) || bytes` otherwise.
+- **Record**: name `"policy"`, content `IntegrityRecord` (§6.2): the digest plus the **approval anchor**, which holds the `approval_methods` and the corresponding registered keys from the approved `authorization.json`. Stores serialize it as JSON:
+
+  ```json
+  {"version": 1, "digest": "<hex>",
+   "approval": {"methods": ["ssh-agent"], "ssh_agent_keys": ["sk-ssh-ed25519@openssh.com AAAA..."], "windows_hello_keys": []}}
+  ```
+
+  The anchor lives with the digest so that the next approval is authorized by what was *last approved*, never by whatever the home-directory files say now. Editing `authorization.json`, or tampering with it and forcing lockdown, cannot downgrade approval to a password.
 - **Linux stores**, used **concurrently** (§6.2 `IntegrityStoreKind`):
 
   | Store | Available when | Location | Strength |
   |---|---|---|---|
-  | `PROTECTED_DIRECTORY` | Agent hardened, and `/var/lib/mairu` is `root:mairu`, mode `2770` with no "other" bits, not FUSE | `/var/lib/mairu/users/<uid>/policy.sha256` (hex + `\n`), written atomically (temp + rename + fsync) inside `with_privileged_gid` | Strong: unreachable by same-user code. Authoritative when present. |
-  | `SECRET_SERVICE` | Session bus reachable, `org.freedesktop.secrets` present, default collection unlocked. A locked collection is `UNAVAILABLE`; the agent never triggers an unlock prompt. | Item in the default collection: label `mairu policy digest (uid N)`, attributes `{application: "co.0w0.mairu", kind: "policy-digest", name: "policy", uid: "N"}`, secret = hex digest | Weak: same-user code can read and write it. It catches offline or careless edits, and on hardened hosts any disagreement with the protected directory. |
+  | `PROTECTED_DIRECTORY` | Agent hardened, and `/var/lib/mairu` is `root:mairu`, mode `2770` with no "other" bits, not FUSE | `/var/lib/mairu/users/<uid>/policy.record` (the JSON above), written atomically (temp + rename + fsync) inside `with_privileged_gid` | Strong: unreachable by same-user code. Authoritative when present. |
+  | `SECRET_SERVICE` | Session bus reachable, `org.freedesktop.secrets` present, default collection unlocked. A locked collection is `UNAVAILABLE`; the agent never triggers an unlock prompt. | Item in the default collection: label `mairu policy record (uid N)`, attributes `{application: "co.0w0.mairu", kind: "policy-record", name: "policy", uid: "N"}`, secret = the JSON above | Weak: same-user code can read and write it. It catches offline or careless edits, and on hardened hosts any disagreement with the protected directory. |
 
 - **macOS stores** are designed in §12.
 
 ### 9.8 Integrity state and effective policy
 
-**Record** (approve) writes the digest to every available store. It fails if none is available.
+**Record** (approve) writes the record (digest and approval anchor) to every available store. It fails if none is available.
+
+**Approval anchor in force:**
+- Hardened: the protected directory's record. Secret Service is never consulted for it.
+- Unhardened: the Secret Service record. This is weak, since same-user code can rewrite it.
+- No record (never approved, or reset by root): `["platform"]`.
 
 **Verify** collects per-store statuses, then:
 
@@ -1167,8 +1279,8 @@ An `APPROVED` policy that no longer validates against this binary's schema, for 
 |---|---|---|
 | `ABSENT` | Built-ins for the hardening state | Defaults |
 | `APPROVED` | `policy.cedar`, or the built-ins when only `authorization.json` exists | `authorization.json` |
-| `UNAPPROVED` | Built-ins **plus only the `forbid` policies** of `policy.cedar`. Adding a `forbid` can only remove permissions, so unapproved content can only tighten. `permit` policies are ignored. If the file does not parse it is ignored, and `forbid` policies that fail validation are dropped one by one. | Defaults, plus `ai_agent_detection` additions and a smaller `grant_retention_secs` (both tighten). `methods` and `ssh_agent_keys` are ignored, since registering a key relaxes. |
-| `TAMPERED` | **Lockdown**: lockdown built-ins plus the file's `forbid` policies (same rules as `UNAPPROVED`) | As `UNAPPROVED`, with `methods = ["platform"]` because registered keys are not trusted. `doctor` and every client print a warning, and clients emit the lockdown notification (§10.1). |
+| `UNAPPROVED` | Built-ins **plus only the `forbid` policies** of `policy.cedar`. Adding a `forbid` can only remove permissions, so unapproved content can only tighten. `permit` policies are ignored. If the file does not parse it is ignored, and `forbid` policies that fail validation are dropped one by one. | Defaults, plus `ai_agent_detection` additions and a smaller `grant_retention_secs` (both tighten). `methods` and keys in the file are ignored, since registering a key relaxes. Key-based methods use only the keys of the approval anchor in force (§9.8), followed by `"platform"`. |
+| `TAMPERED` | **Lockdown**: lockdown built-ins plus the file's `forbid` policies (same rules as `UNAPPROVED`) | As `UNAPPROVED`: the keys in the file are not trusted, but the anchored keys are. `doctor` and every client print a warning, and clients emit the lockdown notification (§10.1). |
 
 Verification runs:
 - at agent start
@@ -1202,8 +1314,10 @@ Policies without `@id` are shown as `policy.cedar#<n>`, and `check` warns about 
   2. It sends `ApprovePolicy{expected_digest}`.
   3. The agent re-reads both files. If the digest differs → `FAILED_PRECONDITION` ("policy changed while approving"). This binds approval to what the human saw.
   4. The agent validates them → `INVALID_ARGUMENT` on error.
-  5. The agent asks the human with action `approve-policy`. This always asks, never uses grants, and uses the *currently effective* methods: in lockdown or before any keys are registered, that is the platform only, which is how the first key registration is bootstrapped.
-  6. It records the digest into all available stores and returns the per-store results.
+  5. The agent asks the human with action `approve-policy`. This always asks and never uses grants. It uses only the methods and keys of the **approval anchor in force** (§9.8), never those of the files being approved or of the current effective settings. Before any approval, that anchor is `["platform"]`, which is how the first key registration is bootstrapped.
+  6. It records the new digest, with the new files' `approval_methods` and keys as the next anchor, into all available stores, and returns the per-store results.
+
+**Recovery.** When every approval key is lost, root removes the record with `sudo mairu harden --reset-policy-record --user <name>`. The state becomes `UNAPPROVED`, and the anchor falls back to `["platform"]`. A stale Secret Service record then reads as `MISMATCHED`, so lockdown applies until the next approval. Requiring root here is deliberate: root is already the top of the trust chain (§2.4).
 
 ## 10. Convenience features: notifications and opening URLs
 
@@ -1228,7 +1342,7 @@ Rate-limit state is best-effort: one file per event key under `runtime_dir()/not
 
 | Mode | Behavior |
 |---|---|
-| `auto` (default) | `local` when the client looks graphical (`WAYLAND_DISPLAY` or `DISPLAY` set, and `SSH_CONNECTION`/`SSH_TTY` unset), otherwise `none` |
+| `auto` (default) | On WSL2 with interop, use the Windows side (§11a.4). Otherwise `local` when the client looks graphical (`WAYLAND_DISPLAY` or `DISPLAY` set, and `SSH_CONNECTION`/`SSH_TTY` unset), and `none` if not. |
 | `local` | The client's own backend, `crate::platform::current()` (§10.4) |
 | `agent` | Ask the agent through the `OpenUrl`/`Notify` RPCs (§10.5). The agent uses its own backend, which may be the platform helper (§6.3). Useful when the agent has a desktop session the client lacks, and on macOS where notifications need the helper app. |
 | `command` | Run a different helper program supplied by the user (§10.3) |
@@ -1312,6 +1426,70 @@ The reference workflow is long-lived **tmux sessions on a remote host, reached o
 - polkit's PAM stack (`/etc/pam.d/polkit-1`) can use `pam_fprintd` or `pam_u2f` on local machines.
 - For SSH, the ssh-agent method is preferred, because a FIDO key on the local machine cannot be reached through PAM on the remote host.
 
+## 11a. WSL2
+
+WSL2 runs a real Linux kernel in a lightweight VM, so §3–§11 apply inside a distribution unchanged. Two things differ: Windows interop, and the authenticators available on the Windows side. WSL1 translates system calls instead of running a Linux kernel, and is not supported for hardening. On WSL1, `doctor` reports `HARDENING_STATE_MISCONFIGURED`.
+
+### 11a.1 Detection (agent)
+
+- **WSL2**: `/proc/sys/kernel/osrelease` contains `microsoft-standard-WSL2`, and `/run/WSL` exists.
+- **Interop enabled**: `/proc/sys/fs/binfmt_misc/WSLInterop` (or `WSLInterop-late`) exists, and its first line is `enabled`.
+
+These facts are agent-determined and feed `context.wsl_interop` (§9.2), `GetAgentStatus` capability notes and `doctor`.
+
+### 11a.2 Interop makes root reachable
+
+With interop enabled, any process in the distribution can run Windows programs as the Windows user, including `wsl.exe`. `wsl.exe -u root` opens a root shell in the distribution without authentication. This is documented from the Windows side; **Q-W1** confirms it from inside a session.
+
+So with interop on, same-user Linux code can become root and bypass the marker group, the protected directory and the agent's memory protection (§2.4). mairu still runs hardened in this mode, reports `context.wsl_interop = true`, and `harden` and `doctor` warn.
+
+Windows-side code running as the same Windows user can do this with or without interop. Like root, it is outside the threat model: on WSL2 the Windows account sits at the top of the trust chain.
+
+### 11a.3 Profiles
+
+| | Integrated (interop on, the WSL default) | Isolated (interop off) |
+|---|---|---|
+| Root reachable by same-user Linux code | Yes, through `wsl.exe -u root` | No; as native Linux |
+| Strength | A guardrail against over-eager tools such as AI agents, and against accidents. Not a boundary against malicious code. | As native Linux (§2.4) |
+| Presence methods | `windows-hello` (§8.10). `ssh-agent` through a relay of the Windows OpenSSH agent (npiperelay + socat, or `wsl2-ssh-agent`). `platform` through `pkttyagent`. | `ssh-agent`, by SSHing into the distribution from Windows with `ssh -A`. This is the headless reference workflow (§11). `platform` through `pkttyagent`. |
+| `open_url` in `auto` mode | The Windows default browser: `wslview` when installed, otherwise `explorer.exe <url>` | URL printed, or `command` mode |
+| `notify` in `auto` mode | None. Use `command` mode with a Windows toast helper. | None |
+| Secret Service | Usually absent | Usually absent |
+
+To disable interop, write `/etc/wsl.conf` and then restart the distribution from Windows (`wsl.exe --terminate <distro>`). Turning it back on requires root inside the distribution, or Windows-side access.
+
+```ini
+[interop]
+enabled = false
+appendWindowsPath = false
+```
+
+### 11a.4 Integration points
+
+- **`open_url`.** On WSL2 with interop, `auto` (§10.2) resolves to: `wslview` when installed, else `explorer.exe` located through `wslpath`, started via `hardening::command()`. This takes precedence over WSLg's `DISPLAY`/`WAYLAND_DISPLAY`, since the Linux side usually has no browser.
+- **`doctor`** reports:
+  - the WSL version, interop state and profile in effect
+  - whether the Windows Hello helper is reachable and its key enrolled
+  - whether a relayed Windows OpenSSH agent is reachable
+- **`harden`** on WSL2 with interop enabled proceeds, but prints the root-reachability warning and how to disable interop.
+- **Policy.** `context.wsl_interop` lets a policy refuse sensitive roles while interop is on:
+
+  ```cedar
+  @id("no-prod-with-interop")
+  forbid (principal, action, resource in Mairu::Account::"999999999999")
+  when { context has wsl_interop && context.wsl_interop };
+  ```
+
+- **`sudo`.** `pam_wsl_hello` (WSL-Hello-sudo) backs `sudo` with Windows Hello, which addresses the `sudo` row of §2.4. It cannot close the interop row.
+
+### 11a.5 Open questions (need a WSL2 host)
+
+- **Q-W1**: `wsl.exe -u root` started from inside a WSL2 session obtains root without authentication.
+- **Q-W2**: the padding of KeyCredential signatures, PSS or PKCS #1 v1.5. Microsoft's documentation contradicts itself; pin it with a test vector.
+- **Q-W3**: whether Windows OpenSSH's FIDO support (`webauthn.dll`) can use Windows Hello itself as the authenticator on current builds. Reports vary by build. If it can, the isolated profile gets Windows Hello through ssh-agent forwarding with no helper at all.
+- **Q-W4**: whether a channel that doesn't use interop is practical for Windows Hello in the isolated profile. For example, a Hyper-V socket (`AF_VSOCK`) to a Windows-side service; registering one needs Windows administrator rights.
+- **Q-W5**: how WSLg should influence `auto` modes beyond §11a.4.
+
 ## 12. macOS design (implemented separately)
 
 This section is the brief for the macOS implementation. Items marked **Q** must be settled there and written back into this spec.
@@ -1335,6 +1513,8 @@ This section is the brief for the macOS implementation. Items marked **Q** must 
    - (b) a Secure Enclave P-256 key (`kSecAttrTokenIDSecureEnclave`) signing the digest, with the signature in `$HOME` and the latest digest also kept in the Keychain to prevent rollback.
 
    Option (b) needs `keychain-access-groups`, which likely means an app bundle and a provisioning profile, i.e. the helper. Report the result through `IntegrityStoreKind` `KEYCHAIN` / `SECURE_ENCLAVE`.
+
+   Whatever the choice, the store must hold the whole `IntegrityRecord`, including the approval anchor (§9.7), where same-user code cannot rewrite it. On macOS the top of the trust chain (§2.4) is the administrator account: `sudo`, and authorization rights in `/etc/authorization`.
 6. **Notifications.** `UNUserNotificationCenter` requires a bundle, so expect `Mairu Helper.app` (`co.0w0.mairu.platform-helper`) serving `PlatformHelper` with mutual verification (§6.3). **Q:** launched by the agent (`open -a` / LaunchServices) or as a LaunchAgent with XPC.
 7. **Open URL.** `NSWorkspace` or `/usr/bin/open`, in the user's GUI session.
 8. **AI-agent ancestry.** The same rules, using `proc_pidinfo`.
@@ -1366,6 +1546,9 @@ This section is the brief for the macOS implementation. Items marked **Q** must 
 | Password capture in tmux/tty | Documented; ssh-agent FIDO preferred (§8.4, §8.7) |
 | Abuse of the forwarded ssh-agent | Touch required; challenge bound to peer + request; single use; 60 s (§8.7) |
 | Fake polkit, D-Bus or `pkttyagent` | System bus path pinned; authority uid 0; fixed `/usr/bin/pkttyagent` with ownership check (§6.4, §8.4) |
+| Approval downgraded to a password by editing or tampering with `authorization.json` | Approval uses only the anchor in the last approved record (§9.7, §9.9) |
+| Root reached through `sudo`/polkit passwords, `NOPASSWD`, root-equivalent groups | Out of scope, but it bounds everything (§2.4); `doctor` warns |
+| Root reached through WSL2 interop (`wsl.exe -u root`) | Isolated profile, or `context.wsl_interop` forbids; `doctor` and `harden` warn (§11a) |
 | Rogue platform helper or rogue helper caller | Mutual verification with pid pinning; fail closed (§6.3) |
 | User in the marker group | Detected → `Misconfigured`; `harden` refuses (§4.2, §4.4) |
 | Hardlinked old hardened binaries | `fs.protected_hardlinks` warning; atomic replace (§3.1, §4.4) |
@@ -1388,13 +1571,19 @@ Logging: authorization decisions go to the agent log at `info` (peer pid, sessio
   - policy integrity per store
   - grant and lease counts
   - warnings: protected hardlinks, marker membership, missing `SO_PEERPIDFD`, Secret Service unavailable, stale `SSH_AUTH_SOCK`, no tty
+  - root reachability (§2.4):
+    - `sudo -n true` succeeding, meaning `NOPASSWD` or a cached timestamp; run through `hardening::command()`
+    - membership in `docker`, `lxd`, `incus-admin` or `disk`
+    - WSL2 interop (§11a)
+    - `"platform"` in an anchored `approval_methods` while keys are registered
 
 ## 16. Scope
 
-**In scope (Linux):** §4–§11 and the `mairu doctor`, `mairu lock`, `mairu policy`, `mairu harden` and `mairu platform-helper` commands.
+**In scope (Linux):** §4–§11a, and the `mairu doctor`, `mairu lock`, `mairu policy`, `mairu harden` and `mairu platform-helper` commands. The WSL2 Linux-side parts can be built here. The Windows helper, and verification of §11a.5, need a Windows host with WSL2.
 
 **Out of scope, and future work:**
 - macOS implementation (§12)
+- WSL1 hardening (§11a)
 - BSD (§13)
 - Tokens wrapped by TPM or Secure Enclave and unwrapped only for use, plus a zeroizing global allocator (`zeroizing-alloc`) so HTTP client buffers are wiped too
 - Integrity for `servers.d` and `.mairu.json` trust records
@@ -1411,12 +1600,13 @@ Delivered as a `gh stack`, one PR per layer.
 | `hardening/spec` | `docs/specs/agent-hardening.md` |
 | `hardening/marker-gid` | `src/hardening.rs`, `src/main.rs`, `src/agent.rs` (connect), `src/cmd/agent.rs` (listen, spawn), `src/cmd/exec.rs` (executor drop), `Cargo.toml` (`nix` features `user`, `socket`) |
 | `hardening/peer-verification` | `src/platform/{mod,fallback}.rs`, `src/platform/linux/{mod,procfs,peer}.rs`, `proto/mairu_platform.proto`, `proto/mairu.proto` (`GetAgentStatus`, `AuthorizationError`), `build.rs`, `src/proto.rs`, `src/agent.rs`, `src/cmd/agent.rs` (`PeerStream`, replacement), `src/cmd/kill_agent.rs`, `src/cmd/doctor.rs`, `src/main.rs` |
-| `hardening/install` | `src/cmd/harden.rs`, `src/hardening.rs` (re-exec, validation, suggestion), `pkg/debian/postinst`, `pkg/sysusers.d/mairu.conf`, `pkg/tmpfiles.d/mairu.conf` |
+| `hardening/install` | `src/cmd/harden.rs` (including `--reset-policy-record`), `src/hardening.rs` (re-exec, validation, suggestion), `src/cmd/doctor.rs` (root-reachability warnings), `pkg/debian/postinst`, `pkg/sysusers.d/mairu.conf`, `pkg/tmpfiles.d/mairu.conf` |
 | `hardening/authorization` | `src/authorization.rs` (grants, leases, decision procedure), `src/policy/{mod.rs,mairu.cedarschema,builtin/*.cedar}` (Cedar engine with built-in policies only), `src/platform/linux/polkit.rs`, `pkg/polkit/co.0w0.mairu.policy`, `proto/mairu.proto` (`ClientContext`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs`, `src/ecs_server.rs`, `Cargo.toml` (`cedar-policy`, `zbus`, `zbus_polkit`, deb asset) |
 | `hardening/headless` | `src/polkit_tty_agent.rs`, client retry paths, `src/cmd/doctor.rs` |
 | `hardening/ai-agents` | `src/authorization.rs` (signals), `src/platform/linux/procfs.rs` (ancestry), client `env_names` |
-| `hardening/policy` | `src/policy/{files,integrity_state,settings}.rs` (user files, tighten-only and lockdown sets), `src/platform/linux/integrity.rs`, `proto/mairu.proto` (`GetPolicy`, `ApprovePolicy`), `src/cmd/policy.rs` (`init`, `check`, `show`, `explain`, `schema`, `approve`), `Cargo.toml` (Secret Service crate) |
+| `hardening/policy` | `src/policy/{files,integrity_state,settings}.rs` (user files, tighten-only and lockdown sets, approval anchor), `src/platform/linux/integrity.rs`, `proto/mairu.proto` (`GetPolicy`, `ApprovePolicy`), `src/cmd/policy.rs` (`init`, `check`, `show`, `explain`, `schema`, `approve`), `Cargo.toml` (Secret Service crate) |
 | `hardening/ssh-agent` | `src/ssh_agent_presence.rs`, `proto/mairu.proto` (challenge messages), client relay, `Cargo.toml` (`ssh-key`, `ssh-encoding`) |
+| `hardening/wsl` | `src/platform/linux/wsl.rs` (detection, `wsl_interop`, Windows-side `open_url`), `src/windows_hello.rs` (agent verification, client relay), `windows-hello-helper/` (Windows binary, `windows` crate), `src/cmd/policy.rs` (`enroll-windows-hello`), `proto/mairu.proto` (`windows_hello_signature`), `.github/workflows/release.yml` (Windows helper builds), README WSL2 guide |
 | `hardening/notify` | `src/convenience.rs` (mode resolution, helper commands, rate limits), `src/config.rs` (`UserConfig.open_url`, `UserConfig.notify`), `src/platform/linux/{notify,open_url}.rs`, `proto/mairu.proto` (`OpenUrl`, `Notify`, `PingAgentResponse.policy_integrity`), `src/agent.rs`, `src/cmd/{login,exec}.rs` (`--no-browser`, event emission) |
 | `hardening/platform-helper` | `src/platform/remote.rs`, `src/cmd/platform_helper.rs` |
 
@@ -1448,6 +1638,13 @@ Linux:
 - [ ] Notifications and open-url: backends, client-chosen modes (`auto|local|agent|command|none`), agent `OpenUrl`/`Notify` RPCs
 - [ ] Platform helper with mutual verification
 - [ ] Manual end-to-end verification: GUI session, SSH + tmux, headless
+- [ ] Root-reachability warnings in `doctor`; `harden --reset-policy-record`
+- [ ] Approval anchor in integrity records
+
+WSL2 (§11a):
+- [ ] Detection and `context.wsl_interop`; Windows-side `open_url`
+- [ ] Windows Hello method and `mairu-windows-hello.exe`
+- [ ] Settle Q-W1–Q-W5 on a WSL2 host
 
 macOS (separate implementation, §12):
 - [ ] Settle the Q items in §12 and write them back here
@@ -1471,3 +1668,4 @@ Future:
 - 2026-10-23: Notifications and URL opening moved to client-side emission with client-chosen modes (§10).
 - 2026-10-23: Corrected the tty password-capture vectors (input paths, not output capture); `sudo` escalation stated as out of scope (§2.2, §8.4).
 - 2026-10-23: Policy redesigned around Cedar (`cedar-policy` 4.x): presence as context, built-in policies, forbid-only tightening (§8.5, §9). Schema and all policies in this spec validated with cedar-policy 4.14.0 in strict mode.
+- 2026-10-23: Added the trust chain and weakest-link analysis (§2.4); approval now uses the approval anchor stored with the integrity record, so a captured password cannot approve a policy once keys are registered (§9.7–§9.9); WSL2 profiles and Windows Hello method (§8.10, §11a).
