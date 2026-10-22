@@ -38,11 +38,14 @@ Code running **as the same Unix user** as the human, which the human did not int
 - ptrace the user's ordinary, dumpable processes (subject to `kernel.yama.ptrace_scope`)
 - read and write the user's Secret Service (no per-application access control on Linux) and claim names on the user's session D-Bus
 - use the user's forwarded SSH agent socket
-- observe the user's tmux panes (`tmux pipe-pane`, `capture-pane`)
+- open the user's ptys (`/dev/pts/N` belongs to the user) and race the foreground program for keystrokes
+- drive the user's tmux server through its socket: key bindings that log and forward every key, `send-keys`, and `pipe-pane -I` to inject input
 
 ### 2.2 Out of scope
 
 Root, kernel compromise, physical access, and malicious credential servers or IdPs.
+
+Escalation to root through the user's own `sudo` is also out of scope. If the user types the sudo password where same-user code can capture it (§8.4), that code can become root. mairu cannot defend against that, and its guarantees hold only on hosts where sudo is not used that way, or is backed by FIDO.
 
 Credentials *after delivery* are also out of scope. Once `mairu exec` hands credentials to the user's command, same-user code that can inspect that command (its environment, its memory, or the ECS bearer token in its environment) can take them. This design protects the agent's ability to mint credentials for arbitrary roles and its session tokens. It does not protect credentials already given to an unprotected process.
 
@@ -734,7 +737,14 @@ SessionIdentity =
 
 The process that spawns `pkttyagent` is the one making the RPC, so polkit's subject and the registered agent are the same process. For `exec` that is the sidecar.
 
-**Risk documented for users:** a tty password prompt can be captured by same-user code (`tmux pipe-pane`, terminal emulator or `pkttyagent` memory via ptrace) and replayed later. Prefer ssh-agent presence (§8.7) on shared or headless hosts.
+**Risk documented for users:** same-user code can capture a password typed at a tty prompt and replay it later. The echo is off, so output capture such as `pipe-pane -O` or `capture-pane` does not see it. Input capture does:
+
+- reading the pane's pty concurrently
+- tmux key bindings installed through the server socket
+- a fake prompt written to the pty first
+- ptrace of the terminal path when `kernel.yama.ptrace_scope = 0`
+
+This is the same exposure as `sudo`'s prompt in the same pane, and `auth_self` asks for the same login password. So on a host where the user types the sudo password into tmux, same-user code can already become root, which defeats everything here (§2.2). The mairu prompt adds more opportunities, not a new kind of exposure. Prefer ssh-agent presence (§8.7). For `sudo` itself, the analogous fix is FIDO-backed PAM: `pam_u2f` locally, or `pam_ssh_agent_auth` with an `sk-` key over SSH.
 
 ### 8.5 Grants, leases and the evaluation order
 
@@ -1241,3 +1251,4 @@ Future:
 
 - 2026-10-23: Spec drafted (Linux implementation plan, macOS brief).
 - 2026-10-23: Notifications and URL opening moved to client-side emission with client-chosen modes (§10).
+- 2026-10-23: Corrected the tty password-capture vectors (input paths, not output capture); `sudo` escalation stated as out of scope (§2.2, §8.4).
