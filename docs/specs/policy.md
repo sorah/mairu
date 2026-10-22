@@ -121,7 +121,7 @@ All authorization state is in memory only. Restarting the agent forgets every gr
      - The request carries a valid response (`sshsig` or `windows_hello_signature`) for an outstanding challenge of that method → verify → permit.
      - It carries `declined` → continue with the next method.
      - Otherwise → issue a challenge for that method → `REASON_CHALLENGE`.
-   - **platform** (`Platform::authorize`):
+   - **platform** (`PlatformServices::authorize`, served by the platform helper):
      - `ALLOWED` → permit.
      - `DENIED`/`CANCELLED` → `REASON_DENIED`.
      - `UNAVAILABLE`/`no-authentication-agent` → `REASON_NO_AUTHENTICATION_AGENT`.
@@ -177,21 +177,21 @@ A presence method asks the human and proves the answer to the agent. Methods are
 
 | Method | Mechanism | Proof |
 |---|---|---|
-| `platform` | The platform's facility: polkit on Linux, LocalAuthentication on macOS ([platform-helper §6](platform-helper.md)) | A yes/no from a verified backend |
+| `platform` | The platform's facility: polkit on Linux, LocalAuthentication on macOS ([platform-helper §6](platform-helper.md)) | A yes/no from the verified platform helper |
 | `ssh-agent` | FIDO touch through the forwarded SSH agent (§6.2) | Signature over a challenge |
 | `windows-hello` | Windows Hello key credential on WSL2 (§6.3) | Signature over a challenge |
 
 ### 6.1 Platform method
 
 ```text
-Platform::authorize(ACTION_ASSUME_ROLE, subject = peer, details)
+PlatformServices::authorize(ACTION_ASSUME_ROLE, subject = peer, details)   → platform helper
   ALLOWED                              → permit
   DENIED / CANCELLED                   → REASON_DENIED
   UNAVAILABLE no-authentication-agent  → REASON_NO_AUTHENTICATION_AGENT (client may run pkttyagent)
   UNAVAILABLE other                    → next method
 ```
 
-The agent calls `Platform::authorize` with action `ACTION_ASSUME_ROLE` or `ACTION_APPROVE_POLICY`, the peer as the subject, and the details of §7. Results map as in §4 (step 4). The Linux backend, including the `pkttyagent` fallback for headless sessions, is specified in [platform-helper §6.1](platform-helper.md), and the macOS one in [platform-helper §11](platform-helper.md).
+The agent calls `PlatformServices::authorize`, which the platform helper serves ([platform-helper §4](platform-helper.md)), with action `ACTION_ASSUME_ROLE` or `ACTION_APPROVE_POLICY`, the peer as the subject, and the details of §7. Results map as in §4 (step 4). The Linux backend, including the `pkttyagent` fallback for headless sessions, is specified in [platform-helper §6.1](platform-helper.md), and the macOS one in [platform-helper §11](platform-helper.md).
 
 ### 6.2 ssh-agent presence (FIDO touch through the forwarded agent)
 
@@ -991,3 +991,4 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - 2026-10-23: Approval anchored in the integrity record; Windows Hello method added.
 - 2026-10-23: Split out of the combined spec.
 - 2026-10-23: Added show-me style visual summaries to every section (additive; Mermaid blocks validated with mermaid 11.4.1).
+- 2026-10-23: The platform method goes through the separate platform helper.

@@ -5,7 +5,7 @@ Mutual verification between `mairu` clients and `mairu agent`, the hardened inst
 Related specs:
 
 - [policy.md](policy.md): when the agent asks the human, how answers are remembered, and the Cedar policy that decides it.
-- [platform-helper.md](platform-helper.md): the platform abstraction, the `mairu.platform` protocol, the optional out-of-process platform helper, and the platform backends (polkit, integrity stores, notifications, opening URLs).
+- [platform-helper.md](platform-helper.md): the platform abstraction, the `mairu.platform` protocol, the separate platform helper process that runs every platform service, and the platform backends (polkit, integrity stores, notifications, opening URLs).
 
 Each section opens with a short visual summary. It is illustrative; the text after it is normative.
 
@@ -16,7 +16,7 @@ flowchart LR
   C["mairu client<br/>setgid marker"] -- "verified both ways<br/>(this spec)" --> A["mairu agent"]
   X["other same-uid code"] -. "rejected" .-> A
   A -- "when to ask the human<br/>(policy.md)" --> P["Cedar policy"]
-  A -- "how to ask, store, notify<br/>(platform-helper.md)" --> F["Platform trait"]
+  A -- "how to ask, store, notify<br/>(platform-helper.md)" --> F["platform helper<br/>(separate process)"]
 ```
 
 `mairu agent` holds credential-server sessions in memory and vends AWS credentials to whoever connects to its Unix socket. Today that is any process running as the user. Nothing checks who the client is, nothing lets a client check who the agent is, and nothing asks the human before credentials leave the agent.
@@ -25,7 +25,7 @@ Together with the related specs, this work adds three things:
 
 1. **Mutual verification** between `mairu` (clients) and `mairu agent`, anchored in a platform mechanism that same-user code cannot forge. Clients only talk to a genuine agent, and the agent only serves genuine clients. Covered here.
 2. **Platform authorization.** The agent asks the human, through a platform facility, before vending credentials, and remembers the answer per terminal session for a short time. When to ask is decided by a [Cedar](https://www.cedarpolicy.com/) policy, in which a human check is just another condition, as MFA is in AWS IAM. The user's policy is integrity-protected. Covered in [policy.md](policy.md).
-3. **A common platform protocol** (`mairu.platform`, protobuf) and a matching Rust trait, covering authorization prompts, integrity records, notifications and opening URLs, so the agent core stays platform-independent and an out-of-process helper can serve the same contract. Notifications and opening URLs carry no security weight, and each client chooses how they are delivered. Covered in [platform-helper.md](platform-helper.md).
+3. **A common platform protocol** (`mairu.platform`, protobuf) and a matching Rust trait, covering authorization prompts, integrity records, notifications and opening URLs, so the agent core stays platform-independent. Every platform service runs in a separate platform helper process that shares the agent's lifetime. Notifications and opening URLs carry no security weight, and each client chooses how they are delivered. Covered in [platform-helper.md](platform-helper.md).
 
 Linux is implemented first, with WSL2 as a first-class variant (§8). macOS is designed in these specs and implemented separately against them. BSD is design-only.
 
@@ -49,7 +49,7 @@ agent
 | grant | A remembered authorization keyed by (session identity, server, rolespec), with an idle timeout and a hard cap. |
 | lease | A remembered authorization tied to one live `mairu exec` sidecar process, valid for that process's lifetime. |
 | integrity record | A digest (or signature) of the user policy file, kept where same-user code cannot rewrite it. |
-| platform helper | An optional out-of-process server of the `mairu.platform.PlatformHelper` service. |
+| platform helper | The separate process, spawned by the agent and sharing its lifetime, that serves the `mairu.platform.PlatformHelper` service. Every platform service runs there. |
 
 ## 2. Threat model
 
@@ -243,7 +243,7 @@ flowchart LR
 | `/usr/share/polkit-1/actions/co.0w0.mairu.policy` | `root:root` | `0644` | polkit actions ([platform-helper §6.1](platform-helper.md)) |
 | `/var/lib/mairu` | `root:mairu` | `2770` | Protected state root. Users cannot traverse it, but the marker gid can. |
 | `/var/lib/mairu/users` | `root:mairu` | `2770` | |
-| `/var/lib/mairu/users/<uid>` | `<uid>:mairu` | `0700` | Per-user integrity records ([policy §9.7](policy.md)). Created by the agent with the marker gid held. |
+| `/var/lib/mairu/users/<uid>` | `<uid>:mairu` | `0700` | Per-user integrity records ([policy §9.7](policy.md)). Created by the platform helper with the marker gid held ([platform-helper §7](platform-helper.md)). |
 
 `/var/lib/mairu/users/<uid>` is owned by the user, but the user cannot reach it by path: they are neither owner nor group of `/var/lib/mairu`, and "other" has no search permission. Only a process holding the marker gid can open it, and the genuine agent only ever opens the directory for `getuid()`. User namespaces do not help, because unmapped owners keep their permission semantics.
 
@@ -284,7 +284,8 @@ Process-specific rules:
 
 - **Executor** (`mairu exec` parent): drops permanently before `exec`'ing the user's command. Without this, the command (attacker-influenced) would inherit `egid == mairu` and pass the agent's check.
 - **Sidecar** (`mairu exec` child): keeps the saved marker for reconnects, and holds the effective marker only inside `with_privileged_gid`.
-- **Agent**: holds the effective marker only for `listen()` and protected-directory I/O.
+- **Agent**: holds the effective marker only for `listen()` and for creating the platform helper's socketpair ([platform-helper §4](platform-helper.md)).
+- **Platform helper**: holds it only for protected-directory I/O.
 
 ### 4.3 Re-exec from non-packaged installs
 
@@ -488,7 +489,7 @@ starttime = field 22                     # clock ticks since boot
 pidfd still alive after reading?         # values belong to this process, not a recycled pid
 ```
 
-`src/platform/linux/procfs.rs` parses `/proc/<pid>/stat` by splitting at the **last** `)` (comm may contain spaces and parentheses), giving:
+`src/platform/process/linux/procfs.rs` parses `/proc/<pid>/stat` by splitting at the **last** `)` (comm may contain spaces and parentheses), giving:
 
 - field 4 `ppid`
 - 5 `pgrp`
@@ -537,7 +538,7 @@ message GetAgentStatusResponse {
   PolicyIntegrity policy_integrity = 5;
   uint32 grants = 6;
   uint32 leases = 7;
-  string platform_backend = 8;          // "linux" | "remote" | "fallback"
+  string platform_helper = 8;           // e.g. "running pid=4321 verified", "unavailable: helper-unverified"
   repeated string authorization_methods = 9;  // effective order, e.g. ["ssh-agent", "platform"]
 }
 
@@ -744,6 +745,7 @@ diagnose    mairu doctor
 - **Uninstall**: `sudo mairu harden --uninstall [--purge]`, then optionally `groupdel mairu`.
 - **Diagnostics**: `mairu doctor` (`GetAgentStatus`, `GetPolicy`, plus local checks) shows:
   - client and agent hardening, paths and versions
+  - the platform helper's state: pid, verified, last respawn ([platform-helper §4](platform-helper.md))
   - the caller as the agent sees it
   - capabilities and their notes
   - effective methods: polkit reachable and agent present, `SSH_AUTH_SOCK` reachable and registered keys present
@@ -776,8 +778,8 @@ out   macOS implementation · WSL1 · BSD · TPM token wrapping · servers.d int
 ## 14. Deliverables and stack
 
 ```text
-(main) ← spec ← marker-gid ← peer-verification ← install ← authorization ← headless
-       ← ai-agents ← policy ← ssh-agent ← wsl ← notify ← platform-helper
+(main) ← spec ← marker-gid ← peer-verification ← install ← platform-helper ← authorization
+       ← headless ← ai-agents ← policy ← ssh-agent ← wsl ← notify
 ```
 
 The three specs are delivered together as one `gh stack`, one PR per layer, in this order. Each layer updates `README.md`, `CHANGELOG.md` (`[not yet released]`) and the Current Status of every spec it implements.
@@ -786,16 +788,16 @@ The three specs are delivered together as one `gh stack`, one PR per layer, in t
 |---|---|---|
 | `hardening/spec` | all | `docs/specs/{hardening,policy,platform-helper}.md` |
 | `hardening/marker-gid` | hardening | `src/hardening.rs`, `src/main.rs`, `src/agent.rs` (connect), `src/cmd/agent.rs` (listen, spawn), `src/cmd/exec.rs` (executor drop), `Cargo.toml` (`nix` features `user`, `socket`) |
-| `hardening/peer-verification` | hardening, platform-helper | `src/platform/{mod,fallback}.rs`, `src/platform/linux/{mod,procfs,peer}.rs`, `proto/mairu_platform.proto`, `proto/mairu.proto` (`GetAgentStatus`, `AuthorizationError`), `build.rs`, `src/proto.rs`, `src/agent.rs`, `src/cmd/agent.rs` (`PeerStream`, replacement), `src/cmd/kill_agent.rs`, `src/cmd/doctor.rs`, `src/main.rs` |
+| `hardening/peer-verification` | hardening, platform-helper | `src/platform/mod.rs`, `src/platform/process/{linux,fallback}.rs`, `proto/mairu_platform.proto`, `proto/mairu.proto` (`GetAgentStatus`, `AuthorizationError`), `build.rs`, `src/proto.rs`, `src/agent.rs`, `src/cmd/agent.rs` (`PeerStream`, replacement), `src/cmd/kill_agent.rs`, `src/cmd/doctor.rs`, `src/main.rs` |
 | `hardening/install` | hardening | `src/cmd/harden.rs` (including `--reset-policy-record`), `src/hardening.rs` (re-exec, validation, suggestion), `src/cmd/doctor.rs` (root-reachability warnings), `pkg/debian/postinst`, `pkg/sysusers.d/mairu.conf`, `pkg/tmpfiles.d/mairu.conf` |
-| `hardening/authorization` | policy, platform-helper | `src/authorization.rs`, `src/policy/{mod.rs,mairu.cedarschema,builtin/*.cedar}`, `src/platform/linux/polkit.rs`, `pkg/polkit/co.0w0.mairu.policy`, `proto/mairu.proto` (`ClientContext`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs`, `src/ecs_server.rs`, `Cargo.toml` (`cedar-policy`, `zbus`, `zbus_polkit`, deb asset) |
+| `hardening/platform-helper` | platform-helper | `src/platform/helper.rs` (`HelperClient`, spawn, respawn), `src/cmd/platform_helper.rs` (hidden `mairu platform-helper --fd`), `src/platform/services/{mod,fallback}.rs`, agent startup wiring |
+| `hardening/authorization` | policy, platform-helper | `src/authorization.rs`, `src/policy/{mod.rs,mairu.cedarschema,builtin/*.cedar}`, `src/platform/services/linux/polkit.rs`, `pkg/polkit/co.0w0.mairu.policy`, `proto/mairu.proto` (`ClientContext`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs`, `src/ecs_server.rs`, `Cargo.toml` (`cedar-policy`, `zbus`, `zbus_polkit`, deb asset) |
 | `hardening/headless` | platform-helper | `src/polkit_tty_agent.rs`, client retry paths, `src/cmd/doctor.rs` |
-| `hardening/ai-agents` | policy | `src/authorization.rs` (signals), `src/platform/linux/procfs.rs` (ancestry), client `env_names` |
-| `hardening/policy` | policy, platform-helper | `src/policy/{files,integrity_state,settings}.rs`, `src/platform/linux/integrity.rs`, `proto/mairu.proto` (`GetPolicy`, `ApprovePolicy`), `src/cmd/policy.rs`, `Cargo.toml` (Secret Service crate) |
+| `hardening/ai-agents` | policy | `src/authorization.rs` (signals), `src/platform/process/linux/procfs.rs` (ancestry), client `env_names` |
+| `hardening/policy` | policy, platform-helper | `src/policy/{files,integrity_state,settings}.rs`, `src/platform/services/linux/integrity.rs`, `proto/mairu.proto` (`GetPolicy`, `ApprovePolicy`), `src/cmd/policy.rs`, `Cargo.toml` (Secret Service crate) |
 | `hardening/ssh-agent` | policy | `src/ssh_agent_presence.rs`, `proto/mairu.proto` (challenge messages), client relay, `Cargo.toml` (`ssh-key`, `ssh-encoding`) |
-| `hardening/wsl` | hardening, policy, platform-helper | `src/platform/linux/wsl.rs` (detection, `wsl_interop`, Windows-side `open_url`), `src/windows_hello.rs`, `windows-hello-helper/`, `src/cmd/policy.rs` (`enroll-windows-hello`), `proto/mairu.proto` (`windows_hello_signature`), `.github/workflows/release.yml`, README WSL2 guide |
-| `hardening/notify` | platform-helper | `src/convenience.rs`, `src/config.rs` (`UserConfig.open_url`, `UserConfig.notify`), `src/platform/linux/{notify,open_url}.rs`, `proto/mairu.proto` (`OpenUrl`, `Notify`, `PingAgentResponse.policy_integrity`), `src/agent.rs`, `src/cmd/{login,exec}.rs` |
-| `hardening/platform-helper` | platform-helper | `src/platform/remote.rs`, `src/cmd/platform_helper.rs` |
+| `hardening/wsl` | hardening, policy, platform-helper | `src/platform/process/linux/wsl.rs` (detection, `wsl_interop`), `src/platform/services/linux/wsl.rs` (Windows-side `open_url`), `src/windows_hello.rs`, `windows-hello-helper/`, `src/cmd/policy.rs` (`enroll-windows-hello`), `proto/mairu.proto` (`windows_hello_signature`), `.github/workflows/release.yml`, README WSL2 guide |
+| `hardening/notify` | platform-helper | `src/convenience.rs`, `src/config.rs` (`UserConfig.open_url`, `UserConfig.notify`), `src/platform/services/linux/{notify,open_url}.rs`, `proto/mairu.proto` (`OpenUrl`, `Notify`, `PingAgentResponse.policy_integrity`), `proto/mairu_platform.proto` (`SessionHint`), `src/agent.rs`, `src/cmd/{login,exec}.rs` |
 
 ## Current Status
 
@@ -835,3 +837,4 @@ Future:
 - 2026-10-23: Added the trust chain and weakest-link analysis (§2.4) and the WSL2 profiles (§8).
 - 2026-10-23: Split into hardening, policy and platform-helper specs.
 - 2026-10-23: Added show-me style visual summaries to every section (additive; Mermaid blocks validated with mermaid 11.4.1).
+- 2026-10-23: Platform services moved permanently into a separate platform helper process (platform-helper §1, §4); the helper layer moves early in the stack.

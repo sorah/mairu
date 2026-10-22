@@ -1,6 +1,6 @@
 # Platform abstraction and platform helper
 
-The platform-dependent features of `mairu agent` and its clients behind one Rust trait and one protobuf contract (`mairu.platform`), served in-process or by a mutually verified out-of-process helper, and the Linux backends.
+The platform-dependent code of mairu: process primitives that every process runs for itself, and platform services that always run in a separate platform helper process, which shares the agent's lifetime and is mutually verified with it, behind one protobuf contract (`mairu.platform`); plus the Linux backends.
 
 Related specs:
 
@@ -11,37 +11,54 @@ Each section opens with a short visual summary. It is illustrative; the text aft
 
 ## 1. Overview
 
-```text
-src/platform/
-├── mod.rs        # Platform trait, PeerIdentity, SessionIdentity, current()
-├── linux/        # in-process: procfs, peer, polkit, integrity, notify, open_url, wsl
-├── remote.rs     # RemotePlatform → PlatformHelper over a verified socket
-└── fallback.rs   # macOS and BSD until implemented
+```mermaid
+flowchart LR
+  C["mairu client<br/>process primitives · presence relays"] -- "one connection" --> A["mairu agent<br/>tokens · policy · process primitives"]
+  A -- "inherited socketpair<br/>shared lifetime, verified both ways" --> H["mairu platform-helper<br/>authorize · integrity stores · notify · open_url"]
 ```
 
-- The `Platform` trait (§2) and the `mairu.platform` protocol (§3) cover peer inspection, authorization prompts, integrity records, notifications and opening URLs, so the agent core stays platform-independent.
-- Linux implements the trait in-process. Platforms where a feature needs a separate identity, such as macOS notifications, which need an app bundle, use a helper process that serves the same protocol. Both directions of that connection are verified (§4).
-- In-process backends also verify the system services they call (§5).
+```text
+src/platform/
+├── mod.rs        # ProcessPlatform and PlatformServices traits, PeerIdentity, SessionIdentity
+├── process/      # in-process primitives per OS: linux (procfs, peer, wsl detection), fallback
+├── helper.rs     # HelperClient: the agent's only PlatformServices, over the socketpair
+└── services/     # backends that run only inside the helper: linux (polkit, integrity, notify, open_url, wsl), fallback
+```
+
+Platform-dependent code lives in four places, each with one home:
+
+| Kind | Runs in | Examples | Trust |
+|---|---|---|---|
+| Process primitives | Every mairu process, in-process, never remoted | marker gid, peer credentials (`inspect_peer`, `verify_agent`), process facts, safe spawning | Part of the process's own trust |
+| Platform services | **Only the platform helper**, on every OS | `authorize` (polkit, LocalAuthentication), integrity stores, `notify`, `open_url` | Verified both ways with the agent (§4) |
+| Presence relays | The client | `pkttyagent` registration (§6.1), ssh-agent signing and the Windows Hello helper ([policy §6](policy.md)) | Untrusted by design: the agent trusts only polkitd's own answer or a verified signature |
+| Convenience commands | The client | user `command` helpers for `notify` and `open_url` (§8) | No security weight |
+
+- **The agent never runs platform-service code.** The process that holds session tokens contains no D-Bus client, Secret Service, notification, desktop portal or LocalAuthentication code paths at run time. A bug reached through those surfaces lands in the helper, which holds no tokens.
+- **One code path.** The agent reaches every service through `HelperClient` (§2), always over IPC, with no in-process/IPC branching, on every OS.
+- **Clients make one connection**, to the agent. They reach services only through agent RPCs (`AssumeRole`, `ApprovePolicy`, `OpenUrl`, `Notify`, …), never directly.
+- **The helper shares the agent's lifetime** (§4): the agent spawns it, talks to it over an inherited socketpair, and the helper exits when the agent goes away.
+- **Packaging does not matter.** The helper is `mairu platform-helper`, the same binary, by default. A separately signed executable, inside an app bundle or not, can serve the same protocol under the same checks, and nothing else in these specs changes. No bundle is planned (§11).
+- Inside the helper, the Linux backends verify the system services they call (§5).
 - Backends: authorization facilities (§6), integrity stores (§7), and notifications and opening URLs (§8). Notifications and opening URLs carry no security weight, and each client chooses how they are delivered.
 - Headless Linux (§9) and WSL2 (§10) are first-class environments. The macOS backends are briefed in §11.
 
-## 2. Rust trait
+## 2. Rust traits
 
 ```text
-agent accept               → inspect_peer
-client connect             → verify_agent
-Authorizer (policy.md)     → session_identity, ancestry, authorize
-policy approval            → record_integrity, verify_integrity
-clients, convenience (§8)  → notify, open_url
+agent accept                → ProcessPlatform::inspect_peer               in-process
+client connect              → ProcessPlatform::verify_agent               in-process
+Authorizer (policy.md)      → ProcessPlatform::session_identity, ancestry in-process
+                            → PlatformServices::authorize                 helper
+policy approval             → PlatformServices::record/verify_integrity   helper
+OpenUrl / Notify RPCs (§8)  → PlatformServices::open_url, notify          helper
 ```
 
 `src/platform/mod.rs`:
 
 ```rust
-#[async_trait::async_trait]
-pub trait Platform: Send + Sync + std::fmt::Debug {
-    fn capabilities(&self) -> crate::proto::platform::Capabilities;
-
+/// Runs in-process in every mairu process; never remoted.
+pub trait ProcessPlatform: Send + Sync + std::fmt::Debug {
     /// Agent side, at accept time.
     fn inspect_peer(&self, stream: &tokio::net::UnixStream) -> crate::Result<PeerIdentity>;
     /// Client side, right after connect.
@@ -49,6 +66,13 @@ pub trait Platform: Send + Sync + std::fmt::Debug {
 
     fn session_identity(&self, peer: &PeerIdentity) -> Option<SessionIdentity>;
     fn ancestry(&self, peer: &PeerIdentity) -> Vec<crate::proto::platform::Process>;
+}
+
+/// The `PlatformHelper` contract (§3) as a trait. The agent only holds `HelperClient`;
+/// the backends that implement it run inside the platform helper.
+#[async_trait::async_trait]
+pub trait PlatformServices: Send + Sync + std::fmt::Debug {
+    async fn capabilities(&self) -> crate::proto::platform::Capabilities;
 
     async fn authorize(
         &self,
@@ -69,10 +93,14 @@ pub trait Platform: Send + Sync + std::fmt::Debug {
 
 - `PeerIdentity`: `uid`, `gid`, `pid`, `pidfd: Option<OwnedFd>`, `start_time: u64`, `exe: Option<PathBuf>`, `trust: PeerTrust`.
 - `SessionIdentity`: `enum { Tty { sid: i32, leader_start_time: u64 }, Parent { ppid: i32, start_time: u64 } }`.
-- `crate::platform::current()` returns, chosen by `cfg` and configuration:
-  - `LinuxPlatform`, in-process
-  - `RemotePlatform`, the helper client of §4
-  - `FallbackPlatform`: macOS and BSD until they are implemented. No verification (`Unverifiable`), authorization `UNAVAILABLE`, no integrity stores, no notifications. `open_url` uses `/usr/bin/open` on macOS.
+- `crate::platform::process()` returns the `ProcessPlatform` for the OS, chosen by `cfg`:
+  - `LinuxProcess`
+  - `FallbackProcess`: macOS and BSD until they are implemented. No verification (`Unverifiable`).
+- The agent's `PlatformServices` is always `HelperClient` (§4). When the helper is unavailable, every call returns `RESULT_UNAVAILABLE` (`helper-unavailable` or `helper-unverified`) and capabilities are empty, so the agent fails closed.
+- Inside the helper, `crate::platform::services()` returns the backend, chosen by `cfg`:
+  - `LinuxServices` (§5–§8, §10)
+  - `FallbackServices`: macOS and BSD until they are implemented. Authorization `UNAVAILABLE`, no integrity stores, no notifications. `open_url` uses `/usr/bin/open` on macOS.
+- Clients never construct a `PlatformServices`.
 
 ## 3. Protocol: `proto/mairu_platform.proto`
 
@@ -80,11 +108,11 @@ pub trait Platform: Send + Sync + std::fmt::Debug {
 mairu.platform.PlatformHelper
 ├── GetCapabilities  → {peer_verification, authorization, integrity_stores, notifications, open_url, notes}
 ├── Authorize        → ALLOWED | DENIED | CANCELLED | UNAVAILABLE(reason)
-├── Notify, OpenUrl
+├── Notify, OpenUrl                     # carry the client's SessionHint
 └── RecordIntegrity, VerifyIntegrity    # IntegrityRecord = digest + ApprovalAnchor
 ```
 
-The types here are the contract. The Linux backend uses them in-process, and an out-of-process helper serves the same messages over gRPC. Enum values are prefixed with the enum name, because proto3 enum values share their package's scope.
+The types here are the contract. The platform helper serves them over gRPC on the inherited socketpair (§4), and the agent is its only client. Enum values are prefixed with the enum name, because proto3 enum values share their package's scope.
 
 ```proto
 syntax = "proto3";
@@ -177,7 +205,7 @@ message AuthorizeResponse {
   }
   Result result = 1;
   // Machine-readable for UNAVAILABLE: "no-authentication-agent", "polkit-action-not-installed",
-  // "polkit-unavailable", "untrusted-authority", "helper-unverified", "timeout".
+  // "polkit-unavailable", "untrusted-authority", "helper-unavailable", "helper-unverified", "timeout".
   string reason = 2;
   string detail = 3;
 }
@@ -193,11 +221,23 @@ message NotifyRequest {
   string body = 2;
   Urgency urgency = 3;
   string event = 4;  // "login-required" | "ai-agent-denied" | "policy-lockdown"
+  SessionHint session = 5;
 }
 message NotifyResponse { bool delivered = 1; }
 
-message OpenUrlRequest { string url = 1; }
+message OpenUrlRequest {
+  string url = 1;
+  SessionHint session = 2;
+}
 message OpenUrlResponse { bool opened = 1; string detail = 2; }
+
+// The requesting client's desktop session, passed through by the agent (§8.4).
+message SessionHint {
+  string display = 1;                   // $DISPLAY
+  string wayland_display = 2;           // $WAYLAND_DISPLAY
+  string dbus_session_bus_address = 3;  // honored only as unix:path= under $XDG_RUNTIME_DIR
+  bool ssh = 4;                         // $SSH_CONNECTION or $SSH_TTY was set
+}
 
 // What a store keeps for a name ([policy §9.7](policy.md)).
 message IntegrityRecord {
@@ -237,21 +277,21 @@ message IntegrityStoreResult {
 
 Helpers reject requests whose `uid` differs from their own.
 
-## 4. Platform helper transport and mutual verification
+## 4. Platform helper process and mutual verification
 
 ```mermaid
 sequenceDiagram
   participant A as agent
   participant H as mairu platform-helper
-  A->>H: spawn /proc/self/exe platform-helper (setgid re-applies)
-  H->>H: listen() while holding egid=mairu
-  A->>H: connect() while holding egid=mairu
-  H->>H: peer gid mairu, same uid, pid equals getppid()
-  A->>A: helper gid mairu, same uid, pid equals spawned child
-  Note over A,H: any check fails → UNAVAILABLE, fail closed
+  A->>A: socketpair() while holding egid=mairu
+  A->>H: spawn own image with one end inherited (setgid re-applies)
+  H->>H: fd peer creds: same uid, gid mairu, pid equals getppid()
+  A->>A: helper is the child it exec'd, keep its pidfd
+  A->>H: GetCapabilities
+  Note over A,H: EOF → helper exits · helper gone → agent fails closed and respawns
 ```
 
-An out-of-process helper exists for platforms where a feature needs a separate identity. On macOS, `UNUserNotificationCenter` requires an app bundle, and Secure Enclave keys bound to a keychain access group require entitlements that a bare CLI cannot carry. On Linux the in-process backend is the default; the helper is opt-in and exists to exercise the transport.
+The helper is a separate process on every OS. It holds no tokens, and the agent never runs platform-service code itself (§1).
 
 Both directions are security-critical:
 
@@ -260,20 +300,22 @@ Both directions are security-critical:
 
 Rules:
 
-1. The same trust anchor as client ↔ agent, checked on **both** ends of every connection.
-2. **Linux/BSD:**
-   1. The agent spawns `/proc/self/exe platform-helper --socket <runtime_dir>/mairu-platform-<agent pid>.sock` via `hardening::command()`. The setgid bit re-applies the marker.
-   2. The helper binds and listens inside `with_privileged_gid`.
-   3. The helper accepts a connection only if `SO_PEERCRED` shows `uid == own`, `gid == mairu` (when hardened) and **`pid == getppid()`**. It serves exactly one such connection, rejects all others, and exits when the connection closes or the parent dies (`crate::ppid`).
-   4. The agent connects inside `with_privileged_gid`, and accepts the helper only if `SO_PEERCRED` shows `uid == own`, `gid == mairu` (when hardened) and **`pid == spawned child pid`**.
-   5. On an unhardened Linux system, the checks reduce to uid plus pid pinning.
-3. **macOS:**
-   - The helper verifies its caller against identifier `co.0w0.mairu` with the same team ID. The agent verifies the helper against identifier `co.0w0.mairu.platform-helper` with its own team ID.
-   - Use `xpc_connection_set_peer_code_signing_requirement` / `NSXPCConnection.setCodeSigningRequirement:` when on XPC, or `LOCAL_PEERTOKEN` on a socket. Pin the peer's pid and pid version.
-   - Ad-hoc builds need a cdhash pin recorded at install time; §11 settles this.
-4. If the helper is unverified, unreachable or crashed, `RemotePlatform` returns `RESULT_UNAVAILABLE` (`helper-unverified`) and empty capabilities. The agent fails closed. It respawns the helper at most once per 30 s.
+1. **Spawn.** At startup, before serving clients, the agent:
+   1. creates a `socketpair(AF_UNIX, SOCK_STREAM)` inside `with_privileged_gid`, so the credentials the kernel records for the pair carry the marker gid;
+   2. spawns its own image (`/proc/self/exe platform-helper --fd <n>` on Linux) via `hardening::command()`, with that end as the only inherited fd. The setgid bit re-applies the marker, which the helper needs for the protected directory (§7);
+   3. closes its copy of the helper's end.
 
-## 5. Verifying system services (Linux in-process backend)
+   There is no rendezvous in the filesystem, so there is nothing to squat. The helper runs from the setgid binary, so it is non-dumpable and its fd cannot be taken over through `/proc`.
+2. **The helper verifies the agent** before serving: `SO_PEERCRED` of the inherited fd must show `uid == own`, `gid == mairu` (when hardened) and **`pid == getppid()`**. On a socketpair the kernel reports the creator of the pair, which is the agent. The helper serves only that fd and exits on EOF, which is how it shares the agent's fate. `crate::ppid` remains a backstop.
+3. **The agent verifies the helper by construction:** it exec'd its own image and keeps the child's pidfd. A socketpair reports its creator to both ends, so `SO_PEERCRED` cannot identify the helper, and the agent does not need it to.
+4. Both ends reject requests whose `uid` differs from their own (§3).
+5. **Failure.** If the helper fails verification, exits or crashes, `HelperClient` returns `RESULT_UNAVAILABLE` (`helper-unavailable` or `helper-unverified`) and empty capabilities, and the agent fails closed. It respawns the helper at most once per 30 s. `GetAgentStatus` reports the helper's state ([hardening §7.1](hardening.md)).
+6. **Unhardened Linux:** the checks reduce to uid plus pid pinning.
+7. **macOS:** the same process model, with the same binary (§11).
+   - **Q-M1:** whether a socketpair yields usable peer information there. `LOCAL_PEERTOKEN` on a socketpair may report the creator, as `SO_PEERCRED` does on Linux. If it does not, the helper checks its parent's code signature through `getppid()` and its audit token, and pins the pid and pid version.
+   - A separately signed helper executable, bundled or not, follows the same rules. The helper then verifies its caller against identifier `co.0w0.mairu` with the same team ID, and the agent verifies the helper against identifier `co.0w0.mairu.platform-helper` with its own team ID. Use `xpc_connection_set_peer_code_signing_requirement` / `NSXPCConnection.setCodeSigningRequirement:` when on XPC, or `LOCAL_PEERTOKEN` on a socket. Ad-hoc builds need a cdhash pin recorded at install time.
+
+## 5. Verifying system services (Linux helper backends)
 
 ```text
 system bus   hardened: ignore $DBUS_SYSTEM_BUS_ADDRESS → /run/dbus/system_bus_socket (root-owned dir)
@@ -281,8 +323,8 @@ polkit       GetConnectionUnixUser("org.freedesktop.PolicyKit1") == 0, else untr
 session bus  Secret Service, notifications, portal: claimable by same uid → never trusted alone
 ```
 
-- **System bus.** When hardened, the agent ignores `DBUS_SYSTEM_BUS_ADDRESS`, which is attacker-controllable environment, and connects to `unix:path=/run/dbus/system_bus_socket`. The socket's parent directory must be root-owned and not group/other-writable.
-- **polkit authority.** Before trusting a result, the agent checks that the owner of `org.freedesktop.PolicyKit1` is uid 0 (`org.freedesktop.DBus.GetConnectionUnixUser`). A mismatch maps to `UNAVAILABLE`/`untrusted-authority`.
+- **System bus.** When hardened, the helper ignores `DBUS_SYSTEM_BUS_ADDRESS`, which is attacker-controllable environment, and connects to `unix:path=/run/dbus/system_bus_socket`. The socket's parent directory must be root-owned and not group/other-writable.
+- **polkit authority.** Before trusting a result, the helper checks that the owner of `org.freedesktop.PolicyKit1` is uid 0 (`org.freedesktop.DBus.GetConnectionUnixUser`). A mismatch maps to `UNAVAILABLE`/`untrusted-authority`.
 - **Session bus** services (Secret Service, notifications, the desktop portal) can be claimed by any same-uid process. They are treated as untrusted conveniences, and this is why Secret Service is a secondary integrity store ([policy §9.7](policy.md)).
 
 ## 6. Authorization facilities
@@ -291,19 +333,24 @@ session bus  Secret Service, notifications, portal: claimable by same uid → ne
 sequenceDiagram
   participant C as client in a tmux pane
   participant A as agent
+  participant H as platform helper
   participant P as polkitd
   C->>A: AssumeRole
-  A->>P: CheckAuthorization(unix-process C, co.0w0.mairu.assume-role)
-  P-->>A: not authorized, no authentication agent
+  A->>H: Authorize(subject C)
+  H->>P: CheckAuthorization(unix-process C, co.0w0.mairu.assume-role)
+  P-->>H: not authorized, no authentication agent
+  H-->>A: UNAVAILABLE no-authentication-agent
   A-->>C: NO_AUTHENTICATION_AGENT
   C->>C: spawn /usr/bin/pkttyagent --process C --fallback
   C->>A: AssumeRole again
-  A->>P: CheckAuthorization
+  A->>H: Authorize(subject C)
+  H->>P: CheckAuthorization
   P->>C: password prompt in this pane, via pkttyagent
-  P-->>A: authorized
+  P-->>H: authorized
+  H-->>A: ALLOWED
 ```
 
-The `platform` presence method ([policy §6.1](policy.md)) is backed by these.
+The `platform` presence method ([policy §6.1](policy.md)) is backed by these. They run in the platform helper (§4), which talks to polkitd or LocalAuthentication on the agent's behalf.
 
 ### 6.1 polkit (Linux)
 
@@ -349,7 +396,7 @@ CheckAuthorization(unix-process{pid, start-time, uid}, action, details, AllowUse
 - `auth_self` on `allow_any` means SSH and other remote sessions get a prompt rather than a silent "no". `auth_self_keep` is not used; mairu keeps its own grants.
 - Check: `CheckAuthorization(subject, action_id, details, flags = AllowUserInteraction, cancellation_id)`.
   - `subject` is `("unix-process", {pid: u32, start-time: u64, uid: i32})` of the **peer** (the sidecar for `exec`), passed with `zbus_polkit` ≥ 5.1 (CVE-2026-78422).
-  - `cancellation_id` is unique per check. If the request is dropped, for example because the client disconnected, a drop guard spawns `CancelCheckAuthorization`. The agent's own timeout is 5 min, after which it cancels and returns `CANCELLED`/`timeout`.
+  - `cancellation_id` is unique per check. If the request is dropped, for example because the client disconnected, the agent cancels its `Authorize` call, and a drop guard in the helper spawns `CancelCheckAuthorization`. The helper's own timeout is 5 min, after which it cancels and returns `CANCELLED`/`timeout`.
 - `$(role)`/`$(server)` expand from `details`. Whether a given authentication agent shows the expansion or the other `details` keys varies, so the client terminal always prints the full context too ([policy §7](policy.md)). Confirm the expansion against polkit 127 during implementation.
 - Result mapping. The exact signals for "no agent" and "dismissed" must be confirmed empirically on polkit 127 and pinned with a test; this table is the contract.
 
@@ -387,7 +434,7 @@ This is the same exposure as `sudo`'s prompt in the same pane, and `auth_self` a
 ### 6.2 LocalAuthentication (macOS)
 
 ```text
-LAContext.evaluatePolicy(.deviceOwnerAuthentication, reason) → ALLOWED / DENIED     (§11)
+LAContext.evaluatePolicy(.deviceOwnerAuthentication, reason) → ALLOWED / DENIED     in the helper (§11)
 ```
 
 Briefed in §11.
@@ -406,8 +453,8 @@ The stores hold the `IntegrityRecord` (§3) of [policy §9.7](policy.md): a dige
 
   | Store | Available when | Location | Strength |
   |---|---|---|---|
-  | `PROTECTED_DIRECTORY` | Agent hardened, and `/var/lib/mairu` is `root:mairu`, mode `2770` with no "other" bits, not FUSE | `/var/lib/mairu/users/<uid>/policy.record` (the record JSON of [policy §9.7](policy.md)), written atomically (temp + rename + fsync) inside `with_privileged_gid` | Strong: unreachable by same-user code. Authoritative when present. |
-  | `SECRET_SERVICE` | Session bus reachable, `org.freedesktop.secrets` present, default collection unlocked. A locked collection is `UNAVAILABLE`; the agent never triggers an unlock prompt. | Item in the default collection: label `mairu policy record (uid N)`, attributes `{application: "co.0w0.mairu", kind: "policy-record", name: "policy", uid: "N"}`, secret = the record JSON | Weak: same-user code can read and write it. It catches offline or careless edits, and on hardened hosts any disagreement with the protected directory. |
+  | `PROTECTED_DIRECTORY` | Helper hardened (it inherits the marker through the setgid exec, §4), and `/var/lib/mairu` is `root:mairu`, mode `2770` with no "other" bits, not FUSE | `/var/lib/mairu/users/<uid>/policy.record` (the record JSON of [policy §9.7](policy.md)), written atomically (temp + rename + fsync) by the helper inside `with_privileged_gid` | Strong: unreachable by same-user code. Authoritative when present. |
+  | `SECRET_SERVICE` | Session bus reachable, `org.freedesktop.secrets` present, default collection unlocked. A locked collection is `UNAVAILABLE`; the helper never triggers an unlock prompt. | Item in the default collection: label `mairu policy record (uid N)`, attributes `{application: "co.0w0.mairu", kind: "policy-record", name: "policy", uid: "N"}`, secret = the record JSON | Weak: same-user code can read and write it. It catches offline or careless edits, and on hardened hosts any disagreement with the protected directory. |
 
 - **macOS stores** are briefed in §11.
 
@@ -415,9 +462,10 @@ The stores hold the `IntegrityRecord` (§3) of [policy §9.7](policy.md): a dige
 
 ```text
 mode = --no-browser ?? $MAIRU_OPEN_URL ?? config.json open_url ?? auto
-auto      WSL2 + interop → Windows side · graphical and not SSH → local · else none
-local     this process's backend      agent    → OpenUrl / Notify RPC
-command   your helper program         none     → terminal output only
+auto      → agent
+agent     OpenUrl / Notify RPC → agent → platform helper, with the client's SessionHint
+command   your helper program, run by the client
+none      terminal output only
 ```
 
 These carry no security weight. Nothing relies on a notification being seen or a URL being opened, and the URLs involved are not secret (PKCE and `state` protect the code flow). They are therefore chosen **per client**, from unprotected settings, and can be redirected or switched off freely. Terminal output and printed URLs never depend on these settings.
@@ -445,16 +493,15 @@ Rate-limit state is best-effort: one file per event key under `runtime_dir()/not
 ### 8.2 Modes
 
 ```text
-per feature (open_url, notify):   auto | local | agent | command | none
+per feature (open_url, notify):   auto | agent | command | none
 ```
 
 `open_url` and `notify` each take one of:
 
 | Mode | Behavior |
 |---|---|
-| `auto` (default) | On WSL2 with interop, use the Windows side (§10). Otherwise `local` when the client looks graphical (`WAYLAND_DISPLAY` or `DISPLAY` set, and `SSH_CONNECTION`/`SSH_TTY` unset), and `none` if not. |
-| `local` | The client's own backend, `crate::platform::current()` (§8.4) |
-| `agent` | Ask the agent through the `OpenUrl`/`Notify` RPCs (§8.5). The agent uses its own backend, which may be the platform helper (§4). Useful when the agent has a desktop session the client lacks, and on macOS where notifications need the helper app. |
+| `auto` (default) | `agent` |
+| `agent` | Ask the agent through the `OpenUrl`/`Notify` RPCs (§8.5). The agent passes the request, with the client's `SessionHint`, to the platform helper, whose backend (§8.4) decides where to deliver it. The helper delivers to the client's desktop session when the hint names one, even if the agent was started elsewhere. It reports `opened`/`delivered = false`, rather than using some other session, when the hint shows SSH without a display, or no display at all. On WSL2 with interop it uses the Windows side (§10). |
 | `command` | Run a different helper program supplied by the user (§8.3) |
 | `none` | Disabled |
 
@@ -481,7 +528,7 @@ Precedence: command-line flag, then environment, then `config.json`, then `auto`
 
   `command` is an argv array, required when `mode` is `command`.
 - Environment:
-  - `MAIRU_OPEN_URL` / `MAIRU_NOTIFY` set the mode: `auto|local|agent|command|none`.
+  - `MAIRU_OPEN_URL` / `MAIRU_NOTIFY` set the mode: `auto|agent|command|none`.
   - `MAIRU_OPEN_URL_COMMAND` / `MAIRU_NOTIFY_COMMAND` hold a shell command line, run as `/bin/sh -c '<value> "$@"' mairu <args…>`. Setting one implies `command` mode.
 - Flags: `--no-browser` on `mairu login` and `mairu exec` means `open_url = none`.
 
@@ -493,19 +540,20 @@ The helper command interface:
 
 The README gives examples: a `notify-send` wrapper, and for tmux over SSH, a script that forwards the URL to the local machine or calls `tmux display-message`.
 
-### 8.4 Backends (`local` and `agent` modes)
+### 8.4 Backends (in the platform helper)
 
 ```text
 notify     org.freedesktop.Notifications on the session bus · no bus or daemon → no-op
 open_url   portal OpenURI → xdg-open · http/https only · title/body truncated
 ```
 
+- **Session hint.** The client fills `SessionHint` from its own environment, and the agent passes it through unchanged. The values are requester-chosen, which is acceptable because these features carry no security weight. The helper honors `dbus_session_bus_address` only as `unix:path=` under the user's `$XDG_RUNTIME_DIR`, so a hint cannot point it at an arbitrary socket or a TCP address.
 - **Linux notifications**:
   - `org.freedesktop.Notifications.Notify` on the session bus (`app_name = "mairu"`, urgency hint).
-  - The address comes from `DBUS_SESSION_BUS_ADDRESS`, falling back to `unix:path=$XDG_RUNTIME_DIR/bus` when that exists.
+  - The address comes from the hint's `dbus_session_bus_address` when honored, otherwise the helper's `DBUS_SESSION_BUS_ADDRESS`, falling back to `unix:path=$XDG_RUNTIME_DIR/bus` when that exists.
   - Headless (no bus, or no notification daemon): `notifications = false`, and calls are no-ops.
-- **Linux open URL**: `org.freedesktop.portal.OpenURI.OpenURI("", url, {})`, falling back to `xdg-open` via `hardening::command()`. A `PATH` lookup is acceptable here.
-- **macOS**: [hardening §9](hardening.md).
+- **Linux open URL**: `org.freedesktop.portal.OpenURI.OpenURI("", url, {})` on that bus, falling back to `xdg-open` via `hardening::command()` with `DISPLAY`/`WAYLAND_DISPLAY` from the hint. A `PATH` lookup is acceptable here.
+- **macOS**: §11.
 - **Fallback**: `/usr/bin/open` on macOS, otherwise unavailable.
 
 Every mode passes on only `http`/`https` URLs, so a URL can never reach `file://` or a custom-scheme handler. Notification title and body are truncated to 256 and 1024 bytes.
@@ -513,7 +561,7 @@ Every mode passes on only `http`/`https` URLs, so a URL can never reach `file://
 ### 8.5 Agent RPCs
 
 ```text
-client ──OpenUrl / Notify──► agent ──► agent's backend (in-process or helper)
+client ──OpenUrl / Notify + SessionHint──► agent ──► platform helper backend
 trusted peer only · never authorization · same URL and length rules
 ```
 
@@ -524,7 +572,7 @@ service Agent {
 }
 ```
 
-Both need only a trusted peer ([hardening §5.1](hardening.md)), never authorization, and apply the URL and length rules of §8.4.
+Both need only a trusted peer ([hardening §5.1](hardening.md)), never authorization. The agent applies the URL and length rules of §8.4 before forwarding to the helper, which applies them again.
 
 ## 9. Headless Linux
 
@@ -571,8 +619,8 @@ WSL2 isolated    open_url → printed                   notify → none      aut
 
 Profiles, interop and the root path are in [hardening §8](hardening.md). Platform-specific behavior inside a WSL2 distribution:
 
-- **`open_url`.** On WSL2 with interop, `auto` (§8.2) resolves to `wslview` when installed, otherwise `explorer.exe` located through `wslpath`, started via `hardening::command()`. This takes precedence over WSLg's `DISPLAY`/`WAYLAND_DISPLAY`, since the Linux side usually has no browser.
-- **`notify`.** `auto` resolves to `none`; `command` mode with a Windows toast helper is the documented option.
+- **`open_url`.** On WSL2 with interop, the helper's `open_url` backend uses `wslview` when installed, otherwise `explorer.exe` located through `wslpath`, started via `hardening::command()`. The helper runs in the same distribution as the agent, so it has interop whenever the agent does. This takes precedence over WSLg's `DISPLAY`/`WAYLAND_DISPLAY`, since the Linux side usually has no browser.
+- **`notify`.** The helper has no WSL2 notification backend, so `agent` mode reports `delivered = false`. `command` mode with a Windows toast helper is the documented option.
 - **Authorization facility.** WSL2 normally has no polkit agent, so the `pkttyagent` fallback (§6.1) applies. The key-based methods ([policy §6](policy.md)) are preferred.
 - **Integrity stores.** Secret Service is usually absent, so hardened distributions rely on the protected directory alone.
 - **Q-W5** ([hardening §8.5](hardening.md)): how WSLg should influence `auto` modes beyond this.
@@ -581,32 +629,36 @@ Profiles, interop and the root path are in [hardening §8](hardening.md). Platfo
 
 ```mermaid
 flowchart LR
-  A["mairu agent"] -- "code signing<br/>checked both ways" --> H["Mairu Helper.app<br/>co.0w0.mairu.platform-helper"]
+  A["mairu agent"] -- "inherited socketpair<br/>verified both ways" --> H["mairu platform-helper<br/>same binary, no bundle"]
   H --> LA["LocalAuthentication<br/>(Touch ID, password)"]
-  H --> UN["UNUserNotificationCenter"]
-  H --> KC["Keychain / Secure Enclave<br/>integrity record"]
+  H --> KC["legacy keychain item<br/>integrity record"]
+  H --> OP["/usr/bin/open"]
 ```
 
 Together with [hardening §9](hardening.md), this is the brief for the macOS implementation. Items marked **Q** must be settled there and written back into these specs.
 
+The helper is the same binary as the agent, with no app bundle. Everything below runs in the helper process, never in the agent (§1, §4).
+
 1. **Authorization.**
-   - `LAContext.evaluatePolicy(.deviceOwnerAuthentication, localizedReason:)`, with the reason built from [policy §7](policy.md), run in the agent or helper.
+   - `LAContext.evaluatePolicy(.deviceOwnerAuthentication, localizedReason:)`, with the reason built from [policy §7](policy.md). It works from a plain binary.
    - Track lid/clamshell state (Touch ID unavailable) and fall back to password.
    - **Q:** whether to use a Secure Enclave key gated by `.userPresence` so the result is cryptographic rather than boolean. Optional, because the agent enforcing the result is itself protected.
    - Over SSH there is no UI, so the ssh-agent method ([policy §6.2](policy.md)) applies unchanged.
+   - **Q-M2:** an agent first started from an SSH login, and so its helper, may sit outside the user's GUI session, where the LocalAuthentication UI cannot appear (`UNAVAILABLE`). The candidate fix is a per-user LaunchAgent plist that runs the plain binary in the GUI session; it needs no bundle.
 2. **Integrity store.** **Q:** choose between:
-   - (a) a Keychain generic-password item holding the record, with an ACL restricted to mairu's code requirement, or
+   - (a) a Keychain generic-password item holding the record, with an ACL restricted to mairu's code requirement. This is the legacy file-based keychain and needs no entitlements, so it is the planned option, or
    - (b) a Secure Enclave P-256 key (`kSecAttrTokenIDSecureEnclave`) signing the digest, with the signature in `$HOME` and the latest record also kept in the Keychain to prevent rollback.
 
-   Option (b) needs `keychain-access-groups`, which likely means an app bundle and a provisioning profile, i.e. the helper. Report the result through `IntegrityStoreKind` `KEYCHAIN` / `SECURE_ENCLAVE`. Whatever the choice, the store must hold the whole `IntegrityRecord`, including the approval anchor, where same-user code cannot rewrite it.
-3. **Notifications.** `UNUserNotificationCenter` requires a bundle, so expect `Mairu Helper.app` (`co.0w0.mairu.platform-helper`) serving `PlatformHelper` with mutual verification (§4). **Q:** launched by the agent (`open -a` / LaunchServices) or as a LaunchAgent with XPC.
+   Option (b) needs `keychain-access-groups`, which means an app bundle and a provisioning profile, so it is not planned. Report the result through `IntegrityStoreKind` `KEYCHAIN` / `SECURE_ENCLAVE`. Whatever the choice, the store must hold the whole `IntegrityRecord`, including the approval anchor, where same-user code cannot rewrite it.
+3. **Notifications.** `UNUserNotificationCenter` requires an app bundle, which is not planned. The helper reports `notifications = false`, and `command` mode with a user-chosen notifier is the documented option (§8.3).
 4. **Open URL.** `NSWorkspace` or `/usr/bin/open`, in the user's GUI session.
-5. **AI-agent ancestry** ([policy §5](policy.md)). The same rules, using `proc_pidinfo` (process facts in [hardening §9](hardening.md)).
+5. **AI-agent ancestry** ([policy §5](policy.md)). The same rules, using `proc_pidinfo` (process facts in [hardening §9](hardening.md)). This is a process primitive in the agent, not a helper service.
 
 ## 12. Security considerations
 
 ```text
-rogue helper or helper caller    ✗ verified both ways, pid pinned, fail closed
+rogue helper or helper caller    ✗ inherited socketpair, parent checked, child by construction, fail closed
+bug via D-Bus / portal / keychain ✗ runs in the helper, which holds no tokens
 fake polkit / bus / pkttyagent   ✗ pinned bus path, authority uid 0, fixed /usr/bin/pkttyagent
 Secret Service rewritten         ! weak store; protected directory is authoritative
 spoofed notifications / URLs     · no security weight by design
@@ -614,7 +666,8 @@ spoofed notifications / URLs     · no security weight by design
 
 | Threat | Mitigation |
 |---|---|
-| Rogue platform helper or rogue helper caller | Mutual verification with pid pinning; fail closed (§4) |
+| Rogue platform helper or rogue helper caller | Inherited socketpair with no filesystem rendezvous; the helper checks its parent's credentials, and the agent trusts the child it exec'd; fail closed (§4) |
+| A bug reached through D-Bus, Secret Service, notification, portal or LocalAuthentication code | Platform services run only in the helper, which holds no tokens (§1) |
 | Fake polkit, D-Bus or `pkttyagent` | System bus path pinned; authority uid 0; fixed `/usr/bin/pkttyagent` with ownership check (§5, §6.1) |
 | Password capture at a tty prompt | Documented (§6.1); key-based methods preferred ([policy §6](policy.md)) |
 | Secret Service read or rewritten by same-user code | Secondary store; the protected directory is authoritative when hardened (§7) |
@@ -630,27 +683,27 @@ out   macOS backends · agent-initiated login · hosts without polkitd (promptin
 **In scope (Linux):** §2–§10, plus the hidden `mairu platform-helper` command.
 
 **Out of scope, and future work:**
-- macOS backends and helper app (§11)
+- macOS backends (§11)
 - Agent-initiated login with browser opening
 - Linux hosts without polkitd: prompts are `UNAVAILABLE` there, so roles that require a platform prompt fail closed, while key-based methods and `forbid` policies still work
 
 ## 14. Deliverables
 
 ```text
-peer-verification ← authorization ← headless ← policy ← wsl ← notify ← platform-helper
+peer-verification ← platform-helper ← authorization ← headless ← policy ← wsl ← notify
 ```
 
 Layers of the stack in [hardening §14](hardening.md) that implement this spec:
 
 | Layer | Files |
 |---|---|
-| `hardening/peer-verification` | `src/platform/{mod,fallback}.rs`, `src/platform/linux/{mod,procfs,peer}.rs`, `proto/mairu_platform.proto`, `build.rs`, `src/proto.rs` |
-| `hardening/authorization` | `src/platform/linux/polkit.rs`, `pkg/polkit/co.0w0.mairu.policy`, `Cargo.toml` (`zbus`, `zbus_polkit`, deb asset) |
+| `hardening/peer-verification` | `src/platform/mod.rs` (traits), `src/platform/process/{linux,fallback}.rs` (procfs, peer), `proto/mairu_platform.proto`, `build.rs`, `src/proto.rs` |
+| `hardening/platform-helper` | `src/platform/helper.rs` (`HelperClient`, spawn, respawn), `src/cmd/platform_helper.rs` (hidden `mairu platform-helper --fd`), `src/platform/services/{mod,fallback}.rs`, agent startup wiring |
+| `hardening/authorization` | `src/platform/services/linux/polkit.rs`, `pkg/polkit/co.0w0.mairu.policy`, `Cargo.toml` (`zbus`, `zbus_polkit`, deb asset) |
 | `hardening/headless` | `src/polkit_tty_agent.rs`, client retry paths, `src/cmd/doctor.rs` |
-| `hardening/policy` | `src/platform/linux/integrity.rs`, `Cargo.toml` (Secret Service crate) |
-| `hardening/wsl` | `src/platform/linux/wsl.rs` (Windows-side `open_url`) |
-| `hardening/notify` | `src/convenience.rs` (mode resolution, helper commands, rate limits), `src/config.rs` (`UserConfig.open_url`, `UserConfig.notify`), `src/platform/linux/{notify,open_url}.rs`, `proto/mairu.proto` (`OpenUrl`, `Notify`), `src/agent.rs`, `src/cmd/{login,exec}.rs` (`--no-browser`, event emission) |
-| `hardening/platform-helper` | `src/platform/remote.rs`, `src/cmd/platform_helper.rs` |
+| `hardening/policy` | `src/platform/services/linux/integrity.rs`, `Cargo.toml` (Secret Service crate) |
+| `hardening/wsl` | `src/platform/process/linux/wsl.rs` (detection), `src/platform/services/linux/wsl.rs` (Windows-side `open_url`) |
+| `hardening/notify` | `src/convenience.rs` (mode resolution `auto|agent|command|none`, helper commands, rate limits), `src/config.rs` (`UserConfig.open_url`, `UserConfig.notify`), `src/platform/services/linux/{notify,open_url}.rs`, `proto/mairu.proto` (`OpenUrl`, `Notify`), `proto/mairu_platform.proto` (`SessionHint`), `src/agent.rs`, `src/cmd/{login,exec}.rs` (`--no-browser`, event emission) |
 
 ## Current Status
 
@@ -659,22 +712,23 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 ### Checklist
 
 Linux:
-- [ ] `mairu.platform` proto and `Platform` trait
+- [ ] `mairu.platform` proto; `ProcessPlatform` and `PlatformServices` traits
+- [ ] Platform helper process: inherited socketpair, mutual verification, fail closed, respawn
 - [ ] polkit backend and policy file; system bus and authority checks
 - [ ] `pkttyagent` fallback
 - [ ] Protected-directory and Secret Service integrity stores
-- [ ] Notifications and open-url: backends, client-chosen modes (`auto|local|agent|command|none`), agent `OpenUrl`/`Notify` RPCs
+- [ ] Notifications and open-url: helper backends, `SessionHint`, client-chosen modes (`auto|agent|command|none`), agent `OpenUrl`/`Notify` RPCs
 - [ ] WSL2: Windows-side `open_url`; settle Q-W5
-- [ ] Platform helper with mutual verification
 
 macOS (separate implementation, §11):
 - [ ] Settle the Q items in §11 and write them back here
 - [ ] LocalAuthentication backend
 - [ ] Integrity store
-- [ ] Helper app with mutual verification
+- [ ] Helper on macOS (same binary, no bundle); settle Q-M1 and Q-M2
 
 ### Updates
 
 - 2026-10-23: Drafted as part of a single combined spec; notifications and URL opening moved to client-side emission with client-chosen modes.
 - 2026-10-23: Split out of the combined spec.
 - 2026-10-23: Added show-me style visual summaries to every section (additive; Mermaid blocks validated with mermaid 11.4.1).
+- 2026-10-23: Platform services always run in a separate platform helper that shares the agent's lifetime (inherited socketpair), on every OS; process primitives split into their own trait; convenience modes reduced to `auto|agent|command|none` with a session hint; no app bundle planned on macOS.
