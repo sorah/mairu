@@ -7,7 +7,7 @@
 This spec adds three things:
 
 1. **Mutual verification** between `mairu` (clients) and `mairu agent`, anchored in a platform mechanism that same-user code cannot forge. Clients only talk to a genuine agent, and the agent only serves genuine clients.
-2. **Platform authorization.** The agent asks the human, through a platform facility, before vending credentials. The answer is remembered per terminal session for a short time. User policy that relaxes or tightens this is integrity-protected.
+2. **Platform authorization.** The agent asks the human, through a platform facility, before vending credentials, and remembers the answer per terminal session for a short time. When to ask is decided by a [Cedar](https://www.cedarpolicy.com/) policy, in which a human check is just another condition, as MFA is in AWS IAM. The user's policy is integrity-protected.
 3. **A common platform protocol** (`mairu.platform`, protobuf) and a matching Rust trait, covering authorization prompts, integrity records, notifications and opening URLs, so the agent core stays platform-independent and an out-of-process helper can serve the same contract. Notifications and opening URLs carry no security weight, and each client chooses how they are delivered (§10).
 
 Linux is implemented first. macOS is designed here and implemented separately against this document. BSD is design-only.
@@ -110,7 +110,7 @@ Both sides also require the hardened-runtime flag and the absence of `com.apple.
 | `/usr/share/polkit-1/actions/co.0w0.mairu.policy` | `root:root` | `0644` | polkit actions (§8.4) |
 | `/var/lib/mairu` | `root:mairu` | `2770` | Protected state root. Users cannot traverse it, but the marker gid can. |
 | `/var/lib/mairu/users` | `root:mairu` | `2770` | |
-| `/var/lib/mairu/users/<uid>` | `<uid>:mairu` | `0700` | Per-user integrity records (§9.3). Created by the agent with the marker gid held. |
+| `/var/lib/mairu/users/<uid>` | `<uid>:mairu` | `0700` | Per-user integrity records (§9.7). Created by the agent with the marker gid held. |
 
 `/var/lib/mairu/users/<uid>` is owned by the user, but the user cannot reach it by path: they are neither owner nor group of `/var/lib/mairu`, and "other" has no search permission. Only a process holding the marker gid can open it, and the genuine agent only ever opens the directory for `getuid()`. User namespaces do not help, because unmapped owners keep their permission semantics.
 
@@ -467,7 +467,7 @@ Rules:
 
 - **System bus.** When hardened, the agent ignores `DBUS_SYSTEM_BUS_ADDRESS`, which is attacker-controllable environment, and connects to `unix:path=/run/dbus/system_bus_socket`. The socket's parent directory must be root-owned and not group/other-writable.
 - **polkit authority.** Before trusting a result, the agent checks that the owner of `org.freedesktop.PolicyKit1` is uid 0 (`org.freedesktop.DBus.GetConnectionUnixUser`). A mismatch maps to `UNAVAILABLE`/`untrusted-authority`.
-- **Session bus** services (Secret Service, notifications, the desktop portal) can be claimed by any same-uid process. They are treated as untrusted conveniences, and this is why Secret Service is a secondary integrity store (§9.3).
+- **Session bus** services (Secret Service, notifications, the desktop portal) can be claimed by any same-uid process. They are treated as untrusted conveniences, and this is why Secret Service is a secondary integrity store (§9.7).
 
 ## 7. Agent protocol changes (`proto/mairu.proto`)
 
@@ -553,8 +553,8 @@ message AuthorizationError {
     REASON_UNSPECIFIED = 0;
     REASON_UNVERIFIED_PEER = 1;          // PERMISSION_DENIED
     REASON_DENIED = 2;                   // PERMISSION_DENIED: the human said no or cancelled
-    REASON_DISALLOWED = 3;               // PERMISSION_DENIED: require = deny / disallow_roles
-    REASON_AI_AGENT_DENIED = 4;          // PERMISSION_DENIED
+    REASON_FORBIDDEN = 3;                // PERMISSION_DENIED: a forbid policy, or disallow_roles
+    REASON_NOT_PERMITTED = 4;            // PERMISSION_DENIED: no permit applies, even after a human check
     REASON_UNAVAILABLE = 5;              // FAILED_PRECONDITION: no method could ask the human
     REASON_CHALLENGE = 6;                // FAILED_PRECONDITION: sign `challenge` and retry
     REASON_NO_AUTHENTICATION_AGENT = 7;  // FAILED_PRECONDITION: register pkttyagent and retry
@@ -563,6 +563,8 @@ message AuthorizationError {
   Reason reason = 1;
   string detail = 2;
   AuthorizationChallenge challenge = 3;
+  repeated string policy_ids = 4;        // @id of the determining forbid policies, for REASON_FORBIDDEN
+  bool ai_agent = 5;                     // AI-agent signals were present (§8.6)
 }
 
 enum HardeningState {
@@ -603,10 +605,12 @@ message PeerView {
 
 message GetPolicyRequest {}
 message GetPolicyResponse {
-  string effective_json = 1;
-  PolicyIntegrity integrity = 2;
-  bytes file_digest = 3;                // empty when the file is absent
-  repeated mairu.platform.IntegrityStoreResult stores = 4;
+  string effective_policies = 1;        // Cedar text actually in force (§9.8), built-ins included
+  string effective_settings_json = 2;   // authorization.json as in force
+  PolicyIntegrity integrity = 3;
+  bytes digest = 4;                     // §9.7 digest of the files as read
+  repeated mairu.platform.IntegrityStoreResult stores = 5;
+  repeated string notes = 6;            // e.g. "dropped forbid policy.cedar#3: validation error …"
 }
 
 message ApprovePolicyRequest {
@@ -649,7 +653,7 @@ Existing codes keep their meanings. In particular, `UNAUTHENTICATED` still means
 
 ### 8.1 When it applies
 
-Authorization runs in `AssumeRole`, after the peer trust check and server/user-config loading, and **before** the credential cache lookup. `ApprovePolicy` always requires authorization (§9.5). `ListRoles`, `ListSessions`, `GetServer`, `RefreshSession`, the login RPCs and `ShutdownAgent` require only a trusted peer.
+Authorization runs in `AssumeRole`, after the peer trust check and server/user-config loading, and **before** the credential cache lookup. `ApprovePolicy` always requires authorization (§9.9). `ListRoles`, `ListSessions`, `GetServer`, `RefreshSession`, the login RPCs and `ShutdownAgent` require only a trusted peer.
 
 ### 8.2 Process facts (Linux)
 
@@ -746,51 +750,62 @@ The process that spawns `pkttyagent` is the one making the RPC, so polkit's subj
 
 This is the same exposure as `sudo`'s prompt in the same pane, and `auth_self` asks for the same login password. So on a host where the user types the sudo password into tmux, same-user code can already become root, which defeats everything here (§2.2). The mairu prompt adds more opportunities, not a new kind of exposure. Prefer ssh-agent presence (§8.7). For `sudo` itself, the analogous fix is FIDO-backed PAM: `pam_u2f` locally, or `pam_ssh_agent_auth` with an `sk-` key over SSH.
 
-### 8.5 Grants, leases and the evaluation order
+### 8.5 Grants, leases and the decision procedure
 
-**Clock.** `CLOCK_BOOTTIME`, so suspended time counts toward idle expiry. `std::time::Instant` uses `CLOCK_MONOTONIC` on Linux, which excludes suspend.
+The agent remembers human checks as grants and leases, and the Cedar policy (§9) decides whether a remembered check is good enough for a given request. The agent never hardcodes "this role needs a prompt": it only asks whether some presence would make the policy permit the request, which is how MFA conditions behave in AWS IAM.
+
+**Clock.** `CLOCK_BOOTTIME`, so suspended time counts toward ages and idle times. `std::time::Instant` uses `CLOCK_MONOTONIC` on Linux, which excludes suspend.
 
 **Grant.**
 
 - Key: `(SessionIdentity, server_id, Rolespec)`. `server_id` is the canonical id from the server config. `Rolespec` includes the chained `assume_role` fields, since a chained role is different access.
-- Value: `{created, last_used}`.
-- Valid iff `now − last_used ≤ grant_idle_timeout_secs` (default 300) **and** `now − created ≤ grant_max_lifetime_secs` (default 43200). A hit sets `last_used = now`.
-- Created when the effective `require == session` and there are no AI signals.
+- Value: `{created, last_used, method}`.
+- Recorded after every successful human check when the peer has a session identity.
+- When a grant is what permits a request, `last_used = now`.
+- Dropped after `grant_retention_secs` (default 43200, §9.5) to bound memory. Freshness itself is a policy matter (`context.presence.age`, `context.presence.idle`).
 
 **Lease.**
 
-- Key: `(peer pid, peer start_time, server_id, Rolespec)`. Value: the peer's pidfd.
-- Valid while the pidfd's process is alive.
-- Created on any allowed prompt whose intent is `exec`. This includes `require = always` and AI-prompted requests: the human approved this exact command, and ECS refreshes must not prompt again.
-- Swept every 60 s and checked on lookup.
+- Key: `(peer pid, peer start_time, server_id, Rolespec)`. Value: `{created, method}` and the peer's pidfd.
+- Recorded after every successful human check whose intent is `exec`.
+- Valid while the pidfd's process is alive. Swept every 60 s and checked on lookup.
 
 All authorization state is in memory only. Restarting the agent forgets every grant and lease.
 
 **Request digest.** SHA-256 over the prost encoding of `{action, server_id, rolespec, ClientContext without authorization_response}`. It binds ssh-agent challenges to the exact request, which the retry must repeat.
 
-**Evaluation order** (`src/authorization.rs`, `Authorizer::authorize_assume_role`):
+**Decision procedure** (`src/authorization.rs`, `Authorizer::authorize_assume_role`):
 
-1. Effective policy (§9.4): pick the rule for `(server, rolespec)` (§9.2).
-2. `require == deny`, or `UserConfig::is_role_disallowed` → `REASON_DISALLOWED`.
-3. AI signals (§8.6) present:
-   - `ai_agents == deny` → `REASON_AI_AGENT_DENIED`
-   - `prompt` → skip grants (step 6)
-   - `allow` → no change
-4. `require == none` → allow.
-5. Lease hit → allow.
-6. Grant hit → allow.
-7. Ask the human, using the methods in policy order (§8.7, §9.2):
-   - **ssh-agent** (only when keys are registered and usable):
-     - The request carries a valid `authorization_response.sshsig` for an outstanding challenge → verify (§8.7) → allow.
-     - It carries `declined` → try the next method.
+1. `UserConfig::is_role_disallowed` (existing `disallow_roles`) → `REASON_FORBIDDEN`. This check stays outside Cedar and behaves as today.
+2. Build the Cedar request (§9.3): principal, action, resource entities, and the base context including AI signals (§8.6).
+3. Evaluate the effective policy set (§9.8) with each **remembered presence** in turn. The first candidate that is `Allow` permits the request; for a grant, also touch `last_used`.
+
+   | Candidate | `presence` |
+   |---|---|
+   | nothing remembered | `{verified: false, scope: "none", age: 0, idle: 0}` |
+   | the lease for (peer, server, rolespec), if any | `{verified: true, scope: "process", method, age: now − created, idle: 0}` |
+   | the grant for (session, server, rolespec), if any | `{verified: true, scope: "session", method, age: now − created, idle: now − last_used}` |
+
+4. Otherwise, for each method `m` in the effective method order (§9.5) that is usable for this request, evaluate a **fresh** candidate: `{verified: true, scope: "request", method: m, age: 0, idle: 0}`. The first `m` whose candidate is `Allow` is the method to ask with:
+   - **ssh-agent**:
+     - The request carries a valid `authorization_response.sshsig` for an outstanding challenge → verify (§8.7) → permit.
+     - It carries `declined` → continue with the next method.
      - Otherwise → issue a challenge → `REASON_CHALLENGE`.
    - **platform** (`Platform::authorize`):
-     - `ALLOWED` → allow.
+     - `ALLOWED` → permit.
      - `DENIED`/`CANCELLED` → `REASON_DENIED`.
      - `UNAVAILABLE`/`no-authentication-agent` → `REASON_NO_AUTHENTICATION_AGENT`.
-     - Any other `UNAVAILABLE` → try the next method.
-   - No method left → `REASON_UNAVAILABLE`, with a detail listing what was tried.
-8. On allow from step 7: record a lease (exec intent) and a grant (step-3 rules permitting), then continue into the existing credential logic.
+     - Any other `UNAVAILABLE` → continue with the next method.
+
+   If a fresh candidate allows but no method can ask → `REASON_UNAVAILABLE`, with a detail listing what was tried.
+5. On a permit from step 4, record the lease (exec intent) and the grant (session identity present).
+6. Otherwise refuse:
+   - If any evaluation in steps 3–4 was `Deny` with a `forbid` among its determining policies → `REASON_FORBIDDEN`, listing those policy ids.
+   - Otherwise → `REASON_NOT_PERMITTED`: no `permit` applies, even after a human check.
+
+   `AuthorizationError.ai_agent` is set when AI signals were present.
+
+**Fail closed on evaluation errors.** Cedar skips a policy whose evaluation errors, which would silently drop a `forbid`. Any candidate whose response carries errors is therefore treated as `Deny`, and the errors are logged. Strict validation (§9.9) keeps this from happening in practice.
 
 Concurrent requests with the same grant key wait on one platform prompt through the existing `crate::singleflight::Singleflight`. ssh-agent challenges are per request and are not coalesced.
 
@@ -798,8 +813,10 @@ Concurrent requests with the same grant key wait on one platform prompt through 
 
 Signals, all positive-only (they can add caution, never remove it):
 
-- **Ancestry.** Walk from the peer up through `ppid`, stopping at pid 1, at a uid change, or after 64 hops. Match each ancestor's `comm`, `exe` basename, `argv[0]` basename and `argv[1]` basename (interpreters such as `node script`) exactly against `process_names`. The built-in default is `["claude", "codex", "gemini", "cursor-agent", "aider", "opencode", "goose", "amp", "crush", "qwen", "copilot"]`; recheck it against current agents during implementation.
+- **Ancestry.** Walk from the peer up through `ppid`, stopping at pid 1, at a uid change, or after 64 hops. Match each ancestor's `comm`, `exe` basename, `argv[0]` basename and `argv[1]` basename (interpreters such as `node script`) exactly against `process_names` (built-ins plus `ai_agent_detection.process_names`, §9.5). The built-in default is `["claude", "codex", "gemini", "cursor-agent", "aider", "opencode", "goose", "amp", "crush", "qwen", "copilot"]`; recheck it against current agents during implementation.
 - **Environment names.** The client sends the names (never values) of its environment variables. They are matched against `env_names`. The built-in default is `["AI_AGENT", "CLAUDECODE", "GEMINI_CLI", "CODEX_SANDBOX"]`; `AI_AGENT` and `CLAUDECODE` were observed in Claude Code's tool environment, and the rest need verifying. The agent cannot read `/proc/<pid>/environ` of a hardened (non-dumpable) peer, so the genuine client reports them. Same-user code can only *add* markers, by launching mairu with them, which only makes things stricter.
+
+The result is `context.ai_agent` and `context.ai_agent_names` (§9.2). What happens to AI-agent requests is up to the policy; the built-in policy (§9.6) requires a human check for every new AI-agent request and never lets AI agents reuse session grants.
 
 Evasion is possible (`setsid` + double fork, `systemd-run --user`, a renamed binary), which is why this is a guardrail: the authorization prompt remains the boundary. Detected signals appear in the prompt details (`ai_agent=…`) and in `doctor`.
 
@@ -807,13 +824,13 @@ Evasion is possible (`setsid` + double fork, `systemd-run --user`, a renamed bin
 
 This is a platform-independent method. On headless hosts, and inside tmux over SSH in particular, it beats a tty password because a signature cannot be replayed.
 
-**Registration** (policy, §9.2), as `authorization.ssh_agent_keys[]`:
+**Registration** (`authorization.json`, §9.5), as `ssh_agent_keys[]`:
 
 - `{"key": "<OpenSSH public key line>"}` is accepted only for `sk-ssh-ed25519@openssh.com` and `sk-ecdsa-sha2-nistp256@openssh.com`.
 - Other key types require `"presence": "unverified-confirm"`. The agent cannot verify presence for them; the user must load them with `ssh-add -c`.
 - Optional `"require_user_verification": true` additionally requires the UV flag (a PIN or biometric on the key).
 
-**Challenge.** On step 7, when keys are registered and the method is selected, the agent:
+**Challenge.** In step 4 of §8.5, when keys are registered and ssh-agent is the selected method, the agent:
 
 1. creates `AuthorizationStatement{nonce, agent_instance_id, peer pid/start_time, action, server_id, rolespec, request_digest, expires_at = now + 60 s}` and serializes it once
 2. stores `PendingChallenge{statement bytes, peer, request_digest, expires_at}` under a fresh `challenge_id`, keeping at most 4 outstanding per peer and evicting expired ones
@@ -873,75 +890,250 @@ The same keys go into polkit `details`:
 
 No authorization is required, since this only tightens.
 
-## 9. Protected policy
+## 9. Protected policy (Cedar)
 
-### 9.1 Location
+Authorization policy is written in [Cedar](https://www.cedarpolicy.com/), the policy language behind Amazon Verified Permissions. It is evaluated with the `cedar-policy` crate (4.x, `default-features = false`, since no extension types are used).
 
-`config_dir()/policy.json`, i.e. `~/.config/mairu/policy.json`. Values stay in the home directory, readable and editable. Only integrity records live elsewhere (§9.3).
+The semantics match AWS IAM:
+- The default is deny.
+- A `forbid` overrides any `permit`.
+- A human check is just another condition on the request, like `aws:MultiFactorAuthPresent`.
 
-The agent reads the file itself; clients never send policy content. Integrity records are keyed by **uid, never by path**, so an agent started with a different `HOME` or `XDG_CONFIG_HOME` reads a file whose digest does not match and ends up in `TAMPERED` → lockdown.
+### 9.1 Files
 
-### 9.2 Schema
+| File | Content |
+|---|---|
+| `config_dir()/policy.cedar` | Cedar policies. Only static policies are allowed; templates are rejected. |
+| `config_dir()/authorization.json` | Settings that are not policies (§9.5) |
+
+Both are ordinary files the user edits. Only their integrity record lives elsewhere (§9.7). The agent reads them itself; clients never send policy content.
+
+Integrity records are keyed by **uid, never by path**. An agent started with a different `HOME` or `XDG_CONFIG_HOME` reads files whose digest does not match, and ends up in `TAMPERED` → lockdown.
+
+The schema (§9.2) and built-in policies (§9.6) are embedded in the binary. `mairu policy schema` prints the schema for use with Cedar's own tooling (for example `cedar validate --schema`).
+
+### 9.2 Schema (`src/policy/mairu.cedarschema`)
+
+```cedarschema
+namespace Mairu {
+  // The local Unix user the agent runs for. Entity id: the uid.
+  entity User = {
+    name: String,
+    uid: Long
+  };
+
+  // A credential server from servers.d. Entity id: the server id.
+  entity Server = {
+    url: String
+  };
+
+  // An AWS account named by a role. Entity id: the 12-digit account id, shared across servers.
+  entity Account;
+
+  // A role on a server. Entity id: "<server id>:<role>".
+  // Parents: its Server, and its Account when the role names one.
+  entity Role in [Server, Account] = {
+    name: String,
+    server: Server,
+    account_id?: String
+  };
+
+  type Presence = {
+    // A human check (ssh-agent touch or platform prompt) covers this request.
+    verified: Bool,
+    // "none"; "request": checked for this very request; "process": the lease of this running
+    // `mairu exec`; "session": a grant for this terminal session.
+    scope: String,
+    // "ssh-agent" or "platform"; absent when not verified.
+    method?: String,
+    // Seconds since the covering human check; 0 when not verified.
+    age: Long,
+    // Seconds since a session grant was last used; 0 for other scopes.
+    idle: Long
+  };
+
+  action AssumeRole appliesTo {
+    principal: [User],
+    resource: [Role],
+    context: {
+      presence: Presence,
+      // AI-agent signals (§8.6).
+      ai_agent: Bool,
+      ai_agent_names: Set<String>,
+      // "tty", "parent" or "none" (§8.3); tty is the device path when "tty".
+      session: String,
+      tty?: String,
+      // Whether the agent runs hardened (§4.2).
+      hardened: Bool,
+      // Reported by the client: truthful about what it will do, but chosen by whoever runs it (§9.4).
+      intent: String,
+      exec_command?: String,
+      exec_command_line?: String,
+      cwd?: String,
+      chained_role_arn?: String
+    }
+  };
+}
+```
+
+Reference for the context attributes:
+
+| Attribute | Values | Source |
+|---|---|---|
+| `presence.*` | as commented | agent (§8.5) |
+| `ai_agent`, `ai_agent_names` | names that matched | agent ancestry + client env names |
+| `session`, `tty` | `"tty"` `"parent"` `"none"`, `/dev/pts/N` | agent, from the kernel |
+| `hardened` | | agent |
+| `intent` | `"exec"` `"credential-process"` `"unknown"` | client |
+| `exec_command` | basename of `argv[0]` | client, `exec` only |
+| `exec_command_line` | shell-escaped argv, truncated to 4 KiB | client, `exec` only |
+| `cwd` | absolute path | client |
+| `chained_role_arn` | ARN | client (`--assume-role`, `.mairu.json`) |
+
+Cedar strings are UTF-8, so non-UTF-8 bytes in paths and argv are replaced with U+FFFD.
+
+The schema may only grow by adding optional attributes, so approved policies stay valid across upgrades. Any other change re-validates them as described in §9.8.
+
+### 9.3 Entities and request
+
+For each evaluation the agent builds:
+
+- **principal**: `Mairu::User::"<uid>"` with `name` (from `getpwuid`) and `uid`.
+- **action**: `Mairu::Action::"AssumeRole"`.
+- **resource**: `Mairu::Role::"<server id>:<role>"` with `name`, `server` and `account_id`. Its parents are:
+  - `Mairu::Server::"<server id>"` (`url`)
+  - `Mairu::Account::"<account id>"`, when the role names an account: an AWS SSO role `^\d{12}/`, or an `arn:aws:iam::\d{12}:role/` ARN.
+- **context**: as in the schema, with `presence` set per candidate (§8.5).
+
+`Request::new(…, Some(&schema))` and `Entities::from_json_value(…, Some(&schema))` check every request against the schema.
+
+Example `policy.cedar`:
+
+```cedar
+// Read-only access needs no human check.
+@id("readonly-free")
+permit (
+  principal,
+  action == Mairu::Action::"AssumeRole",
+  resource == Mairu::Role::"contoso:123456789012/ReadOnly"
+);
+
+// Admin: touch the security key for every new command.
+// A running `mairu exec` keeps its approval.
+@id("admin-touch")
+permit (
+  principal,
+  action == Mairu::Action::"AssumeRole",
+  resource == Mairu::Role::"contoso:123456789012/Admin"
+) when {
+  context.presence.verified &&
+  ["request", "process"].contains(context.presence.scope) &&
+  context.presence has method && context.presence.method == "ssh-agent"
+};
+
+// Everything else on contoso: once per terminal session, 15 minutes idle, 8 hours at most.
+@id("contoso-session")
+permit (principal, action == Mairu::Action::"AssumeRole", resource in Mairu::Server::"contoso")
+when {
+  !context.ai_agent &&
+  context.presence.verified &&
+  context.presence.idle <= 900 &&
+  context.presence.age <= 28800
+};
+
+// Never hand production to AI agents, on any server.
+@id("no-ai-prod")
+forbid (principal, action, resource in Mairu::Account::"999999999999")
+when { context.ai_agent };
+```
+
+### 9.4 Which context can be trusted
+
+- **Determined by the agent**: `presence`, `hardened`, `session`, `tty`, and the ancestry half of `ai_agent`. These cannot be influenced by the requester beyond actually being in that position.
+- **Reported by the client**: `intent`, `exec_command`, `exec_command_line`, `cwd`, `chained_role_arn`, and the environment half of `ai_agent`. A verified client reports them truthfully, but whoever runs `mairu` chooses them: same-user code can `cd` into any directory or exec any command. Use them to **narrow** a `permit` that also requires `context.presence.verified`, or in a `forbid`. Never rely on them alone to grant access.
+
+`mairu policy check` and `mairu policy approve` list every `permit` that can apply without a human check, so these are always visible at approval time.
+
+### 9.5 Settings (`authorization.json`)
 
 ```jsonc
 {
   "version": 1,
-  "defaults": {
-    "require": "session",            // "none" | "session" | "always" | "deny"
-    "ai_agents": "prompt"            // "allow" | "prompt" | "deny"
-  },
-  "grant_idle_timeout_secs": 300,
-  "grant_max_lifetime_secs": 43200,
-  "rules": [
-    // server: server id or URL. role: exact role, or "*".
-    // assume_role_arn: absent = only rolespecs without chaining; "*" = any chained ARN; or an exact ARN.
-    {"server": "contoso", "role": "123456789012/ReadOnly", "require": "none"},
-    {"server": "contoso", "role": "123456789012/Admin", "require": "always", "ai_agents": "deny"},
-    {"server": "contoso", "role": "*", "assume_role_arn": "arn:aws:iam::999999999999:role/Prod", "require": "deny"}
+  // Order in which to try ways of asking the human.
+  // Default: ["ssh-agent", "platform"] when keys are registered, otherwise ["platform"].
+  "methods": ["ssh-agent", "platform"],
+  "ssh_agent_keys": [
+    {"key": "sk-ssh-ed25519@openssh.com AAAA... me@laptop"},
+    {"key": "sk-ecdsa-sha2-nistp256@openssh.com AAAA... spare", "require_user_verification": true},
+    {"key": "ssh-ed25519 AAAA... confirm-key", "presence": "unverified-confirm"}
   ],
-  "ai_agent": {
-    "process_names": ["my-agent"],   // added to the built-in list
-    "env_names": ["MY_AGENT_ACTIVE"] // added to the built-in list
+  "ai_agent_detection": {
+    "process_names": ["my-agent"],    // added to the built-in list (§8.6)
+    "env_names": ["MY_AGENT_ACTIVE"]  // added to the built-in list (§8.6)
   },
-  "authorization": {
-    "methods": ["ssh-agent", "platform"],  // default: ["ssh-agent", "platform"] when keys exist, else ["platform"]
-    "ssh_agent_keys": [
-      {"key": "sk-ssh-ed25519@openssh.com AAAA... me@laptop"},
-      {"key": "ssh-ed25519 AAAA... confirm-key", "presence": "unverified-confirm"}
-    ]
-  }
+  "grant_retention_secs": 43200
 }
 ```
 
-The file is plain JSON; the comments above are for documentation only. Every field is optional except `version`. Unknown fields are rejected at approval time, so typos never silently weaken policy.
+- The file is plain JSON; the comments are for documentation only.
+- Every field except `version` is optional.
+- Unknown fields are rejected, so a typo never silently weakens anything.
+- Method names: `"ssh-agent"` (§8.7), and `"platform"` for the platform's own facility (polkit on Linux, LocalAuthentication on macOS). A policy can require a specific method through `context.presence.method`.
 
-Method names are `"ssh-agent"` (§8.7) and `"platform"`, which is the platform's own facility: polkit on Linux, LocalAuthentication on macOS.
+### 9.6 Built-in policies (`src/policy/builtin/*.cedar`)
 
-**Rule selection.** Among the rules matching `(server, rolespec)`, the highest specificity wins:
+Used when no approved `policy.cedar` exists. Ids starting with `builtin-` are reserved.
 
-- role: exact = 2, `*` = 0
-- `assume_role_arn`: exact = 1, `*` or absent = 0
+Hardened agent:
 
-Ties resolve to the stricter value per attribute. Attributes the winning rule leaves unset come from `defaults`, then from built-ins.
+```cedar
+// Humans: one check per terminal session, remembered for 5 minutes idle, 12 hours at most.
+@id("builtin-human-session")
+permit (principal, action == Mairu::Action::"AssumeRole", resource)
+when {
+  !context.ai_agent &&
+  context.presence.verified &&
+  context.presence.idle <= 300 &&
+  context.presence.age <= 43200
+};
 
-**Strictness orders:**
+// AI agents: a human approves every new request; a running `mairu exec` keeps its approval.
+@id("builtin-ai-agent-per-request")
+permit (principal, action == Mairu::Action::"AssumeRole", resource)
+when {
+  context.ai_agent &&
+  context.presence.verified &&
+  ["request", "process"].contains(context.presence.scope)
+};
+```
 
-- `require`: none < session < always < deny
-- `ai_agents`: allow < prompt < deny
-- timeouts: smaller is stricter
+Unhardened agent (today's behavior):
 
-**Built-in defaults:**
+```cedar
+@id("builtin-unhardened")
+permit (principal, action == Mairu::Action::"AssumeRole", resource);
+```
 
-| | require | ai_agents | methods |
-|---|---|---|---|
-| Hardened agent | `session` | `prompt` | `["platform"]` |
-| Unhardened agent | `none` | `allow` | `["platform"]` |
+Lockdown (§9.8):
 
-The unhardened defaults reproduce today's behavior.
+```cedar
+@id("builtin-lockdown")
+permit (principal, action == Mairu::Action::"AssumeRole", resource)
+when {
+  context.presence.verified &&
+  ["request", "process"].contains(context.presence.scope)
+};
 
-### 9.3 Integrity records and stores
+@id("builtin-lockdown-no-ai")
+forbid (principal, action, resource)
+when { context.ai_agent };
+```
 
-- **Digest**: `SHA-256("mairu.policy.v1\0" || file bytes)`. Record name `"policy"`.
+`mairu policy init` writes the hardened built-in policies, with explanatory comments, into `policy.cedar`, plus a minimal `authorization.json`. The user then edits and approves them.
+
+### 9.7 Integrity records and stores
+
+- **Digest**: `SHA-256("mairu.policy.v1\0" || part(policy.cedar) || part(authorization.json))`, where `part(f)` is `0x00` when the file is absent, and `0x01 || u64be(len) || bytes` otherwise. Record name `"policy"`.
 - **Linux stores**, used **concurrently** (§6.2 `IntegrityStoreKind`):
 
   | Store | Available when | Location | Strength |
@@ -951,7 +1143,7 @@ The unhardened defaults reproduce today's behavior.
 
 - **macOS stores** are designed in §12.
 
-### 9.4 Integrity state and effective policy
+### 9.8 Integrity state and effective policy
 
 **Record** (approve) writes the digest to every available store. It fails if none is available.
 
@@ -959,37 +1151,59 @@ The unhardened defaults reproduce today's behavior.
 
 | Situation | State |
 |---|---|
-| File absent and no store has a record | `ABSENT` |
-| Any store `MISMATCHED` (including a record existing while the file is absent) | `TAMPERED` |
+| Both files absent and no store has a record | `ABSENT` |
+| Any store `MISMATCHED` (including a record existing while both files are absent) | `TAMPERED` |
 | Hardened, protected directory `NOT_RECORDED` | `UNAPPROVED`. Re-approve after hardening, whatever Secret Service says. |
 | Hardened, protected directory `MATCHED`, Secret Service `NOT_RECORDED` | `APPROVED`, and backfill the Secret Service record |
 | Hardened, protected directory `MATCHED`, Secret Service `MATCHED` or `UNAVAILABLE` | `APPROVED` |
 | Unhardened, Secret Service `MATCHED` | `APPROVED` |
 | Unhardened, Secret Service `NOT_RECORDED` or `UNAVAILABLE` | `UNAPPROVED` |
 
+An `APPROVED` policy that no longer validates against this binary's schema, for example after an upgrade, is treated as `UNAPPROVED`, and the user is warned to re-approve.
+
 **Effective policy:**
 
-| State | Effective policy |
-|---|---|
-| `ABSENT` | Built-in defaults |
-| `APPROVED` | The file |
-| `UNAPPROVED` | **Tighten-only merge**: for every request, the stricter of the built-in defaults and the file, per attribute. Unapproved `ai_agent` additions apply, since they only tighten. Unapproved `authorization` (methods, keys) is **ignored**, since adding keys relaxes. An unparseable file is ignored, with a warning. |
-| `TAMPERED` | **Lockdown**: `require = max(always, file rule if parseable)`, `ai_agents = deny`, `methods = ["platform"]` (registered keys are not trusted), grant creation disabled. `doctor` and every client print a warning, and clients emit the lockdown notification (§10.1). |
+| State | Policies | Settings |
+|---|---|---|
+| `ABSENT` | Built-ins for the hardening state | Defaults |
+| `APPROVED` | `policy.cedar`, or the built-ins when only `authorization.json` exists | `authorization.json` |
+| `UNAPPROVED` | Built-ins **plus only the `forbid` policies** of `policy.cedar`. Adding a `forbid` can only remove permissions, so unapproved content can only tighten. `permit` policies are ignored. If the file does not parse it is ignored, and `forbid` policies that fail validation are dropped one by one. | Defaults, plus `ai_agent_detection` additions and a smaller `grant_retention_secs` (both tighten). `methods` and `ssh_agent_keys` are ignored, since registering a key relaxes. |
+| `TAMPERED` | **Lockdown**: lockdown built-ins plus the file's `forbid` policies (same rules as `UNAPPROVED`) | As `UNAPPROVED`, with `methods = ["platform"]` because registered keys are not trusted. `doctor` and every client print a warning, and clients emit the lockdown notification (§10.1). |
 
-Verification runs at agent start, before every authorization decision (cached by file `(dev, ino, mtime, size)` plus a 5 s TTL), and after `ApprovePolicy`.
+Verification runs:
+- at agent start
+- before every authorization decision, cached by `(dev, ino, mtime, size)` of both files plus a 5 s TTL
+- after `ApprovePolicy`
 
-Rollback: only the latest digest is kept. Restoring an older file plus its record works against Secret Service only; the protected directory, which is authoritative when hardened, does not allow it.
+Rollback: only the latest digest is kept. Restoring older files plus their record works against Secret Service only; the protected directory, which is authoritative when hardened, does not allow it.
 
-### 9.5 Approval: `mairu policy approve`
+### 9.9 Validation and commands
 
-1. The client reads `policy.json`, prints it with a summary of rule changes, and computes the digest.
-2. It sends `ApprovePolicy{expected_digest}`.
-3. The agent re-reads the file. If the digest differs → `FAILED_PRECONDITION` ("policy.json changed while approving"). This binds approval to what the human saw.
-4. The agent validates the file (schema, known version, keys parse, presence rules) → `INVALID_ARGUMENT` on error.
-5. The agent authorizes with action `approve-policy`. This always asks, never uses grants, and uses the *currently effective* methods: in lockdown or before any keys are registered, that is the platform only, which is how the first key registration is bootstrapped.
-6. It records the digest into all available stores and returns the per-store results.
+**Validation** happens at approval, at load, and in `mairu policy check`. A policy file is valid when:
+- it parses as a set of **static** Cedar policies
+- `Validator::validate(…, ValidationMode::Strict)` against the embedded schema passes; strict mode, for example, requires `has` before an optional attribute
+- every `@id` is unique, and none starts with `builtin-`
+- `authorization.json` matches §9.5
 
-`mairu policy show` prints the effective policy, the integrity state and per-store statuses (`GetPolicy`).
+Policies without `@id` are shown as `policy.cedar#<n>`, and `check` warns about them.
+
+**Commands:**
+
+- `mairu policy init [--force]`: writes the templates (§9.6).
+- `mairu policy check`: client-local, no agent involved. Validates both files, lists every policy (id, effect, scope), and flags any `permit` that applies without a human check (§9.4).
+- `mairu policy show`: from `GetPolicy`, prints the effective policies and settings, the integrity state, per-store statuses, and notes such as dropped policies.
+- `mairu policy explain <server> <role> [--assume-role ARN] [--ai-agent] [--intent exec|credential-process] [--cwd PATH] [--exec CMD]`:
+  - Fetches the effective policy through `GetPolicy`.
+  - Evaluates it locally for every candidate presence of §8.5: none, process lease, session grant at a given age and idle time, and fresh per method.
+  - Prints each decision with its determining policy ids. This answers "what would happen if…".
+- `mairu policy schema`: prints the schema.
+- `mairu policy approve`:
+  1. The client runs `check`, prints both files and the summary, and computes the digest.
+  2. It sends `ApprovePolicy{expected_digest}`.
+  3. The agent re-reads both files. If the digest differs → `FAILED_PRECONDITION` ("policy changed while approving"). This binds approval to what the human saw.
+  4. The agent validates them → `INVALID_ARGUMENT` on error.
+  5. The agent asks the human with action `approve-policy`. This always asks, never uses grants, and uses the *currently effective* methods: in lockdown or before any keys are registered, that is the platform only, which is how the first key registration is bootstrapped.
+  6. It records the digest into all available stores and returns the per-store results.
 
 ## 10. Convenience features: notifications and opening URLs
 
@@ -1003,7 +1217,7 @@ Emission always happens in a client, never on the agent's own initiative, so eve
 |---|---|---|
 | Open the authorize URL (`verification_uri_complete` for the device code grant) | `mairu login`, including the login inside `mairu exec` | once per login |
 | Login required | `mairu exec` sidecar (ECS backend and auto-refresh) when the agent returns `UNAUTHENTICATED` | once per server per 10 min |
-| AI-agent request denied | The client that receives `REASON_AI_AGENT_DENIED` | once per (server, rolespec) per minute |
+| AI-agent request refused | The client that receives `REASON_FORBIDDEN` or `REASON_NOT_PERMITTED` with `ai_agent = true` | once per (server, rolespec) per minute |
 | Policy lockdown | Any client whose `PingAgent` reports `POLICY_INTEGRITY_TAMPERED` (§7) | once per agent instance |
 
 Rate-limit state is best-effort: one file per event key under `runtime_dir()/notified/`, compared by mtime.
@@ -1144,8 +1358,11 @@ This section is the brief for the macOS implementation. Items marked **Q** must 
 | Socket squatter or rogue agent stealing OAuth codes | Client checks the agent's listen-time marker (§5.2); hardened clients replace unverified agents (§5.3) |
 | Pid reuse | `SO_PEERPIDFD`/pidfd, start times in every identity, liveness re-checks (§5.1, §8.2) |
 | AI agent sharing the user's terminal session | Ancestry + env-name signals; `ai_agents` prompt/deny (§8.6). Guardrail only. |
-| Editing the policy to relax it | Integrity records; tighten-only when unapproved; lockdown on tamper (§9.4) |
-| Rolling back the policy | Protected directory keeps only the latest digest (§9.4) |
+| Editing the policy to relax it | Integrity records; only `forbid` policies apply when unapproved; lockdown on tamper (§9.8) |
+| Rolling back the policy | Protected directory keeps only the latest digest (§9.8) |
+| A `forbid` silently skipped because its evaluation errors | Strict schema validation; any evaluation error makes the candidate `Deny` (§8.5, §9.9) |
+| A `permit` that relies only on requester-chosen context (`cwd`, `exec_command`, …) | Documented (§9.4); `check` and `approve` list every permit that needs no human check |
+| Schema drift after an upgrade | Approved policy re-validated at load; invalid → `UNAPPROVED` (§9.8) |
 | Password capture in tmux/tty | Documented; ssh-agent FIDO preferred (§8.4, §8.7) |
 | Abuse of the forwarded ssh-agent | Touch required; challenge bound to peer + request; single use; 60 s (§8.7) |
 | Fake polkit, D-Bus or `pkttyagent` | System bus path pinned; authority uid 0; fixed `/usr/bin/pkttyagent` with ownership check (§6.4, §8.4) |
@@ -1195,10 +1412,10 @@ Delivered as a `gh stack`, one PR per layer.
 | `hardening/marker-gid` | `src/hardening.rs`, `src/main.rs`, `src/agent.rs` (connect), `src/cmd/agent.rs` (listen, spawn), `src/cmd/exec.rs` (executor drop), `Cargo.toml` (`nix` features `user`, `socket`) |
 | `hardening/peer-verification` | `src/platform/{mod,fallback}.rs`, `src/platform/linux/{mod,procfs,peer}.rs`, `proto/mairu_platform.proto`, `proto/mairu.proto` (`GetAgentStatus`, `AuthorizationError`), `build.rs`, `src/proto.rs`, `src/agent.rs`, `src/cmd/agent.rs` (`PeerStream`, replacement), `src/cmd/kill_agent.rs`, `src/cmd/doctor.rs`, `src/main.rs` |
 | `hardening/install` | `src/cmd/harden.rs`, `src/hardening.rs` (re-exec, validation, suggestion), `pkg/debian/postinst`, `pkg/sysusers.d/mairu.conf`, `pkg/tmpfiles.d/mairu.conf` |
-| `hardening/polkit` | `src/authorization.rs`, `src/platform/linux/polkit.rs`, `pkg/polkit/co.0w0.mairu.policy`, `proto/mairu.proto` (`ClientContext`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs`, `src/ecs_server.rs`, `Cargo.toml` (`zbus`, `zbus_polkit`, deb asset) |
+| `hardening/authorization` | `src/authorization.rs` (grants, leases, decision procedure), `src/policy/{mod.rs,mairu.cedarschema,builtin/*.cedar}` (Cedar engine with built-in policies only), `src/platform/linux/polkit.rs`, `pkg/polkit/co.0w0.mairu.policy`, `proto/mairu.proto` (`ClientContext`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs`, `src/ecs_server.rs`, `Cargo.toml` (`cedar-policy`, `zbus`, `zbus_polkit`, deb asset) |
 | `hardening/headless` | `src/polkit_tty_agent.rs`, client retry paths, `src/cmd/doctor.rs` |
 | `hardening/ai-agents` | `src/authorization.rs` (signals), `src/platform/linux/procfs.rs` (ancestry), client `env_names` |
-| `hardening/policy` | `src/policy.rs`, `src/platform/linux/integrity.rs`, `proto/mairu.proto` (`GetPolicy`, `ApprovePolicy`), `src/cmd/policy.rs`, `Cargo.toml` (Secret Service crate) |
+| `hardening/policy` | `src/policy/{files,integrity_state,settings}.rs` (user files, tighten-only and lockdown sets), `src/platform/linux/integrity.rs`, `proto/mairu.proto` (`GetPolicy`, `ApprovePolicy`), `src/cmd/policy.rs` (`init`, `check`, `show`, `explain`, `schema`, `approve`), `Cargo.toml` (Secret Service crate) |
 | `hardening/ssh-agent` | `src/ssh_agent_presence.rs`, `proto/mairu.proto` (challenge messages), client relay, `Cargo.toml` (`ssh-key`, `ssh-encoding`) |
 | `hardening/notify` | `src/convenience.rs` (mode resolution, helper commands, rate limits), `src/config.rs` (`UserConfig.open_url`, `UserConfig.notify`), `src/platform/linux/{notify,open_url}.rs`, `proto/mairu.proto` (`OpenUrl`, `Notify`, `PingAgentResponse.policy_integrity`), `src/agent.rs`, `src/cmd/{login,exec}.rs` (`--no-browser`, event emission) |
 | `hardening/platform-helper` | `src/platform/remote.rs`, `src/cmd/platform_helper.rs` |
@@ -1214,11 +1431,12 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 Common:
 - [ ] `mairu.platform` proto and `Platform` trait
 - [ ] Agent RPCs: `GetAgentStatus`, `GetPolicy`, `ApprovePolicy`, `RevokeAuthorizations`; `ClientContext`; `AuthorizationError`
-- [ ] `Authorizer`: rule selection, grants, leases, singleflight, evaluation order
+- [ ] Cedar engine: schema, entities, built-in policies, fail-closed evaluation
+- [ ] `Authorizer`: grants, leases, singleflight, decision procedure (§8.5)
 - [ ] AI-agent signals
-- [ ] Policy schema, tighten-only merge, integrity states, lockdown
+- [ ] Policy files: `policy.cedar` + `authorization.json`, integrity states, forbid-only when unapproved, lockdown
 - [ ] ssh-agent presence method
-- [ ] `mairu doctor`, `mairu lock`, `mairu policy show|approve`
+- [ ] `mairu doctor`, `mairu lock`, `mairu policy init|check|show|explain|schema|approve`
 
 Linux:
 - [ ] Marker gid confinement (`src/hardening.rs`)
@@ -1252,3 +1470,4 @@ Future:
 - 2026-10-23: Spec drafted (Linux implementation plan, macOS brief).
 - 2026-10-23: Notifications and URL opening moved to client-side emission with client-chosen modes (§10).
 - 2026-10-23: Corrected the tty password-capture vectors (input paths, not output capture); `sudo` escalation stated as out of scope (§2.2, §8.4).
+- 2026-10-23: Policy redesigned around Cedar (`cedar-policy` 4.x): presence as context, built-in policies, forbid-only tightening (§8.5, §9). Schema and all policies in this spec validated with cedar-policy 4.14.0 in strict mode.
