@@ -7,7 +7,17 @@ Related specs:
 - [policy.md](policy.md): when the agent asks the human, how answers are remembered, and the Cedar policy that decides it.
 - [platform-helper.md](platform-helper.md): the platform abstraction, the `mairu.platform` protocol, the optional out-of-process platform helper, and the platform backends (polkit, integrity stores, notifications, opening URLs).
 
+Each section opens with a short visual summary. It is illustrative; the text after it is normative.
+
 ## 1. Overview
+
+```mermaid
+flowchart LR
+  C["mairu client<br/>setgid marker"] -- "verified both ways<br/>(this spec)" --> A["mairu agent"]
+  X["other same-uid code"] -. "rejected" .-> A
+  A -- "when to ask the human<br/>(policy.md)" --> P["Cedar policy"]
+  A -- "how to ask, store, notify<br/>(platform-helper.md)" --> F["Platform trait"]
+```
 
 `mairu agent` holds credential-server sessions in memory and vends AWS credentials to whoever connects to its Unix socket. Today that is any process running as the user. Nothing checks who the client is, nothing lets a client check who the agent is, and nothing asks the human before credentials leave the agent.
 
@@ -20,6 +30,14 @@ Together with the related specs, this work adds three things:
 Linux is implemented first, with WSL2 as a first-class variant (§8). macOS is designed in these specs and implemented separately against them. BSD is design-only.
 
 ### 1.1 Terminology
+
+```text
+agent
+├── peers             # verified by the marker gid (§5)
+├── grants            # (session, server, rolespec) → 5 min idle / 12 h max by default
+├── leases            # (running exec sidecar, server, rolespec) → while it lives
+└── integrity record  # digest + approval anchor, root-protected
+```
 
 | Term | Meaning |
 |---|---|
@@ -35,7 +53,20 @@ Linux is implemented first, with WSL2 as a first-class variant (§8). macOS is d
 
 ## 2. Threat model
 
+```text
+attacker = code running as your uid
+  can     read/write ~, connect to your sockets, run genuine mairu with any args,
+          use $SSH_AUTH_SOCK, read your ptys, drive your tmux server
+  cannot  ptrace a hardened mairu, forge SO_PEERCRED or a code signature,
+          become root*                     * unless the host allows it (§2.4)
+```
+
 ### 2.1 Adversary
+
+```text
+same uid ──► your files · sockets · processes · Secret Service · session D-Bus
+             · forwarded $SSH_AUTH_SOCK · ptys · tmux server
+```
 
 Code running **as the same Unix user** as the human, which the human did not intend to act. Examples: a compromised dependency's install script, a malicious repository script, or an AI coding agent going beyond what it was asked to do. It can:
 
@@ -50,6 +81,11 @@ Code running **as the same Unix user** as the human, which the human did not int
 
 ### 2.2 Out of scope
 
+```text
+out of scope   root · kernel · physical access · malicious credential server or IdP
+               · escalation through your own sudo · credentials after delivery to your command
+```
+
 Root, kernel compromise, physical access, and malicious credential servers or IdPs.
 
 Escalation to root through the user's own `sudo` is also out of scope. If the user types the sudo password where same-user code can capture it ([platform-helper §6.1](platform-helper.md)), that code can become root. mairu cannot defend against that, and its guarantees hold only on hosts where sudo is not used that way, or is backed by FIDO. §2.4 covers this and the other routes to root.
@@ -57,6 +93,13 @@ Escalation to root through the user's own `sudo` is also out of scope. If the us
 Credentials *after delivery* are also out of scope. Once `mairu exec` hands credentials to the user's command, same-user code that can inspect that command (its environment, its memory, or the ECS bearer token in its environment) can take them. This design protects the agent's ability to mint credentials for arbitrary roles and its session tokens. It does not protect credentials already given to an unprotected process.
 
 ### 2.3 What is a boundary and what is a guardrail
+
+```text
+boundary   platform prompt / FIDO touch / Windows Hello
+           + mutual verification (prompt contents are true)
+           + policy integrity
+guardrail  AI-agent detection · disallow_roles · .mairu.json trust prompt
+```
 
 - **Boundary**:
   - The platform authorization step (polkit, macOS LocalAuthentication, or the ssh-agent FIDO touch).
@@ -68,6 +111,20 @@ Credentials *after delivery* are also out of scope. Once `mairu exec` hands cred
   - the `.mairu.json` trust prompt
 
 ### 2.4 Trust chain and the weakest link
+
+```mermaid
+flowchart TB
+  sudo["sudo / su / polkit admin<br/>(password, NOPASSWD)"] --> root["root"]
+  groups["docker · lxd · incus-admin · disk"] --> root
+  wsl["wsl.exe -u root<br/>(WSL2 interop)"] --> root
+  root --> anchors["setgid binary · polkit action ·<br/>/var/lib/mairu records"]
+  anchors --> approval["policy approval<br/>(approval anchor)"]
+  approval --> methods["what role permits accept<br/>(context.presence.method)"]
+```
+
+```text
+strength = min(path to root, approval_methods, methods accepted by permits)
+```
 
 On a hardened Linux host every anchor is root-owned:
 - the setgid binary
@@ -99,7 +156,20 @@ Recommendations (README; `mairu doctor` warns where it can detect the condition,
 
 ## 3. Trust anchors
 
+```text
+Linux/BSD  exec setgid mairu → egid = mairu, AT_SECURE, non-dumpable → peer checks SO_PEERCRED.gid
+macOS      signed + hardened runtime → audit token → SecCode satisfies my own designated requirement
+```
+
 ### 3.1 Linux and BSD: the setgid marker group
+
+```text
+execve(/usr/local/libexec/mairu/mairu)      root:mairu 2755
+  egid      := mairu     # the marker, reported by SO_PEERCRED
+  AT_SECURE := 1         # loader ignores LD_PRELOAD and friends
+  dumpable  := 0         # no same-uid ptrace, /proc/<pid>/mem, environ, fd
+  traced by an unprivileged tracer?  → setgid not applied → no marker
+```
 
 The hardened binary is installed root-owned, with group `mairu` and mode `2755` (setgid). When any user execs it, the kernel:
 
@@ -122,6 +192,14 @@ Preconditions, checked at runtime (§4.2):
 
 ### 3.2 macOS: code signature
 
+```text
+verify_peer(socket)
+  getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)          → audit token (pid + pid version)
+  SecCodeCopyGuestWithAttributes(audit token)     → peer code
+  SecCodeCheckValidity(peer code, my own designated requirement)
+  require hardened runtime, no get-task-allow
+```
+
 Identity comes from the peer's audit token, never a pid:
 
 1. Get the audit token with `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` on the Unix socket, or from the XPC connection.
@@ -137,7 +215,25 @@ Both sides also require the hardened-runtime flag and the absence of `com.apple.
 
 ## 4. Hardened installation (Linux)
 
+```mermaid
+flowchart LR
+  pkg["deb / AUR postinst"] --> B["/usr/bin/mairu<br/>root:mairu 2755"]
+  usr["~/.cargo/bin/mairu, mise, aqua, tarball"] -- "sudo mairu harden<br/>(once)" --> H["/usr/local/libexec/mairu/mairu<br/>root:mairu 2755"]
+  usr -- "every run: re-exec" --> H
+```
+
 ### 4.1 Layout
+
+```text
+/usr/local/libexec/mairu/
+├── mairu                   root:mairu 2755   # the hardened binary
+└── .harden-manifest        root:root  0644   # what --uninstall removes
+/usr/share/polkit-1/actions/co.0w0.mairu.policy
+/var/lib/mairu/             root:mairu 2770   # users cannot traverse it
+└── users/                  root:mairu 2770
+    └── <uid>/              <uid>:mairu 0700
+        └── policy.record   # digest + approval anchor
+```
 
 | Path | Owner | Mode | Purpose |
 |---|---|---|---|
@@ -152,6 +248,17 @@ Both sides also require the hardened-runtime flag and the absence of `com.apple.
 `/var/lib/mairu/users/<uid>` is owned by the user, but the user cannot reach it by path: they are neither owner nor group of `/var/lib/mairu`, and "other" has no search permission. Only a process holding the marker gid can open it, and the genuine agent only ever opens the directory for `getuid()`. User namespaces do not help, because unmapped owners keep their permission semantics.
 
 ### 4.2 Classifying the running process
+
+```text
+detect()
+  g = getgrnam("mairu")                    none → Unhardened
+  rgid == g or g ∈ getgroups()             → Misconfigured (marker forgeable)
+  egid == g                                → Hardened; setresgid(rgid, rgid, g)
+  otherwise                                → Unhardened (try re-exec, §4.3)
+
+with_privileged_gid(f)    egid := g; f(); egid := rgid      # connect, listen, /var/lib/mairu
+before exec of anything   setresgid(rgid, rgid, rgid)       # marker never leaks
+```
 
 `crate::hardening::Hardening::detect()` runs first in `main`, before argument handling has any side effects:
 
@@ -181,6 +288,16 @@ Process-specific rules:
 
 ### 4.3 Re-exec from non-packaged installs
 
+```text
+main  (~/.cargo/bin/mairu exec …)
+  Hardening::detect                       → Unhardened
+  reexec_hardened_if_available
+    validate candidate                    root-owned, setgid mairu, no g/o write, not FUSE, safe parents
+    exec /usr/local/libexec/mairu/mairu   + MAIRU_HARDENED_REEXEC_{FROM,VERSION}
+main  (hardened copy)
+  read and unset MAIRU_HARDENED_REEXEC_*  → warn if versions differ
+```
+
 `mise`, `cargo install`, `aqua` and tarball installs keep the binary in a user-writable location, where it cannot be setgid. `crate::hardening::reexec_hardened_if_available()` runs right after classification when the state is `Unhardened`. It is skipped for the `harden` subcommand and when `MAIRU_NO_HARDENED_REEXEC=1` is set; the opt-out produces an unhardened client, which a hardened agent rejects anyway, so it is safe for development.
 
 1. For each candidate in order, `/usr/local/libexec/mairu/mairu` then `/usr/bin/mairu`:
@@ -205,6 +322,15 @@ The hardened copy is the single authoritative binary. Every installation execs i
 
 ### 4.4 `mairu harden`
 
+```text
+sudo mairu harden
+  ensure group mairu exists and has no members
+  /proc/self/exe → .mairu.tmp.<pid> → fchown root:mairu → fchmod 2755 → fsync → rename
+  setcap cap_ipc_lock=+ep             # after chown, which clears file caps
+  write co.0w0.mairu.policy, mkdir /var/lib/mairu{,/users} 2770
+  record .harden-manifest
+```
+
 Linux only (BSD later). It must run as root (`euid == 0`); otherwise it exits with the exact command to run: `sudo <canonical exe path> harden`. It is idempotent, and re-running it upgrades the binary.
 
 1. **Group.** If `mairu` is missing, run `groupadd --system mairu`, falling back to `addgroup --system mairu` (busybox). Refuse if the group has members, or if `SUDO_UID`'s primary gid is `mairu`, and print how to fix it.
@@ -226,6 +352,15 @@ Linux only (BSD later). It must run as root (`euid == 0`); otherwise it exits wi
 
 ### 4.5 Distribution packages
 
+```diff
+ #!/bin/sh
++getent group mairu >/dev/null || groupadd --system mairu
++chgrp mairu /usr/bin/mairu
++chmod 2755 /usr/bin/mairu
+ setcap cap_ipc_lock=+ep /usr/bin/mairu
++install -d -o root -g mairu -m 2770 /var/lib/mairu /var/lib/mairu/users
+```
+
 - **Debian** (`cargo deb`, `pkg/debian/postinst`):
 
   ```sh
@@ -243,7 +378,30 @@ Linux only (BSD later). It must run as root (`euid == 0`); otherwise it exits wi
 
 ## 5. Mutual verification (client ↔ agent)
 
+```mermaid
+sequenceDiagram
+  participant C as mairu client
+  participant K as kernel
+  participant A as mairu agent
+  A->>K: listen() while holding egid=mairu
+  C->>K: connect() while holding egid=mairu
+  K-->>A: SO_PEERCRED of client {pid, uid, gid=mairu}
+  K-->>C: SO_PEERCRED of listener {uid, gid=mairu}
+  A->>A: same uid and gid mairu → Verified
+  C->>C: same uid and gid mairu → genuine agent
+```
+
 ### 5.1 Agent side
+
+```text
+on accept(stream)
+  cred = SO_PEERCRED                       cred.uid != me → close
+  pidfd = SO_PEERPIDFD ?: pidfd_open(cred.pid)
+  start_time = /proc/<pid>/stat field 22; pidfd still alive?
+  trust = hardened ? (cred.gid == mairu ? Verified : Rejected) : Unverifiable
+on every RPC except PingAgent, GetAgentStatus
+  Rejected → PERMISSION_DENIED, REASON_UNVERIFIED_PEER
+```
 
 The agent wraps every accepted stream in `PeerStream { inner: tokio::net::UnixStream, peer: Arc<PeerIdentity> }`, which implements `tonic::transport::server::Connected<ConnectInfo = Arc<PeerIdentity>>`. tonic inserts the connect info into every request's extensions. At accept:
 
@@ -264,6 +422,14 @@ Each handler calls `require_trusted(&request)`. `Rejected` peers get `PERMISSION
 
 ### 5.2 Client side
 
+```text
+connect_to_agent(path)                     # tonic calls this on every reconnect
+  with_privileged_gid { std connect(path) }
+  cred = SO_PEERCRED(stream)               # the agent's credentials at listen()
+  require cred.uid == me
+  hardened client: require cred.gid == mairu, else only Ping / GetAgentStatus / Shutdown
+```
+
 `connect_to_agent_with_path` connects with a blocking `std::os::unix::net::UnixStream::connect` inside `with_privileged_gid`, then converts the stream to tokio. tonic calls the connector closure again on every reconnect, so reconnects behave the same. After connecting, it reads `SO_PEERCRED` of the stream, which carries the agent's credentials at `listen()`:
 
 - `uid` must equal `geteuid()`.
@@ -272,6 +438,18 @@ Each handler calls `require_trusted(&request)`. `Rejected` peers get `PERMISSION
 The `MAIRU_AGENT_SOCK` override remains supported. A redirected socket still has to pass this check.
 
 ### 5.3 Replacing an unverified agent
+
+```mermaid
+sequenceDiagram
+  participant C as hardened client
+  participant O as unverified agent
+  participant N as new hardened agent
+  C->>O: connect, gid is not mairu
+  C->>N: spawn mairu agent --replace-unverified
+  N->>O: ShutdownAgent (2 s timeout)
+  N->>N: unlink socket, bind and listen with egid=mairu
+  C->>N: connect, verified
+```
 
 A hardened client that finds a live but unverified agent at the socket path (an old agent started before `harden`, or a squatter) does not use it. `connect_or_start` spawns a hardened agent with `--replace-unverified`. That agent's bind logic:
 
@@ -292,9 +470,23 @@ A squatter that ignores `ShutdownAgent` keeps running on an unlinked socket and 
 
 ### 5.4 Session tokens on the wire
 
+```text
+mairu login
+  agent verified (§5.2)?  no → stop      # a squatter never sees the code
+  CompleteOauthCode{handle, code, state} → agent
+```
+
 `CompleteOauthCode` carries authorization codes to the agent. Client-side agent verification (§5.2) is what keeps these codes away from a socket squatter.
 
 ## 6. Process facts (Linux)
+
+```text
+stat = read /proc/<pid>/stat
+rest = text after the LAST ")"           # comm may contain ") "
+ppid, pgrp, session, tty_nr = fields 4..7
+starttime = field 22                     # clock ticks since boot
+pidfd still alive after reading?         # values belong to this process, not a recycled pid
+```
 
 `src/platform/linux/procfs.rs` parses `/proc/<pid>/stat` by splitting at the **last** `)` (comm may contain spaces and parentheses), giving:
 
@@ -308,7 +500,20 @@ It also reads `/proc/<pid>/comm`, `/proc/<pid>/exe` (readlink; may fail), and `/
 
 ## 7. Agent status and compatibility
 
+```text
+mairu doctor
+  PingAgent        → version, policy_integrity
+  GetAgentStatus   → hardening, how the agent sees me, capabilities, grants/leases
+  GetPolicy        → effective policy, per-store integrity
+  local checks     → sudo -n, root-equivalent groups, WSL interop, $SSH_AUTH_SOCK, tty
+```
+
 ### 7.1 `GetAgentStatus`
+
+```text
+PingAgent, GetAgentStatus   open to unverified peers (self-diagnosis)
+every other RPC             Rejected peer → REASON_UNVERIFIED_PEER
+```
 
 ```proto
 service Agent {
@@ -349,15 +554,34 @@ message PeerView {
 
 ### 7.2 Compatibility
 
+```text
+old client → new agent   no ClientContext → intent "unknown", no lease
+new client → old agent   unknown fields ignored; existing version warning fires
+```
+
 - New fields are optional. An old client talking to a new agent sends no `ClientContext`, and the agent then treats intent as unknown: no lease, and `command` is shown as "(unknown)".
 - An old agent ignores unknown fields.
 - Versions already diverge noisily (the existing `PingAgent` warning). Hardened deployments run one binary, so mixed versions are transitional.
 
 ## 8. WSL2
 
+```mermaid
+flowchart LR
+  L["same-uid Linux code"] -- "interop on" --> W["wsl.exe -u root"]
+  W --> R["root in the distribution"]
+  R -. "bypasses" .-> M["marker · protected dir · agent memory"]
+  L -. "interop off: no path" .-> N["native-Linux guarantees"]
+```
+
 WSL2 runs a real Linux kernel in a lightweight VM, so everything in these specs applies inside a distribution unchanged. Two things differ: Windows interop, and the authenticators available on the Windows side. WSL1 translates system calls instead of running a Linux kernel, and is not supported for hardening. On WSL1, `doctor` reports `HARDENING_STATE_MISCONFIGURED`.
 
 ### 8.1 Detection (agent)
+
+```text
+wsl2    = osrelease contains "microsoft-standard-WSL2" and /run/WSL exists
+interop = /proc/sys/fs/binfmt_misc/WSLInterop{,-late} exists and starts with "enabled"
+→ context.wsl_interop, GetAgentStatus notes, doctor
+```
 
 - **WSL2**: `/proc/sys/kernel/osrelease` contains `microsoft-standard-WSL2`, and `/run/WSL` exists.
 - **Interop enabled**: `/proc/sys/fs/binfmt_misc/WSLInterop` (or `WSLInterop-late`) exists, and its first line is `enabled`.
@@ -366,6 +590,11 @@ These facts are agent-determined and feed `context.wsl_interop` ([policy §9.2](
 
 ### 8.2 Interop makes root reachable
 
+```text
+interop on    same-uid code → wsl.exe -u root → root (Q-W1) → context.wsl_interop = true, warnings
+any time      Windows-side code as the same Windows user outranks the distro (out of scope)
+```
+
 With interop enabled, any process in the distribution can run Windows programs as the Windows user, including `wsl.exe`. `wsl.exe -u root` opens a root shell in the distribution without authentication. This is documented from the Windows side; **Q-W1** confirms it from inside a session.
 
 So with interop on, same-user Linux code can become root and bypass the marker group, the protected directory and the agent's memory protection (§2.4). mairu still runs hardened in this mode, reports `context.wsl_interop = true`, and `harden` and `doctor` warn.
@@ -373,6 +602,11 @@ So with interop on, same-user Linux code can become root and bypass the marker g
 Windows-side code running as the same Windows user can do this with or without interop. Like root, it is outside the threat model: on WSL2 the Windows account sits at the top of the trust chain.
 
 ### 8.3 Profiles
+
+```text
+integrated (interop on)    convenient: Windows Hello, Windows browser · guardrail only
+isolated   (interop off)   ssh -A from Windows into the distro · native-Linux strength
+```
 
 | | Integrated (interop on, the WSL default) | Isolated (interop off) |
 |---|---|---|
@@ -393,6 +627,13 @@ appendWindowsPath = false
 
 ### 8.4 Integration points
 
+```text
+doctor   WSL version · interop · profile · Hello helper · relayed agent
+harden   proceeds, warns about interop
+policy   forbid … when { context has wsl_interop && context.wsl_interop }
+sudo     pam_wsl_hello closes the sudo row of §2.4, not the interop row
+```
+
 - **`open_url` and `notify`**: [platform-helper §10](platform-helper.md).
 - **`doctor`** reports:
   - the WSL version, interop state and profile in effect
@@ -411,6 +652,11 @@ appendWindowsPath = false
 
 ### 8.5 Open questions (need a WSL2 host)
 
+```text
+Q-W1 root via interop?   Q-W2 Hello signature padding   Q-W3 Hello through OpenSSH FIDO
+Q-W4 channel without interop   Q-W5 WSLg and auto modes
+```
+
 - **Q-W1**: `wsl.exe -u root` started from inside a WSL2 session obtains root without authentication.
 - **Q-W2**: the padding of KeyCredential signatures, PSS or PKCS #1 v1.5. Microsoft's documentation contradicts itself; pin it with a test vector.
 - **Q-W3**: whether Windows OpenSSH's FIDO support (`webauthn.dll`) can use Windows Hello itself as the authenticator on current builds. Reports vary by build. If it can, the isolated profile gets Windows Hello through ssh-agent forwarding with no helper at all.
@@ -418,6 +664,15 @@ appendWindowsPath = false
 - **Q-W5**: how WSLg should influence `auto` modes beyond [platform-helper §10](platform-helper.md).
 
 ## 9. macOS hardening (implemented separately)
+
+```text
+              Linux                              macOS
+anchor        setgid marker group                code signature (my own designated requirement)
+peer id       SO_PEERCRED + pidfd                LOCAL_PEERTOKEN audit token + pid version
+anti-tamper   AT_SECURE, non-dumpable            hardened runtime, PT_DENY_ATTACH
+location      /usr/local/libexec/mairu (root)    Developer ID: anywhere; ad-hoc: harden copy
+top of chain  root                               administrator (sudo, /etc/authorization)
+```
 
 This section and [platform-helper §11](platform-helper.md) are the brief for the macOS implementation. Items marked **Q** must be settled there and written back into these specs.
 
@@ -434,6 +689,13 @@ This section and [platform-helper §11](platform-helper.md) are the brief for th
 
 ## 10. BSD (design only)
 
+```text
+SO_PEERCRED        → LOCAL_PEERCRED (xucred: cr_groups[0] = egid, cr_pid on 13+)
+/proc/<pid>/stat   → kinfo_proc via sysctl
+groupadd           → pw groupadd
+same marker group, same harden layout
+```
+
 - FreeBSD `LOCAL_PEERCRED` (`struct xucred`, `cr_groups[0]` is the effective gid, `cr_pid` on 13+), with the setgid marker as on Linux.
 - Process facts from `kinfo_proc` via `sysctl`.
 - polkit is in ports.
@@ -441,6 +703,15 @@ This section and [platform-helper §11](platform-helper.md) are the brief for th
 - `crate::ppid` already handles `PROC_PDEATHSIG_CTL`.
 
 ## 11. Security considerations
+
+```text
+rogue client                       ✗ marker gid at connect()
+LD_PRELOAD / ptrace into mairu     ✗ AT_SECURE, non-dumpable, setgid dropped under ptrace
+socket squatter / rogue agent      ✗ client checks the listen-time marker; replaced
+pid reuse                          ✗ pidfd + start time
+marker leaking to children         ✗ setresgid before every exec
+root via sudo / groups / WSL       ! out of scope, bounds everything; doctor warns
+```
 
 | Threat | Mitigation |
 |---|---|
@@ -461,6 +732,13 @@ Authorization-related threats are in [policy §11](policy.md), and helper- and b
 
 ## 12. Operations
 
+```text
+upgrade     sudo mairu harden (or the package manager) → mairu kill-agent
+uninstall   sudo mairu harden --uninstall [--purge] → groupdel mairu
+recover     sudo mairu harden --reset-policy-record --user <name>
+diagnose    mairu doctor
+```
+
 - **Kernel**: Linux ≥ 5.3 (pidfd) is required for hardened mode; ≥ 6.5 (`SO_PEERPIDFD`) is recommended. polkit was developed against 127.
 - **Upgrade**: re-run `sudo mairu harden`, or let the package manager upgrade it. Running agents keep the old image until restarted; the existing version-divergence warning tells the user to run `mairu kill-agent`.
 - **Uninstall**: `sudo mairu harden --uninstall [--purge]`, then optionally `groupdel mairu`.
@@ -480,6 +758,11 @@ Authorization-related threats are in [policy §11](policy.md), and helper- and b
 
 ## 13. Scope
 
+```text
+in    marker group · harden + re-exec · mutual verification · GetAgentStatus/doctor · WSL2 detection
+out   macOS implementation · WSL1 · BSD · TPM token wrapping · servers.d integrity · AUR/Homebrew
+```
+
 **In scope (Linux):** §3–§8, plus the `mairu harden` and `mairu doctor` commands. The WSL2 parts can be built on Linux; verifying §8.5 needs a Windows host with WSL2.
 
 **Out of scope, and future work:**
@@ -491,6 +774,11 @@ Authorization-related threats are in [policy §11](policy.md), and helper- and b
 - AUR and Homebrew packaging changes (separate repositories)
 
 ## 14. Deliverables and stack
+
+```text
+(main) ← spec ← marker-gid ← peer-verification ← install ← authorization ← headless
+       ← ai-agents ← policy ← ssh-agent ← wsl ← notify ← platform-helper
+```
 
 The three specs are delivered together as one `gh stack`, one PR per layer, in this order. Each layer updates `README.md`, `CHANGELOG.md` (`[not yet released]`) and the Current Status of every spec it implements.
 
@@ -546,3 +834,4 @@ Future:
 - 2026-10-23: Corrected the tty password-capture vectors and stated `sudo` escalation as out of scope.
 - 2026-10-23: Added the trust chain and weakest-link analysis (§2.4) and the WSL2 profiles (§8).
 - 2026-10-23: Split into hardening, policy and platform-helper specs.
+- 2026-10-23: Added show-me style visual summaries to every section (additive; Mermaid blocks validated with mermaid 11.4.1).

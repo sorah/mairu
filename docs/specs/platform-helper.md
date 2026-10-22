@@ -7,7 +7,17 @@ Related specs:
 - [hardening.md](hardening.md): threat model, terminology, trust anchors, and the peer verification reused by the helper transport.
 - [policy.md](policy.md): when the agent asks the human and what it does with the answer; the integrity records the stores here hold.
 
+Each section opens with a short visual summary. It is illustrative; the text after it is normative.
+
 ## 1. Overview
+
+```text
+src/platform/
+├── mod.rs        # Platform trait, PeerIdentity, SessionIdentity, current()
+├── linux/        # in-process: procfs, peer, polkit, integrity, notify, open_url, wsl
+├── remote.rs     # RemotePlatform → PlatformHelper over a verified socket
+└── fallback.rs   # macOS and BSD until implemented
+```
 
 - The `Platform` trait (§2) and the `mairu.platform` protocol (§3) cover peer inspection, authorization prompts, integrity records, notifications and opening URLs, so the agent core stays platform-independent.
 - Linux implements the trait in-process. Platforms where a feature needs a separate identity, such as macOS notifications, which need an app bundle, use a helper process that serves the same protocol. Both directions of that connection are verified (§4).
@@ -16,6 +26,14 @@ Related specs:
 - Headless Linux (§9) and WSL2 (§10) are first-class environments. The macOS backends are briefed in §11.
 
 ## 2. Rust trait
+
+```text
+agent accept               → inspect_peer
+client connect             → verify_agent
+Authorizer (policy.md)     → session_identity, ancestry, authorize
+policy approval            → record_integrity, verify_integrity
+clients, convenience (§8)  → notify, open_url
+```
 
 `src/platform/mod.rs`:
 
@@ -57,6 +75,14 @@ pub trait Platform: Send + Sync + std::fmt::Debug {
   - `FallbackPlatform`: macOS and BSD until they are implemented. No verification (`Unverifiable`), authorization `UNAVAILABLE`, no integrity stores, no notifications. `open_url` uses `/usr/bin/open` on macOS.
 
 ## 3. Protocol: `proto/mairu_platform.proto`
+
+```text
+mairu.platform.PlatformHelper
+├── GetCapabilities  → {peer_verification, authorization, integrity_stores, notifications, open_url, notes}
+├── Authorize        → ALLOWED | DENIED | CANCELLED | UNAVAILABLE(reason)
+├── Notify, OpenUrl
+└── RecordIntegrity, VerifyIntegrity    # IntegrityRecord = digest + ApprovalAnchor
+```
 
 The types here are the contract. The Linux backend uses them in-process, and an out-of-process helper serves the same messages over gRPC. Enum values are prefixed with the enum name, because proto3 enum values share their package's scope.
 
@@ -213,6 +239,18 @@ Helpers reject requests whose `uid` differs from their own.
 
 ## 4. Platform helper transport and mutual verification
 
+```mermaid
+sequenceDiagram
+  participant A as agent
+  participant H as mairu platform-helper
+  A->>H: spawn /proc/self/exe platform-helper (setgid re-applies)
+  H->>H: listen() while holding egid=mairu
+  A->>H: connect() while holding egid=mairu
+  H->>H: peer gid mairu, same uid, pid equals getppid()
+  A->>A: helper gid mairu, same uid, pid equals spawned child
+  Note over A,H: any check fails → UNAVAILABLE, fail closed
+```
+
 An out-of-process helper exists for platforms where a feature needs a separate identity. On macOS, `UNUserNotificationCenter` requires an app bundle, and Secure Enclave keys bound to a keychain access group require entitlements that a bare CLI cannot carry. On Linux the in-process backend is the default; the helper is opt-in and exists to exercise the transport.
 
 Both directions are security-critical:
@@ -237,15 +275,46 @@ Rules:
 
 ## 5. Verifying system services (Linux in-process backend)
 
+```text
+system bus   hardened: ignore $DBUS_SYSTEM_BUS_ADDRESS → /run/dbus/system_bus_socket (root-owned dir)
+polkit       GetConnectionUnixUser("org.freedesktop.PolicyKit1") == 0, else untrusted-authority
+session bus  Secret Service, notifications, portal: claimable by same uid → never trusted alone
+```
+
 - **System bus.** When hardened, the agent ignores `DBUS_SYSTEM_BUS_ADDRESS`, which is attacker-controllable environment, and connects to `unix:path=/run/dbus/system_bus_socket`. The socket's parent directory must be root-owned and not group/other-writable.
 - **polkit authority.** Before trusting a result, the agent checks that the owner of `org.freedesktop.PolicyKit1` is uid 0 (`org.freedesktop.DBus.GetConnectionUnixUser`). A mismatch maps to `UNAVAILABLE`/`untrusted-authority`.
 - **Session bus** services (Secret Service, notifications, the desktop portal) can be claimed by any same-uid process. They are treated as untrusted conveniences, and this is why Secret Service is a secondary integrity store ([policy §9.7](policy.md)).
 
 ## 6. Authorization facilities
 
+```mermaid
+sequenceDiagram
+  participant C as client in a tmux pane
+  participant A as agent
+  participant P as polkitd
+  C->>A: AssumeRole
+  A->>P: CheckAuthorization(unix-process C, co.0w0.mairu.assume-role)
+  P-->>A: not authorized, no authentication agent
+  A-->>C: NO_AUTHENTICATION_AGENT
+  C->>C: spawn /usr/bin/pkttyagent --process C --fallback
+  C->>A: AssumeRole again
+  A->>P: CheckAuthorization
+  P->>C: password prompt in this pane, via pkttyagent
+  P-->>A: authorized
+```
+
 The `platform` presence method ([policy §6.1](policy.md)) is backed by these.
 
 ### 6.1 polkit (Linux)
+
+```text
+CheckAuthorization(unix-process{pid, start-time, uid}, action, details, AllowUserInteraction)
+  authorized                          → ALLOWED
+  dismissed                           → CANCELLED
+  challenge, no agent for the subject → UNAVAILABLE no-authentication-agent  (client: pkttyagent, retry)
+  action not registered               → UNAVAILABLE polkit-action-not-installed
+  bus unreachable / owner uid ≠ 0     → UNAVAILABLE polkit-unavailable / untrusted-authority
+```
 
 `pkg/polkit/co.0w0.mairu.policy`:
 
@@ -317,9 +386,19 @@ This is the same exposure as `sudo`'s prompt in the same pane, and `auth_self` a
 
 ### 6.2 LocalAuthentication (macOS)
 
+```text
+LAContext.evaluatePolicy(.deviceOwnerAuthentication, reason) → ALLOWED / DENIED     (§11)
+```
+
 Briefed in §11.
 
 ## 7. Integrity stores
+
+```text
+record "policy" = {digest, approval anchor}
+├── /var/lib/mairu/users/<uid>/policy.record   hardened only · authoritative · anchor source
+└── Secret Service item                        when reachable · weak · backfilled
+```
 
 The stores hold the `IntegrityRecord` (§3) of [policy §9.7](policy.md): a digest plus the approval anchor. The state machine that interprets their answers is [policy §9.8](policy.md).
 
@@ -334,9 +413,23 @@ The stores hold the `IntegrityRecord` (§3) of [policy §9.7](policy.md): a dige
 
 ## 8. Convenience features: notifications and opening URLs
 
+```text
+mode = --no-browser ?? $MAIRU_OPEN_URL ?? config.json open_url ?? auto
+auto      WSL2 + interop → Windows side · graphical and not SSH → local · else none
+local     this process's backend      agent    → OpenUrl / Notify RPC
+command   your helper program         none     → terminal output only
+```
+
 These carry no security weight. Nothing relies on a notification being seen or a URL being opened, and the URLs involved are not secret (PKCE and `state` protect the code flow). They are therefore chosen **per client**, from unprotected settings, and can be redirected or switched off freely. Terminal output and printed URLs never depend on these settings.
 
 ### 8.1 Who emits what
+
+```text
+mairu login                    → open the authorize URL
+exec sidecar, UNAUTHENTICATED  → "login required"            once / server / 10 min
+refused AI-agent request       → "AI-agent request refused"  once / (server, rolespec) / min
+PingAgent says TAMPERED        → "policy lockdown"           once / agent instance
+```
 
 Emission always happens in a client, never on the agent's own initiative, so every notification follows the client's choice.
 
@@ -351,6 +444,10 @@ Rate-limit state is best-effort: one file per event key under `runtime_dir()/not
 
 ### 8.2 Modes
 
+```text
+per feature (open_url, notify):   auto | local | agent | command | none
+```
+
 `open_url` and `notify` each take one of:
 
 | Mode | Behavior |
@@ -364,6 +461,12 @@ Rate-limit state is best-effort: one file per event key under `runtime_dir()/not
 A failure in any mode is logged at debug level and otherwise ignored.
 
 ### 8.3 Configuration
+
+```text
+--no-browser  >  MAIRU_OPEN_URL / MAIRU_NOTIFY (+ *_COMMAND)  >  config.json  >  auto
+helper argv   open_url → command + [url]
+              notify   → command + [title, body], env MAIRU_NOTIFY_{URGENCY,EVENT}
+```
 
 Precedence: command-line flag, then environment, then `config.json`, then `auto`.
 
@@ -392,6 +495,11 @@ The README gives examples: a `notify-send` wrapper, and for tmux over SSH, a scr
 
 ### 8.4 Backends (`local` and `agent` modes)
 
+```text
+notify     org.freedesktop.Notifications on the session bus · no bus or daemon → no-op
+open_url   portal OpenURI → xdg-open · http/https only · title/body truncated
+```
+
 - **Linux notifications**:
   - `org.freedesktop.Notifications.Notify` on the session bus (`app_name = "mairu"`, urgency hint).
   - The address comes from `DBUS_SESSION_BUS_ADDRESS`, falling back to `unix:path=$XDG_RUNTIME_DIR/bus` when that exists.
@@ -404,6 +512,11 @@ Every mode passes on only `http`/`https` URLs, so a URL can never reach `file://
 
 ### 8.5 Agent RPCs
 
+```text
+client ──OpenUrl / Notify──► agent ──► agent's backend (in-process or helper)
+trusted peer only · never authorization · same URL and length rules
+```
+
 ```proto
 service Agent {
   rpc OpenUrl(mairu.platform.OpenUrlRequest) returns (mairu.platform.OpenUrlResponse);
@@ -414,6 +527,16 @@ service Agent {
 Both need only a trusted peer ([hardening §5.1](hardening.md)), never authorization, and apply the URL and length rules of §8.4.
 
 ## 9. Headless Linux
+
+```mermaid
+flowchart LR
+  laptop["laptop: FIDO key + ssh-agent"] -- "ssh -A" --> host["remote host"]
+  host --> pane["tmux pane<br/>(own session)"]
+  pane --> mairu["mairu exec"]
+  mairu -- "challenge" --> sock["forwarded $SSH_AUTH_SOCK"]
+  sock --> laptop
+  mairu -. "fallback" .-> pk["pkttyagent password<br/>in the pane"]
+```
 
 The reference workflow is long-lived **tmux sessions on a remote host, reached over SSH**.
 
@@ -441,6 +564,11 @@ The reference workflow is long-lived **tmux sessions on a remote host, reached o
 
 ## 10. WSL2
 
+```text
+WSL2 + interop   open_url → wslview / explorer.exe   notify → command   auth → windows-hello, pkttyagent
+WSL2 isolated    open_url → printed                   notify → none      auth → ssh -A from Windows
+```
+
 Profiles, interop and the root path are in [hardening §8](hardening.md). Platform-specific behavior inside a WSL2 distribution:
 
 - **`open_url`.** On WSL2 with interop, `auto` (§8.2) resolves to `wslview` when installed, otherwise `explorer.exe` located through `wslpath`, started via `hardening::command()`. This takes precedence over WSLg's `DISPLAY`/`WAYLAND_DISPLAY`, since the Linux side usually has no browser.
@@ -450,6 +578,14 @@ Profiles, interop and the root path are in [hardening §8](hardening.md). Platfo
 - **Q-W5** ([hardening §8.5](hardening.md)): how WSLg should influence `auto` modes beyond this.
 
 ## 11. macOS backends (implemented separately)
+
+```mermaid
+flowchart LR
+  A["mairu agent"] -- "code signing<br/>checked both ways" --> H["Mairu Helper.app<br/>co.0w0.mairu.platform-helper"]
+  H --> LA["LocalAuthentication<br/>(Touch ID, password)"]
+  H --> UN["UNUserNotificationCenter"]
+  H --> KC["Keychain / Secure Enclave<br/>integrity record"]
+```
 
 Together with [hardening §9](hardening.md), this is the brief for the macOS implementation. Items marked **Q** must be settled there and written back into these specs.
 
@@ -469,6 +605,13 @@ Together with [hardening §9](hardening.md), this is the brief for the macOS imp
 
 ## 12. Security considerations
 
+```text
+rogue helper or helper caller    ✗ verified both ways, pid pinned, fail closed
+fake polkit / bus / pkttyagent   ✗ pinned bus path, authority uid 0, fixed /usr/bin/pkttyagent
+Secret Service rewritten         ! weak store; protected directory is authoritative
+spoofed notifications / URLs     · no security weight by design
+```
+
 | Threat | Mitigation |
 |---|---|
 | Rogue platform helper or rogue helper caller | Mutual verification with pid pinning; fail closed (§4) |
@@ -479,6 +622,11 @@ Together with [hardening §9](hardening.md), this is the brief for the macOS imp
 
 ## 13. Scope
 
+```text
+in    trait · protocol · helper · polkit + pkttyagent · integrity stores · notify / open_url · headless · WSL2
+out   macOS backends · agent-initiated login · hosts without polkitd (prompting roles fail closed)
+```
+
 **In scope (Linux):** §2–§10, plus the hidden `mairu platform-helper` command.
 
 **Out of scope, and future work:**
@@ -487,6 +635,10 @@ Together with [hardening §9](hardening.md), this is the brief for the macOS imp
 - Linux hosts without polkitd: prompts are `UNAVAILABLE` there, so roles that require a platform prompt fail closed, while key-based methods and `forbid` policies still work
 
 ## 14. Deliverables
+
+```text
+peer-verification ← authorization ← headless ← policy ← wsl ← notify ← platform-helper
+```
 
 Layers of the stack in [hardening §14](hardening.md) that implement this spec:
 
@@ -525,3 +677,4 @@ macOS (separate implementation, §11):
 
 - 2026-10-23: Drafted as part of a single combined spec; notifications and URL opening moved to client-side emission with client-chosen modes.
 - 2026-10-23: Split out of the combined spec.
+- 2026-10-23: Added show-me style visual summaries to every section (additive; Mermaid blocks validated with mermaid 11.4.1).
