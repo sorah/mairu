@@ -8,7 +8,7 @@ This spec adds three things:
 
 1. **Mutual verification** between `mairu` (clients) and `mairu agent`, anchored in a platform mechanism that same-user code cannot forge. Clients only talk to a genuine agent, and the agent only serves genuine clients.
 2. **Platform authorization.** The agent asks the human, through a platform facility, before vending credentials. The answer is remembered per terminal session for a short time. User policy that relaxes or tightens this is integrity-protected.
-3. **A common platform protocol** (`mairu.platform`, protobuf) and a matching Rust trait, covering authorization prompts, integrity records, notifications and opening URLs, so the agent core stays platform-independent and an out-of-process helper can serve the same contract.
+3. **A common platform protocol** (`mairu.platform`, protobuf) and a matching Rust trait, covering authorization prompts, integrity records, notifications and opening URLs, so the agent core stays platform-independent and an out-of-process helper can serve the same contract. Notifications and opening URLs carry no security weight, and each client chooses how they are delivered (§10).
 
 Linux is implemented first. macOS is designed here and implemented separately against this document. BSD is design-only.
 
@@ -405,6 +405,7 @@ message NotifyRequest {
   string title = 1;
   string body = 2;
   Urgency urgency = 3;
+  string event = 4;  // "login-required" | "ai-agent-denied" | "policy-lockdown"
 }
 message NotifyResponse { bool delivered = 1; }
 
@@ -476,6 +477,14 @@ service Agent {
   rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
   rpc ApprovePolicy(ApprovePolicyRequest) returns (ApprovePolicyResponse);
   rpc RevokeAuthorizations(RevokeAuthorizationsRequest) returns (RevokeAuthorizationsResponse);
+  rpc OpenUrl(mairu.platform.OpenUrlRequest) returns (mairu.platform.OpenUrlResponse);  // §10.5
+  rpc Notify(mairu.platform.NotifyRequest) returns (mairu.platform.NotifyResponse);     // §10.5
+}
+
+message PingAgentResponse {
+  string version = 1;
+  // Lets every client warn about, and notify of, lockdown (§10.1) without an extra RPC.
+  PolicyIntegrity policy_integrity = 2;
 }
 
 message AssumeRoleRequest {
@@ -955,7 +964,7 @@ The unhardened defaults reproduce today's behavior.
 | `ABSENT` | Built-in defaults |
 | `APPROVED` | The file |
 | `UNAPPROVED` | **Tighten-only merge**: for every request, the stricter of the built-in defaults and the file, per attribute. Unapproved `ai_agent` additions apply, since they only tighten. Unapproved `authorization` (methods, keys) is **ignored**, since adding keys relaxes. An unparseable file is ignored, with a warning. |
-| `TAMPERED` | **Lockdown**: `require = max(always, file rule if parseable)`, `ai_agents = deny`, `methods = ["platform"]` (registered keys are not trusted), grant creation disabled. `doctor` and every client print a warning, and the agent sends a critical notification once per state change. |
+| `TAMPERED` | **Lockdown**: `require = max(always, file rule if parseable)`, `ai_agents = deny`, `methods = ["platform"]` (registered keys are not trusted), grant creation disabled. `doctor` and every client print a warning, and clients emit the lockdown notification (§10.1). |
 
 Verification runs at agent start, before every authorization decision (cached by file `(dev, ino, mtime, size)` plus a 5 s TTL), and after `ApprovePolicy`.
 
@@ -972,23 +981,86 @@ Rollback: only the latest digest is kept. Restoring an older file plus its recor
 
 `mairu policy show` prints the effective policy, the integrity state and per-store statuses (`GetPolicy`).
 
-## 10. Notifications and opening URLs
+## 10. Convenience features: notifications and opening URLs
 
-- **Linux notifications.**
-  - Mechanism: `org.freedesktop.Notifications.Notify` on the session bus (`app_name = "mairu"`, urgency hint). The address comes from `DBUS_SESSION_BUS_ADDRESS`, falling back to `unix:path=$XDG_RUNTIME_DIR/bus` when that exists.
-  - Headless: no bus or no daemon → `notifications = false`, and calls are debug-logged no-ops.
-  - Events, rate-limited:
+These carry no security weight. Nothing relies on a notification being seen or a URL being opened, and the URLs involved are not secret (PKCE and `state` protect the code flow). They are therefore chosen **per client**, from unprotected settings, and can be redirected or switched off freely. Terminal output and printed URLs never depend on these settings.
 
-    | Event | Limit |
-    |---|---|
-    | Login required while serving an `exec` request | once per server per 10 min |
-    | Policy tampered → lockdown | once per state change |
-    | AI-agent request denied | once per (server, rolespec) per minute |
+### 10.1 Who emits what
 
-- **Opening URLs** (`mairu login`, client side):
-  - Mechanism: `org.freedesktop.portal.OpenURI.OpenURI("", url, {})`, falling back to `xdg-open` via `hardening::command()`. `PATH` lookup is acceptable here; the URL is not secret, since PKCE and state protect the flow.
-  - When: only if `WAYLAND_DISPLAY` or `DISPLAY` is set, `SSH_CONNECTION`/`SSH_TTY` are unset, and neither `--no-browser` nor `MAIRU_NO_BROWSER` is given. The URL is always printed as well.
-  - For the device code grant, open `verification_uri_complete`.
+Emission always happens in a client, never on the agent's own initiative, so every notification follows the client's choice.
+
+| Event | Emitted by | Limit |
+|---|---|---|
+| Open the authorize URL (`verification_uri_complete` for the device code grant) | `mairu login`, including the login inside `mairu exec` | once per login |
+| Login required | `mairu exec` sidecar (ECS backend and auto-refresh) when the agent returns `UNAUTHENTICATED` | once per server per 10 min |
+| AI-agent request denied | The client that receives `REASON_AI_AGENT_DENIED` | once per (server, rolespec) per minute |
+| Policy lockdown | Any client whose `PingAgent` reports `POLICY_INTEGRITY_TAMPERED` (§7) | once per agent instance |
+
+Rate-limit state is best-effort: one file per event key under `runtime_dir()/notified/`, compared by mtime.
+
+### 10.2 Modes
+
+`open_url` and `notify` each take one of:
+
+| Mode | Behavior |
+|---|---|
+| `auto` (default) | `local` when the client looks graphical (`WAYLAND_DISPLAY` or `DISPLAY` set, and `SSH_CONNECTION`/`SSH_TTY` unset), otherwise `none` |
+| `local` | The client's own backend, `crate::platform::current()` (§10.4) |
+| `agent` | Ask the agent through the `OpenUrl`/`Notify` RPCs (§10.5). The agent uses its own backend, which may be the platform helper (§6.3). Useful when the agent has a desktop session the client lacks, and on macOS where notifications need the helper app. |
+| `command` | Run a different helper program supplied by the user (§10.3) |
+| `none` | Disabled |
+
+A failure in any mode is logged at debug level and otherwise ignored.
+
+### 10.3 Configuration
+
+Precedence: command-line flag, then environment, then `config.json`, then `auto`.
+
+- `config.json` (`UserConfig`, unprotected):
+
+  ```jsonc
+  {
+    "open_url": {"mode": "command", "command": ["my-open-url"]},
+    "notify": {"mode": "agent"}
+  }
+  ```
+
+  `command` is an argv array, required when `mode` is `command`.
+- Environment:
+  - `MAIRU_OPEN_URL` / `MAIRU_NOTIFY` set the mode: `auto|local|agent|command|none`.
+  - `MAIRU_OPEN_URL_COMMAND` / `MAIRU_NOTIFY_COMMAND` hold a shell command line, run as `/bin/sh -c '<value> "$@"' mairu <args…>`. Setting one implies `command` mode.
+- Flags: `--no-browser` on `mairu login` and `mairu exec` means `open_url = none`.
+
+The helper command interface:
+
+- `open_url`: argv is `command + [url]`.
+- `notify`: argv is `command + [title, body]`, plus the environment variables `MAIRU_NOTIFY_URGENCY` (`low|normal|critical`) and `MAIRU_NOTIFY_EVENT` (`login-required|ai-agent-denied|policy-lockdown`).
+- The command is spawned through `hardening::command()`, which drops the marker gid, with stdin set to `/dev/null`. It isn't waited on for more than 5 s, and is reaped in the background.
+
+The README gives examples: a `notify-send` wrapper, and for tmux over SSH, a script that forwards the URL to the local machine or calls `tmux display-message`.
+
+### 10.4 Backends (`local` and `agent` modes)
+
+- **Linux notifications**:
+  - `org.freedesktop.Notifications.Notify` on the session bus (`app_name = "mairu"`, urgency hint).
+  - The address comes from `DBUS_SESSION_BUS_ADDRESS`, falling back to `unix:path=$XDG_RUNTIME_DIR/bus` when that exists.
+  - Headless (no bus, or no notification daemon): `notifications = false`, and calls are no-ops.
+- **Linux open URL**: `org.freedesktop.portal.OpenURI.OpenURI("", url, {})`, falling back to `xdg-open` via `hardening::command()`. A `PATH` lookup is acceptable here.
+- **macOS**: §12.
+- **Fallback**: `/usr/bin/open` on macOS, otherwise unavailable.
+
+Every mode passes on only `http`/`https` URLs, so a URL can never reach `file://` or a custom-scheme handler. Notification title and body are truncated to 256 and 1024 bytes.
+
+### 10.5 Agent RPCs
+
+```proto
+service Agent {
+  rpc OpenUrl(mairu.platform.OpenUrlRequest) returns (mairu.platform.OpenUrlResponse);
+  rpc Notify(mairu.platform.NotifyRequest) returns (mairu.platform.NotifyResponse);
+}
+```
+
+Both need only a trusted peer (§5.1), never authorization, and apply the URL and length rules of §10.4.
 
 ## 11. Headless Linux
 
@@ -1001,14 +1073,15 @@ The reference workflow is long-lived **tmux sessions on a remote host, reached o
 | polkit prompt | GUI agent | `pkttyagent` in the pane (§8.4) | ✓ (system bus) | ✗ → `UNAVAILABLE` |
 | Integrity: protected directory | ✓ (hardened) | ✓ (hardened) | ✓ (hardened) | ✓ (hardened) |
 | Integrity: Secret Service | usually ✓ | usually ✗ | ✗ | — |
-| Notifications | ✓ | ✗ (no-op) | ✗ | — |
-| Open URL | ✓ | ✗ (URL printed) | ✗ | — |
+| Notifications, `auto` mode (§10.2) | ✓ | ✗ (no-op) | ✗ | — |
+| Open URL, `auto` mode (§10.2) | ✓ | ✗ (URL printed) | ✗ | — |
+| Notifications / open URL, `command` mode | as configured | as configured (e.g. forward to the local machine) | as configured | as configured |
 
 **Fails closed:**
 - A role that requires a prompt when no method can ask: no ssh-agent key and polkit unavailable, or no tty for `pkttyagent`.
 
 **Degrades:**
-- Notifications and open-url.
+- Notifications and open-url fall back to terminal output only. Users can point them at their own helper (§10.3).
 - Secret Service. On hardened hosts the protected directory carries integrity alone. On unhardened headless hosts there is no store, so the policy is `UNAPPROVED` and only tightens.
 
 **Admin guidance** (README):
@@ -1071,6 +1144,7 @@ This section is the brief for the macOS implementation. Items marked **Q** must 
 | Hardlinked old hardened binaries | `fs.protected_hardlinks` warning; atomic replace (§3.1, §4.4) |
 | Environment injection into a hardened agent (`HOME`, `XDG_*`, `DBUS_*`) | Integrity keyed by uid; system bus pinned. `servers.d` is unprotected (future work, §16). |
 | Credentials after delivery to the user's command | Out of scope (§2.2) |
+| Spoofed, redirected or suppressed notifications and URL opening | Not relied on for security; unprotected client settings by design. Helpers run with the marker dropped and receive only `http`/`https` URLs. (§10) |
 
 Logging: authorization decisions go to the agent log at `info` (peer pid, session identity, server, rolespec, method, result, AI signals), never with credentials or signatures.
 
@@ -1116,7 +1190,7 @@ Delivered as a `gh stack`, one PR per layer.
 | `hardening/ai-agents` | `src/authorization.rs` (signals), `src/platform/linux/procfs.rs` (ancestry), client `env_names` |
 | `hardening/policy` | `src/policy.rs`, `src/platform/linux/integrity.rs`, `proto/mairu.proto` (`GetPolicy`, `ApprovePolicy`), `src/cmd/policy.rs`, `Cargo.toml` (Secret Service crate) |
 | `hardening/ssh-agent` | `src/ssh_agent_presence.rs`, `proto/mairu.proto` (challenge messages), client relay, `Cargo.toml` (`ssh-key`, `ssh-encoding`) |
-| `hardening/notify` | `src/platform/linux/{notify,open_url}.rs`, `src/cmd/login.rs`, agent notification hooks |
+| `hardening/notify` | `src/convenience.rs` (mode resolution, helper commands, rate limits), `src/config.rs` (`UserConfig.open_url`, `UserConfig.notify`), `src/platform/linux/{notify,open_url}.rs`, `proto/mairu.proto` (`OpenUrl`, `Notify`, `PingAgentResponse.policy_integrity`), `src/agent.rs`, `src/cmd/{login,exec}.rs` (`--no-browser`, event emission) |
 | `hardening/platform-helper` | `src/platform/remote.rs`, `src/cmd/platform_helper.rs` |
 
 Every layer also updates `README.md` and `CHANGELOG.md` (`[not yet released]`) for its feature, and this section's Current Status.
@@ -1143,7 +1217,7 @@ Linux:
 - [ ] polkit backend and policy file; system bus and authority checks
 - [ ] `pkttyagent` fallback
 - [ ] Protected-directory and Secret Service integrity stores
-- [ ] Notifications and open-url
+- [ ] Notifications and open-url: backends, client-chosen modes (`auto|local|agent|command|none`), agent `OpenUrl`/`Notify` RPCs
 - [ ] Platform helper with mutual verification
 - [ ] Manual end-to-end verification: GUI session, SSH + tmux, headless
 
@@ -1166,3 +1240,4 @@ Future:
 ### Updates
 
 - 2026-10-23: Spec drafted (Linux implementation plan, macOS brief).
+- 2026-10-23: Notifications and URL opening moved to client-side emission with client-chosen modes (§10).
