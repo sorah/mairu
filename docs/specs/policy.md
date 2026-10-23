@@ -96,9 +96,12 @@ The agent remembers human checks as grants and leases, and the Cedar policy (§9
 
 **Lease.**
 
-- Key: `(peer pid, peer start_time, server_id, Rolespec)`. Value: `{created, method}` and the peer's pidfd.
+- Key: `(peer pid, peer start_time, server_id, Rolespec)`. Value: `{created, method, last_demand_expiry}` and the peer's pidfd.
 - Recorded after every successful human check whose intent is `exec`.
-- Valid while the pidfd's process is alive. Swept every 60 s and checked on lookup.
+- Exists while the pidfd's process is alive. Swept every 60 s and checked on lookup. How long it stays good enough is a policy matter, through `context.presence.age` and `context.presence.idle`. The built-in policy keeps it for the process's lifetime, until the process goes 1 h without credentials (§9.6).
+- **Demand vs pre-fetch.** The sidecar's auto-refresh fetches credentials before they expire whether or not the command uses AWS, so it marks those requests `ExecIntent.prefetch` (§10). Every other request under a lease is demand: the preflight check, the ECS endpoint serving the command, and static mode.
+  - When credentials are vended on demand, `last_demand_expiry` becomes their expiration.
+  - Pre-fetches never move it, so a process that stops using AWS goes idle even though auto-refresh keeps running.
 
 All authorization state is in memory only. Restarting the agent forgets every grant and lease.
 
@@ -113,7 +116,7 @@ All authorization state is in memory only. Restarting the agent forgets every gr
    | Candidate | `presence` |
    |---|---|
    | nothing remembered | `{verified: false, scope: "none", age: 0, idle: 0}` |
-   | the lease for (peer, server, rolespec), if any | `{verified: true, scope: "process", method, age: now − created, idle: 0}` |
+   | the lease for (peer, server, rolespec), if any | `{verified: true, scope: "process", method, age: now − created, idle: max(0, now − last_demand_expiry)}` |
    | the grant for (session, server, rolespec), if any | `{verified: true, scope: "session", method, age: now − created, idle: now − last_used}` |
 
 4. Otherwise, for each method `m` in the effective method order (§9.5) that is usable for this request, evaluate a **fresh** candidate: `{verified: true, scope: "request", method: m, age: 0, idle: 0}`. The first `m` whose candidate is `Allow` is the method to ask with:
@@ -128,6 +131,7 @@ All authorization state is in memory only. Restarting the agent forgets every gr
      - Any other `UNAVAILABLE` → continue with the next method.
 
    If a fresh candidate allows but no method can ask → `REASON_UNAVAILABLE`, with a detail listing what was tried.
+   **Pre-fetch requests skip this step.** If no remembered presence permits a request marked `ExecIntent.prefetch`, the agent returns `REASON_PRESENCE_REQUIRED` without asking anyone. The sidecar then stops pre-fetching until the command next asks for credentials, and that demand request asks the human as usual. A background refresh never raises a prompt.
 5. On a permit from step 4, record the lease (exec intent) and the grant (session identity present).
 6. Otherwise refuse:
    - If any evaluation in steps 3–4 was `Deny` with a `forbid` among its determining policies → `REASON_FORBIDDEN`, listing those policy ids.
@@ -409,7 +413,9 @@ namespace Mairu {
     method?: String,
     // Seconds since the covering human check; 0 when not verified.
     age: Long,
-    // Seconds since a session grant was last used; 0 for other scopes.
+    // Session grant: seconds since it was last used.
+    // Process lease: seconds since the credentials last obtained on demand expired (0 while valid).
+    // Otherwise 0.
     idle: Long
   };
 
@@ -582,7 +588,7 @@ authorization.json
 
 ```text
 no approved policy.cedar?
-  hardened agent    builtin-human-session + builtin-ai-agent-per-request
+  hardened agent    builtin-human + builtin-ai-agent-per-request
   unhardened agent  builtin-unhardened (permit everything, today's behavior)
   tampered          builtin-lockdown + builtin-lockdown-no-ai
 ```
@@ -593,22 +599,26 @@ Hardened agent:
 
 ```cedar
 // Humans: one check per terminal session, remembered for 5 minutes idle, 12 hours at most.
-@id("builtin-human-session")
+// A running `mairu exec` keeps its approval for its lifetime, until it goes 1 hour without credentials.
+@id("builtin-human")
 permit (principal, action == Mairu::Action::"AssumeRole", resource)
 when {
   !context.ai_agent &&
   context.presence.verified &&
-  context.presence.idle <= 300 &&
-  context.presence.age <= 43200
+  (context.presence.scope != "session" ||
+   (context.presence.idle <= 300 && context.presence.age <= 43200)) &&
+  (context.presence.scope != "process" || context.presence.idle <= 3600)
 };
 
-// AI agents: a human approves every new request; a running `mairu exec` keeps its approval.
+// AI agents: a human approves every new request; a running `mairu exec` keeps its approval
+// as above.
 @id("builtin-ai-agent-per-request")
 permit (principal, action == Mairu::Action::"AssumeRole", resource)
 when {
   context.ai_agent &&
   context.presence.verified &&
-  ["request", "process"].contains(context.presence.scope)
+  (context.presence.scope == "request" ||
+   (context.presence.scope == "process" && context.presence.idle <= 3600))
 };
 ```
 
@@ -626,7 +636,8 @@ Lockdown (§9.8):
 permit (principal, action == Mairu::Action::"AssumeRole", resource)
 when {
   context.presence.verified &&
-  ["request", "process"].contains(context.presence.scope)
+  (context.presence.scope == "request" ||
+   (context.presence.scope == "process" && context.presence.idle <= 3600))
 };
 
 @id("builtin-lockdown-no-ai")
@@ -635,6 +646,22 @@ when { context.ai_agent };
 ```
 
 `mairu policy init` writes the hardened built-in policies, with explanatory comments, into `policy.cedar`, plus a minimal `authorization.json`. The user then edits and approves them.
+
+Callers without a tty, such as IDEs running `credential-process`, have `session == "parent"`. Their SDKs cache credentials for about an hour, which outlasts the 5-minute idle window, so under the built-ins they are asked roughly once an hour. The built-ins keep 5 minutes. The README documents this relaxation for users who want fewer prompts:
+
+```cedar
+// IDEs and other callers without a tty: reuse a grant for up to 1 hour idle.
+@id("tty-less-callers-1h-idle")
+permit (principal, action == Mairu::Action::"AssumeRole", resource)
+when {
+  !context.ai_agent &&
+  context.presence.verified &&
+  context.session == "parent" &&
+  context.presence.scope == "session" &&
+  context.presence.idle <= 3600 &&
+  context.presence.age <= 43200
+};
+```
 
 ### 9.7 Integrity records
 
@@ -805,6 +832,7 @@ message ClientContext {
 message ExecIntent {
   repeated bytes command = 1;
   string mode = 2;                 // "ecs" | "static"
+  bool prefetch = 3;               // the sidecar's auto-refresh, not a request by the command (§4)
 }
 
 message CredentialProcessIntent {}
@@ -852,6 +880,7 @@ message AuthorizationError {
     REASON_CHALLENGE = 6;                // FAILED_PRECONDITION: sign `challenge` and retry
     REASON_NO_AUTHENTICATION_AGENT = 7;  // FAILED_PRECONDITION: register pkttyagent and retry
     REASON_INVALID_RESPONSE = 8;         // PERMISSION_DENIED: bad, expired or replayed response
+    REASON_PRESENCE_REQUIRED = 9;        // FAILED_PRECONDITION: pre-fetch needs a fresh check; nobody was asked (§4)
   }
   Reason reason = 1;
   string detail = 2;
@@ -909,6 +938,7 @@ message RevokeAuthorizationsResponse {
 ```text
 PERMISSION_DENIED     UNVERIFIED_PEER · DENIED · FORBIDDEN · NOT_PERMITTED · INVALID_RESPONSE
 FAILED_PRECONDITION   UNAVAILABLE · CHALLENGE (sign, retry) · NO_AUTHENTICATION_AGENT (pkttyagent, retry)
+                      · PRESENCE_REQUIRED (pre-fetch only: stop pre-fetching)
 UNAUTHENTICATED       unchanged: log in to the credential server
 ```
 
@@ -963,7 +993,7 @@ Layers of the stack in [hardening §14](hardening.md) that implement this spec:
 
 | Layer | Files |
 |---|---|
-| `hardening/authorization` | `src/authorization.rs` (grants, leases, decision procedure), `src/policy/{mod.rs,mairu.cedarschema,builtin/*.cedar}` (Cedar engine with built-in policies only), `proto/mairu.proto` (`ClientContext`, `AuthorizationError`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs`, `src/ecs_server.rs`, `Cargo.toml` (`cedar-policy`) |
+| `hardening/authorization` | `src/authorization.rs` (grants, leases, decision procedure), `src/policy/{mod.rs,mairu.cedarschema,builtin/*.cedar}` (Cedar engine with built-in policies only), `proto/mairu.proto` (`ClientContext`, `AuthorizationError`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs` (auto-refresh marks `prefetch`), `src/ecs_server.rs`, `Cargo.toml` (`cedar-policy`), README (relaxing idle for tty-less callers) |
 | `hardening/ai-agents` | `src/authorization.rs` (signals), client `env_names` |
 | `hardening/policy` | `src/policy/{files,integrity_state,settings}.rs` (user files, tighten-only and lockdown sets, approval anchor), `proto/mairu.proto` (`GetPolicy`, `ApprovePolicy`, `PingAgentResponse.policy_integrity`), `src/cmd/policy.rs` (`init`, `check`, `show`, `explain`, `schema`, `approve`) |
 | `hardening/ssh-agent` | `src/ssh_agent_presence.rs`, `proto/mairu.proto` (challenge messages), client relay, `Cargo.toml` (`ssh-key`, `ssh-encoding`) |
@@ -992,3 +1022,4 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - 2026-10-23: Split out of the combined spec.
 - 2026-10-23: Added show-me style visual summaries to every section (additive; Mermaid blocks validated with mermaid 11.4.1).
 - 2026-10-23: The platform method goes through the separate platform helper.
+- 2026-10-23: Leases last the process lifetime under policy control, with a 1 h idle timeout counted from the expiry of the last credentials obtained on demand; auto-refresh pre-fetches are marked and never prompt (§4, §9.6, §10). IDE relaxation documented rather than built in (§9.6).
