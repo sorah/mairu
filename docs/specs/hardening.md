@@ -774,13 +774,17 @@ On macOS the top of the trust chain (§2.4) is the administrator account: `sudo`
 ### 9.8 Distribution
 
 ```text
-GitHub release tarball · mise · aqua   official (Developer ID)
-cargo install                          ad-hoc
-Homebrew cask "mairu" (proposed)       official: binary symlinked from Caskroom, never re-signed
-Homebrew formula (from source)         ad-hoc
+GitHub release tarball · aqua · mise · ubi   official: one self-extracting binary, installed unchanged
+Homebrew cask "mairu"                        official: binary symlinked from Caskroom, never re-signed
+Homebrew formula "mairu-src"                 ad-hoc (built from source)
+cargo install                                ad-hoc
 ```
 
-- GitHub release tarballs, mise and aqua deliver official builds as they are.
+- **aqua, mise and ubi** install the official release tarball unchanged.
+  - The binary is self-extracting: it carries the notifier bundle and writes it out on first use ([platform-helper §11](platform-helper.md)). No installer needs to know about bundles.
+  - These tools download with their own HTTP clients, which do not set quarantine.
+  - They keep each version in its own directory, and versions can run side by side. The team-based requirement does not depend on paths (§9.1), and notifiers are kept per version.
+  - Release asset names stay as they are, so the existing aqua registry entry and the mise and ubi asset matching keep working.
 - `cargo install` produces ad-hoc builds.
 - **Q-M7: Homebrew.** Research findings, as of 2026-10-23:
   - Homebrew policy:
@@ -794,19 +798,19 @@ Homebrew formula (from source)         ad-hoc
   - Quarantine and Gatekeeper:
     - Cask downloads are quarantined; formula downloads are not. `--no-quarantine` is gone as of Homebrew 6.0.0.
     - homebrew/cask has disabled casks that fail Gatekeeper since 2026-09-01. A notarized official build passes. A bare binary cannot be stapled, so its first run needs an online notarization check.
-  - **Proposed shape:**
+  - **Decided (2026-10-23):**
     - A cask `mairu` in `sorah/homebrew-sorah`: `binary "mairu"` pointing at the notarized release tarball, with Linux URLs too, and nothing that strips quarantine.
     - Migrate users from the formula with `tap_migrations.json`.
     - Keep a from-source formula under another name, such as `mairu-src`, for ad-hoc builds. When a formula and a cask share a name, `brew install` picks the formula.
   - **Fallback:** a formula that installs the signed artifact, as hashicorp/tap and cirruslabs/tart do. It keeps the signature and avoids quarantine, but Homebrew maintainers call the pattern unsupported.
-  - Not decided yet: confirm the shape before changing the tap.
+  - The tap change is a follow-up in `sorah/homebrew-sorah`.
 
 ### 9.9 Open questions (macOS)
 
 ```text
 Q-M1 socketpair peer info      Q-M2 GUI session / LaunchAgent   Q-M3 notifier authorization
 Q-M4 permission across upgrade Q-M5 notifier icon and cleanup   Q-M6 ad-hoc integrity store
-Q-M7 Homebrew shape            Q-M8 LOCAL_PEERTOKEN on client   Q-M9 harden for ad-hoc builds
+Q-M7 Homebrew (decided)       Q-M8 LOCAL_PEERTOKEN on client   Q-M9 harden for ad-hoc builds
 ```
 
 - Q-M1 to Q-M6: [platform-helper §4, §11](platform-helper.md)
@@ -1044,7 +1048,7 @@ BSD:
 Future:
 - [ ] TPM/Secure Enclave token wrapping and zeroizing allocator
 - [ ] `servers.d` and trust-record integrity
-- [ ] AUR and Homebrew packaging updates (Homebrew: Q-M7)
+- [ ] AUR and Homebrew packaging updates (Homebrew: cask `mairu` and formula `mairu-src`, §9.8)
 
 ### Updates
 
@@ -1056,3 +1060,4 @@ Future:
 - 2026-10-23: Platform services moved permanently into a separate platform helper process (platform-helper §1, §4); the helper layer moves early in the stack.
 - 2026-10-23: macOS rewritten around Developer ID build tiers (§9): official, third-party and ad-hoc, a signed security floor, the release pipeline; development process for contributors without Apple Developer Program access (§15).
 - 2026-10-23: Homebrew research recorded under Q-M7 (§9.8); a cask is the proposed shape for official builds.
+- 2026-10-23: Homebrew decided: cask `mairu` for official builds, formula `mairu-src` from source. aqua, mise and ubi install the self-extracting official binary unchanged (§9.8).

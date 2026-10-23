@@ -664,7 +664,8 @@ The platform helper is the same binary as the agent and is never bundled. Everyt
    both
      write into a fresh directory per version and flavour; never modify an existing bundle
      strip com.apple.quarantine from what mairu wrote; check the designated requirement
-     rename into place atomically; remove older versions
+     rename into place atomically; touch its mtime on every launch
+     remove notifier directories unused for 30 days   # versions may run side by side
    each notification
      open -g -n -a <full path to the bundle> --args notifier --title … --body … --event …
      notifier: request authorization the first time, add the request, exit
@@ -689,7 +690,7 @@ The platform helper is the same binary as the agent and is never bundled. Everyt
    - The platform helper itself is never the bundle. LaunchServices cannot pass the socketpair (§4), and a bundle in a user-writable location would break "trusted by construction".
    - **Q-M3:** does a LaunchServices-launched notifier get notification authorization and appear in System Settings, for both the Developer ID and the ad-hoc flavour on current macOS? Does that hold when the agent itself was started from an SSH login while a GUI session exists? One source claims unsigned apps can never be authorized, while ad-hoc or self-signed ones can. Also: does quarantine carry over from a cask-quarantined mairu process to files it writes?
    - **Q-M4:** does the permission survive an ad-hoc notifier's upgrade, where the cdhash changes but the bundle id does not?
-   - **Q-M5:** the notifier's icon, display name, and cleanup of old versions.
+   - **Q-M5:** the notifier's icon and display name, and the cleanup period. Old notifiers are removed only when unused for a while, because installers such as mise run several mairu versions side by side.
 4. **Open URL.** `NSWorkspace` or `/usr/bin/open`, in the user's GUI session.
 5. **AI-agent ancestry** ([policy §5](policy.md)). The same rules, using `proc_pidinfo` (process facts in [hardening §9.6](hardening.md)). This is a process primitive in the agent, not a helper service.
 
@@ -776,3 +777,4 @@ macOS (separate implementation, §11):
 - 2026-10-23: Platform services always run in a separate platform helper that shares the agent's lifetime (inherited socketpair), on every OS; process primitives split into their own trait; convenience modes reduced to `auto|agent|command|none` with a session hint; no app bundle planned on macOS.
 - 2026-10-23: macOS backends rewritten around Developer ID build tiers: embedded Developer ID notifier or locally assembled ad-hoc notifier, keychain store per tier.
 - 2026-10-23: Notifier extraction hardened: fresh directory per version and flavour, quarantine removed and designated requirement checked before launch, launch by full path, separate bundle ids per flavour.
+- 2026-10-23: Notifier cleanup is by disuse, not by version, since versions run side by side.
