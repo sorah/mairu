@@ -1005,11 +1005,13 @@ pull_request (forks included)    build + test on Linux and macOS, no secrets
   linux-hardened job             sudo harden in the runner; marker, re-exec, helper socketpair, polkit test rule
   macos job                      macos-dev-sign; verification between two processes; notifier assembly (ad-hoc)
 push of a signed tag (upstream)  environment "release": Developer ID + notary key → §9.4
+release dry run (maintainers)    manual trigger on a branch: build, sign, notarize, no publish; same environment
 maintainer check (draft release) signed artifact: doctor, notifier, security floor, upgrade keeps sessions
 ```
 
 - Designated-requirement strings and security-floor parsing are unit-tested, so the team-requirement logic is covered without signing.
-- Properties only an official build has are checked by a maintainer on the draft release before publishing it, as a step of the release process: team-requirement acceptance from the previous release, the floor, and the embedded notifier.
+- Properties only an official build has are checked by a maintainer on the draft release before publishing it: acceptance of the previous release under the team requirement, the floor, and the embedded notifier. This is a checklist step in the `releng` skill (`.claude/skills/releng/SKILL.md`), between the release workflow and publishing.
+- Pull requests that change the signing or notarization pipeline cannot exercise it from a fork, because forks never receive the secrets. A maintainer runs a **release dry run** on the PR's branch. It is a manually triggered workflow that builds, signs and notarizes without publishing, gated by the `release` environment's reviewers.
 
 ## Current Status
 
@@ -1040,7 +1042,7 @@ Development process (§15):
 - [ ] Dev profile (§15.1)
 - [ ] linux-hardened CI job and polkit test rules (§15.2, §15.5)
 - [ ] macOS CI job and `script/macos-dev-sign` (§15.3, §15.5)
-- [ ] Maintainer check for official-only properties in the release process (§15.5)
+- [ ] Maintainer checklist step in the `releng` skill, and the release dry-run workflow (§15.5)
 
 BSD:
 - [ ] Design only (§10)
@@ -1061,3 +1063,4 @@ Future:
 - 2026-10-23: macOS rewritten around Developer ID build tiers (§9): official, third-party and ad-hoc, a signed security floor, the release pipeline; development process for contributors without Apple Developer Program access (§15).
 - 2026-10-23: Homebrew research recorded under Q-M7 (§9.8); a cask is the proposed shape for official builds.
 - 2026-10-23: Homebrew decided: cask `mairu` for official builds, formula `mairu-src` from source. aqua, mise and ubi install the self-extracting official binary unchanged (§9.8).
+- 2026-10-23: Decided: dev profile on by default for debug builds; official-only checks as a releng checklist step; release dry run for pipeline PRs (§15).
