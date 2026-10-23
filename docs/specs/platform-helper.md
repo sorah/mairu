@@ -659,7 +659,7 @@ The platform helper is the same binary as the agent and is never bundled. Everyt
    - `LAError -4` ("system authentication is running", for example while the screen is locked) maps to `UNAVAILABLE`, which can be retried.
    - **Q:** whether to use a Secure Enclave key gated by `.userPresence` so the result is cryptographic rather than boolean. Optional, because the agent enforcing the result is itself protected.
    - Over SSH there is no UI, so the ssh-agent method ([policy §6.2](policy.md)) applies unchanged.
-   - **Q-M2:** an agent first started from an SSH login, and so its helper, may sit outside the user's GUI session, where the LocalAuthentication UI cannot appear (`UNAVAILABLE`). The candidate fix is a per-user LaunchAgent plist that runs the plain binary in the GUI session; it needs no bundle.
+   - **Q-M2 (addressed):** an agent first started from an SSH login, and so its helper, could sit outside the user's GUI session, where the LocalAuthentication UI cannot appear (`UNAVAILABLE`). The agent always runs as a LaunchAgent in `gui/<uid>`, a plain binary with no bundle ([hardening §9.2](hardening.md)), and its helper inherits that session. What an SSH-only login reaches is Q-M11 there.
 2. **Integrity store.**
    - **The legacy keychain provides no integrity** (confirmed on macOS 27.2). Same-user code deleted an item with `security delete-generic-password` and no prompt. An unrelated unsigned binary then created a new item with the same service and account, whose access list trusts only mairu, holding forged content. mairu read it without a prompt, and the planted access list is indistinguishable from a genuine one. This applies to any requirement, team-based or cdhash. A MAC key kept in the keychain does not help either, because both items can be deleted and planted again. A legacy keychain item (`KEYCHAIN`) is therefore a **weak** store, like Secret Service on Linux: it catches careless edits only.
    - **The data-protection keychain needs an entitlement.** From an unbundled, unentitled binary, `SecItemAdd` fails with `-34018`. `keychain-access-groups`, and with it a Secure Enclave key whose signature would protect the record (`SECURE_ENCLAVE`), therefore need an app bundle and a provisioning profile. They are not planned.
@@ -728,7 +728,7 @@ spoofed notifications / URLs     · no security weight by design
 
 | Threat | Mitigation |
 |---|---|
-| Lending a connected fd to a genuine signed process on macOS, so its audit token stands in for the attacker | Last-I/O semantics of `LOCAL_PEERTOKEN` ([hardening §3.2](hardening.md)); open as Q-M10 (re-check per read, or XPC with per-message tokens) |
+| Lending a connected fd to a genuine signed process on macOS, so its audit token stands in for the attacker | Clients reach the agent over XPC, where every message carries its sender's audit token ([hardening §9.2](hardening.md)). The helper's socketpair ends exist only inside hardened-runtime processes (§4). |
 | Deleting or forging a legacy keychain item on macOS | The keychain store is weak by design; strong integrity needs the protected directory through `harden` (§11) |
 | Rogue platform helper or rogue helper caller | Inherited socketpair with no filesystem rendezvous; the helper checks its parent's credentials, and the agent trusts the child it exec'd; fail closed (§4) |
 | A bug reached through D-Bus, Secret Service, notification, portal or LocalAuthentication code | Platform services run only in the helper, which holds no tokens (§1) |
@@ -790,7 +790,7 @@ macOS (separate implementation, §11):
 - [ ] Settle the Q items in §11 and write them back here
 - [ ] LocalAuthentication backend
 - [ ] Integrity store
-- [ ] Helper on macOS (same binary, unbundled); settle Q-M1 and Q-M2
+- [ ] Helper on macOS (same binary, unbundled), spawned by the LaunchAgent-run agent (Q-M1 confirmed, Q-M2 addressed)
 - [ ] Notifier bundle: embedded Developer ID notifier (`mairu-notifier`) and ad-hoc assembly; settle Q-M3 to Q-M5
 - [ ] Keychain integrity store for Developer ID builds; settle Q-M6 for ad-hoc builds
 
@@ -806,3 +806,4 @@ macOS (separate implementation, §11):
 - 2026-10-23: Decided: a single platform helper process; session-bus exposure recorded as an accepted risk (§12).
 - 2026-10-23: WSL2 `open_url` uses `rundll32.exe url.dll,FileProtocolHandler` (explorer.exe fallback); `auto` honors `$BROWSER`; WSLg findings recorded (§8.2, §10).
 - 2026-10-23: Interim macOS findings: Q-M1 confirmed (socketpair reports the creator until the child does I/O); the legacy keychain has no integrity, so `KEYCHAIN` is weak and strong integrity needs `harden`; the data-protection keychain needs an entitlement; Q-M3 interim results (§4, §7, §11, §12).
+- 2026-10-23: Q-M2 addressed by the LaunchAgent transport decided in [hardening §9.2](hardening.md) (§11, §12).

@@ -196,8 +196,8 @@ Preconditions, checked at runtime (§4.2):
 ### 3.2 macOS: code signature
 
 ```text
-verify_peer(socket)
-  getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)          → audit token (pid + pid version)
+verify_peer(message)
+  audit token of the XPC message (§9.2)           → sender's pid + pid version
   SecCodeCopyGuestWithAttributes(audit token)     → peer code
   SecCodeCheckValidity(peer code, my own designated requirement)
   require hardened runtime, no get-task-allow
@@ -205,7 +205,7 @@ verify_peer(socket)
 
 Identity comes from the peer's audit token, never a pid:
 
-1. Get the audit token with `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` on the Unix socket, or from the XPC connection.
+1. Get the audit token of each XPC message (§9.2). `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` serves only the platform helper's inherited socketpair ([platform-helper §4](platform-helper.md)).
 2. Get the peer's code with `SecCodeCopyGuestWithAttributes(kSecGuestAttributeAudit)`.
 3. Check it with `SecCodeCheckValidity` against a requirement derived from **the verifier's own** designated requirement (`SecCodeCopySelf` + `SecCodeCopyDesignatedRequirement`).
 
@@ -219,7 +219,7 @@ Both sides also require the hardened-runtime flag and the absence of `com.apple.
 
 **Asymmetry with Linux (confirmed on macOS 27.2).** `SO_PEERCRED` on Linux is a snapshot taken at `connect()`/`listen()`. On macOS, `LOCAL_PEERTOKEN` and `LOCAL_PEERPID` are **not** snapshots: they report the last process that did I/O on the peer socket. Only `LOCAL_PEERCRED` is a snapshot, and it carries uid and groups but no pid.
 
-That makes one check per connection unsound. An unsigned process can connect, hand the connected fd to a genuine signed mairu as its stdout, and let it write anything. The peer token then names the genuine binary, while the attacker keeps the fd and continues talking. The transport on macOS is therefore open (Q-M10, §9.2).
+That makes one check per connection unsound. An unsigned process can connect, hand the connected fd to a genuine signed mairu as its stdout, and let it write anything. The peer token then names the genuine binary, while the attacker keeps the fd and continues talking. macOS clients therefore reach the agent over XPC, where every message carries its own sender's audit token (Q-M10, §9.2).
 
 ## 4. Hardened installation (Linux)
 
@@ -687,7 +687,8 @@ Q-W4 channel without interop (not default)   Q-W5 WSLg and auto modes (settled)
 ```text
               Linux                              macOS, Developer ID build                 macOS, ad-hoc build
 anchor        setgid marker group                team + identifier co.0w0.mairu            cdhash (byte-identical binaries)
-peer id       SO_PEERCRED + pidfd                LOCAL_PEERTOKEN audit token + pid version (both tiers)
+transport     Unix socket                        XPC Mach service of a per-user LaunchAgent (both tiers)
+peer id       SO_PEERCRED + pidfd                audit token of each XPC message + pid version (both tiers)
 anti-tamper   AT_SECURE, non-dumpable            hardened runtime, PT_DENY_ATTACH (both tiers)
 location      /usr/local/libexec/mairu (root)    anywhere                                  harden copy recommended
 downgrade     old copies unreachable             signed minimum client version (§9.3)      cdhash differs per version
@@ -712,22 +713,60 @@ The runtime decides from **its own observed signature**, never from build flags.
 - **Third-party signed.** Someone else's Developer ID: the same mechanics under that team. Such builds do not interoperate with official installs, because their designated requirements differ. That is by design.
 - **Ad-hoc.** Everything else. Linker-signed ad-hoc binaries lack the hardened-runtime flag and so run unhardened. `sudo mairu harden` (§9.5) or `script/macos-dev-sign` (§15.3) re-signs them with it.
 
-### 9.2 Peer verification
+### 9.2 Peer verification and transport
 
 ```text
-client ── LOCAL_PEERTOKEN ──► agent's audit token ──► satisfies my DR? + runtime flag + no get-task-allow
-agent  ── LOCAL_PEERTOKEN ──► client's audit token ──► same checks, then the minimum client version (§9.3)
+~/Library/LaunchAgents/co.0w0.mairu.agent.plist   MachServices: co.0w0.mairu.agent    (gui/<uid>)
+client ── XPC request (sender's audit token) ──► agent:  satisfies my DR? + runtime flag + no get-task-allow + §9.3
+agent  ── XPC reply   (sender's audit token) ──► client: satisfies my DR? + runtime flag + no get-task-allow + §9.3
 ```
 
-§3.2, in both directions.
+§3.2, in both directions, on every message.
 
 - **Q-M8 (confirmed, with a caveat).** On the client's connected socket, `LOCAL_PEERTOKEN`/`LOCAL_PEERPID` give the listener's pid, pid version and audit session. `SecCodeCheckValidity` against the verifier's own requirement succeeds for the same build and fails with `errSecCSReqFailed` for a different one, in both directions. The caveat is §3.2's asymmetry: these values follow the last process to do I/O, so a genuine process lent the fd can stand in for an attacker.
-- **Q-M10: the macOS transport.** The options:
-  - (a) Keep the Unix socket. Check the token right after `accept()`, before any read. Re-check after every read, closing the connection if the pid or pid version changes. This narrows the fd-lending attack to a race (the attacker writes, then the lent genuine process writes before the agent re-checks), but does not close it.
-  - (b) XPC through a per-user LaunchAgent `MachService`. Every message carries the sender's audit token, which can be checked per message (`xpc_connection_set_peer_code_signing_requirement`, or the token of each message). The protobuf messages travel unchanged inside XPC messages. A LaunchAgent also puts the agent in the GUI session, which addresses Q-M2.
+- **Q-M10 (decided 2026-10-23): XPC through a per-user LaunchAgent.** The options were:
+  - (a) Keep the Unix socket, check the token right after `accept()`, and re-check after every read. This narrows the fd-lending attack to a race (the attacker writes, then the lent genuine process writes before the agent re-checks), but does not close it.
+  - (b) XPC through a per-user LaunchAgent `MachService`. **Chosen.**
   - (c) A challenge that only a genuine, non-lent process can answer. No such answer exists without a secret, and mairu binaries hold none.
 
-  (b) is the robust option. Whether it is adopted is a decision for the macOS work.
+**Why XPC holds.** The kernel stamps every Mach message with its sender's audit token. A lent or forwarded send right therefore speaks as whichever process actually sends on it, so the lending attack of §3.2 has nothing to borrow.
+
+**Service.**
+- The agent is a LaunchAgent, label `co.0w0.mairu.agent`, declaring the Mach service `co.0w0.mairu.agent` in `MachServices`. It is a plain executable (`ProgramArguments`), so it needs no bundle.
+- Clients connect with `xpc_connection_create_mach_service`, and launchd starts the agent on the first message.
+- The dev profile (§15.1) uses label and service `co.0w0.mairu.dev.agent`.
+- Linux and BSD keep the Unix socket.
+
+**Messages.** Every RPC in `proto/mairu.proto` is unary, so each maps to one XPC request and its reply:
+- request: `{method: "/mairu.Agent/AssumeRole", body: <protobuf bytes>}`
+- reply: `{code, message, metadata, body}`, carrying the gRPC status code and metadata such as `mairu-authorization` unchanged
+
+The protobuf messages and the agent's handlers are shared with Linux. Only the transport differs.
+
+**Verification.**
+- Both ends set `xpc_connection_set_peer_code_signing_requirement` to the requirement of §3.2, derived from their own designated requirement.
+- The hardened-runtime, get-task-allow and minimum-client-version (§9.3) checks run on the audit token of each message.
+- The agent pins the pid and pid version of the requester for grants and leases, as it does on Linux ([policy §4](policy.md)).
+
+**Installing and replacing the LaunchAgent.**
+- When the service does not answer, the client writes the plist, pointing at the binary to run (the hardened copy when there is one, §9.5), and runs `launchctl bootstrap gui/<uid> <plist>`.
+- Replacing an unverified or outdated agent (§5.3) is `launchctl bootout gui/<uid>/co.0w0.mairu.agent`, then rewriting the plist and bootstrapping it again.
+- The plist lives in a user-writable directory and is not trusted. Same-user code can rewrite it, or start the genuine binary with any arguments and environment, which the adversary can do anyway (§2.1). Whatever answers the service name must still pass the client's check.
+- A job that claims the service name first only denies service, which same-user code can also do by killing the agent.
+
+**Session.** A LaunchAgent bootstrapped into `gui/<uid>` runs in the user's GUI session, so the LocalAuthentication UI can appear. This addresses Q-M2 ([platform-helper §11](platform-helper.md)).
+
+**Q-M11: SSH logins.**
+- Can a client in an SSH session look up a Mach service of a `gui/<uid>` LaunchAgent while the user is also logged in at the console?
+- What should the client bootstrap when there is no GUI login at all, as on a headless Mac reached only over SSH: the `user/<uid>` domain, with `LimitLoadToSessionType` `Background`?
+
+There the ssh-agent method ([policy §6.2](policy.md)) applies, as on headless Linux.
+
+**Unchanged by the transport.**
+- The agent ↔ helper channel stays an inherited socketpair ([platform-helper §4](platform-helper.md)). Lending needs a copy of an fd, and both ends live only in hardened-runtime processes, whose task ports same-user code cannot obtain.
+- The ECS credential endpoint keeps its bearer token.
+
+**Compatibility.** macOS clients from before this change use the Unix socket. They start their own socket agent, which shares no sessions with the XPC agent.
 
 ### 9.3 Minimum client version (downgrade protection)
 
@@ -841,12 +880,12 @@ cargo install                                ad-hoc
 Q-M1 socketpair peer info      Q-M2 GUI session / LaunchAgent   Q-M3 notifier authorization
 Q-M4 permission across upgrade Q-M5 notifier icon and cleanup   Q-M6 ad-hoc integrity store
 Q-M7 Homebrew (decided)       Q-M8 LOCAL_PEERTOKEN (confirmed) Q-M9 harden for ad-hoc builds
-Q-M10 macOS transport (socket vs XPC)
+Q-M10 transport (XPC, decided) Q-M11 LaunchAgent over SSH
 ```
 
 - Q-M1 to Q-M6: [platform-helper §4, §11](platform-helper.md)
 - Q-M7: §9.8
-- Q-M8, Q-M10: §9.2
+- Q-M8, Q-M10, Q-M11: §9.2
 - Q-M9: §9.5
 
 ## 10. BSD (design only)
@@ -882,6 +921,8 @@ root via sudo / groups / WSL       ! out of scope, bounds everything; doctor war
 | `LD_PRELOAD` or ptrace into the genuine binary | `AT_SECURE`, non-dumpable, setgid dropped under ptrace (§3.1) |
 | Marker leaking to children | Permanent drop before every exec; `hardening::command()` (§4.2) |
 | Socket squatter or rogue agent stealing OAuth codes | Client checks the agent's listen-time marker (§5.2); hardened clients replace unverified agents (§5.3) |
+| Lending a connected socket to a genuine signed process (macOS) | XPC: every message carries its sender's audit token (§9.2) |
+| Rewritten LaunchAgent plist or a squatted service name (macOS) | Clients verify whatever answers on every message; squatting only denies service (§9.2) |
 | Pid reuse | `SO_PEERPIDFD`/pidfd, start times in every identity, liveness re-checks (§5.1, §6) |
 | Root reached through `sudo`/polkit passwords, `NOPASSWD`, root-equivalent groups | Out of scope, but it bounds everything (§2.4); `doctor` warns (§12) |
 | Root reached through WSL2 interop (`wsl.exe -u root`) | Isolated profile, or `context.wsl_interop` forbids; `doctor` and `harden` warn (§8) |
@@ -1063,8 +1104,9 @@ WSL2 (§8):
 - [ ] Settle Q-W1 and Q-W4 on a WSL2 host
 
 macOS (separate implementation, §9):
-- [ ] Settle Q-M1 to Q-M9 (§9.9) and write them back here
-- [ ] Code-signature peer verification for every tier (§9.1, §9.2)
+- [ ] Settle the open Q-M items (§9.9) and write them back here
+- [ ] XPC transport through the `co.0w0.mairu.agent` LaunchAgent: install, replace, message mapping (§9.2); settle Q-M11
+- [ ] Code-signature peer verification for every tier, on every message (§9.1, §9.2)
 - [ ] Embedded `Info.plist` and the minimum client version (§9.3)
 - [ ] Release pipeline: Developer ID signing, notarization, embedded notifier (§9.4)
 - [ ] Ad-hoc tier: `harden` on macOS (Q-M9)
@@ -1098,3 +1140,4 @@ Future:
 - 2026-10-23: Security floor renamed to minimum client version (`minimum-client-version`, `MairuMinimumClientVersion`), raised only in releases fixing a client-side or protocol-level flaw (§9.3).
 - 2026-10-23: WSL2 findings from a Windows 11 25H2 host: Q-W1 confirmed, with interop off protecting only against processes inside the distribution; Q-W4 not the default; Q-W5 settled (§8).
 - 2026-10-23: Interim macOS findings: LOCAL_PEERTOKEN follows the last I/O process, so per-connection checks are unsound on macOS (§3.2); Q-M8 confirmed; Q-M10 (socket vs XPC transport) opened (§9.2).
+- 2026-10-23: Q-M10 decided: macOS clients reach the agent over XPC through a per-user LaunchAgent, verified on every message; this addresses Q-M2. Q-M11 (reaching it from SSH logins) opened (§3.2, §9.2).
