@@ -627,7 +627,7 @@ isolated   (interop off)   ssh -A from Windows into the distro · native-Linux s
 |---|---|---|
 | Root reachable by same-user Linux code | Yes, through `wsl.exe -u root` | Not from inside this distribution. From Windows-side processes and from other distributions with interop on: yes (§8.2) |
 | Strength | A guardrail against over-eager tools such as AI agents, and against accidents. Not a boundary against malicious code. | As native Linux (§2.4) against code inside the distribution. Code running as the Windows user, or in another distribution with interop on, is out of scope. |
-| Presence methods | `windows-hello` ([policy §6.3](policy.md)). `ssh-agent` through a relay of the Windows OpenSSH agent (npiperelay + socat, or `wsl2-ssh-agent`). `platform` through `pkttyagent`. | `ssh-agent`, by SSHing into the distribution from Windows with `ssh -A`. This is the headless reference workflow ([platform-helper §9](platform-helper.md)). The key is whatever the Windows SSH agent holds: Windows Hello is not available through it (Q-W3), but a USB security key is. `platform` through `pkttyagent`. |
+| Presence methods | `windows-hello` ([policy §6.3](policy.md)). `ssh-agent` through a relay of the Windows OpenSSH agent (npiperelay + socat, or `wsl2-ssh-agent`). `platform` through `pkttyagent`. | `ssh-agent`, by SSHing into the distribution from Windows with `ssh -A`. This is the headless reference workflow ([platform-helper §9](platform-helper.md)). The key is whatever the Windows SSH agent holds: a hardware security key works, but Windows OpenSSH cannot yet enroll a Windows Hello key (Q-W3). `platform` through `pkttyagent`. |
 | `open_url` in `auto` mode | The Windows default browser, through `rundll32.exe url.dll,FileProtocolHandler <url>` ([platform-helper §10](platform-helper.md)) | URL printed, or `command` mode |
 | `notify` in `auto` mode | None: WSLg has no notification daemon. Use `command` mode with a Windows toast helper. | None |
 | Secret Service | Usually absent | Usually absent |
@@ -668,19 +668,19 @@ sudo     pam_wsl_hello closes the sudo row of §2.4, not the interop row
 ### 8.5 Open questions (need a WSL2 host)
 
 ```text
-Q-W1 root via interop (confirmed)   Q-W2 Hello padding (confirmed) Q-W3 Hello via OpenSSH FIDO (no)
+Q-W1 root via interop (confirmed)   Q-W2 Hello padding (confirmed) Q-W3 Hello via OpenSSH (fails)
 Q-W4 channel without interop (not default)   Q-W5 WSLg and auto modes (settled)
 ```
 
 - **Q-W1** (confirmed): `wsl.exe -u root` started from inside a WSL2 session obtains root without authentication. Interop off blocks this only from inside, never from outside (§8.2).
 - **Q-W2** (confirmed): KeyCredential signatures are RSA-2048 PKCS #1 v1.5 with SHA-256, not PSS. The test vector is in [policy §6.3](policy.md).
-- **Q-W3** (answered: no). Whether Windows OpenSSH's FIDO support (`webauthn.dll`) can use Windows Hello itself as the authenticator, which would give the isolated profile Windows Hello through ssh-agent forwarding with no helper. Tested with OpenSSH_for_Windows 9.5p2 and WebAuthn API version 9 on Windows 11 25H2, `ssh-keygen -t ecdsa-sk`:
-  - The Windows Security dialog offered no "this device" (Windows Hello) option, only a third-party passkey provider. That OpenSSH asks for a cross-platform authenticator is inferred, not confirmed.
-  - The provider returned a self-attested credential, which libfido2 rejected (`FIDO_ERR_INVALID_ARGUMENT`, "invalid format"), so enrollment failed.
+- **Q-W3** (answered: not on current builds). Whether Windows OpenSSH's FIDO support (`webauthn.dll`) can use Windows Hello itself as the authenticator, which would give the isolated profile Windows Hello through ssh-agent forwarding with no helper. Tested with OpenSSH_for_Windows 9.5p2 and WebAuthn API version 9 on Windows 11 25H2, `ssh-keygen -t ecdsa-sk`:
+  - The Windows Security dialog offers Windows Hello on this device when the Windows setting to save passkeys to this device is on, alongside any third-party passkey providers.
+  - Choosing Windows Hello creates the platform credential (relying party `ssh:`), but libfido2 rejects its self-attestation (`fido_cred_verify_self: FIDO_ERR_INVALID_ARGUMENT`, "invalid format"), so enrollment fails and no key is written. A third-party passkey provider fails the same way.
   - libfido2 names every `webauthn.dll` device `windows://hello`, so that name in a log does not mean Windows Hello was used.
-  - `ed25519-sk` and resident keys were not tried.
+  - `-O resident` and `-O no-touch-required` were not tried. Windows Hello does not do EdDSA, so `ed25519-sk` cannot use it.
 
-  Windows Hello on WSL2 therefore comes only from the KeyCredential helper ([policy §6.3](policy.md)), which needs interop. `sk-` keys through Windows OpenSSH are for USB security keys, and third-party passkey providers are expected to fail OpenSSH's attestation check.
+  Windows Hello on WSL2 therefore comes only from the KeyCredential helper ([policy §6.3](policy.md)), which needs interop. `sk-` keys through Windows OpenSSH are for hardware security keys. A later Win32-OpenSSH or libfido2 release that accepts self-attestation could make this path work; that would need a re-test.
 - **Q-W4** (answered: not the default). Whether a channel that doesn't use interop is practical for Windows Hello in the isolated profile, for example a Hyper-V socket (`AF_VSOCK`) to a Windows-side service:
   - A non-elevated Windows process can bind an `AF_HYPERV` listener, but the guest cannot reach it. Its `AF_VSOCK` connect returns EOF immediately.
   - Making it reachable needs a one-time administrator registration of a service GUID under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices`. That much is confirmed; whether it then works end to end is inferred, not tested.
@@ -1166,4 +1166,4 @@ Future:
 - 2026-10-23: Q-M10 decided: macOS clients reach the agent over XPC through a per-user LaunchAgent, verified on every message; this addresses Q-M2. Q-M11 (reaching it from SSH logins) opened (§3.2, §9.2).
 - 2026-10-23: Q-W2 confirmed: KeyCredential signatures are RSA-2048 PKCS #1 v1.5 with SHA-256 (§8.5).
 - 2026-10-23: macOS policy integrity: `harden` provides the protected directory for every tier, and Developer ID builds add a signed helper bundle with the data-protection keychain (§9.1, §9.4, §9.5, §9.7); Q-M6 decided, Q-M12 opened.
-- 2026-10-23: Q-W3 answered: Windows OpenSSH FIDO does not offer Windows Hello as the authenticator, so the isolated profile has no Windows Hello (§8.3, §8.5).
+- 2026-10-23: Q-W3 answered: Windows OpenSSH 9.5p2 reaches Windows Hello but rejects its self-attested credential, so the isolated profile has no Windows Hello (§8.3, §8.5).
