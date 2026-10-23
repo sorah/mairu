@@ -708,6 +708,7 @@ spoofed notifications / URLs     · no security weight by design
 |---|---|
 | Rogue platform helper or rogue helper caller | Inherited socketpair with no filesystem rendezvous; the helper checks its parent's credentials, and the agent trusts the child it exec'd; fail closed (§4) |
 | A bug reached through D-Bus, Secret Service, notification, portal or LocalAuthentication code | Platform services run only in the helper, which holds no tokens (§1) |
+| Session-bus input (notification daemon, desktop portal, Secret Service) reaching the same helper that answers `Authorize` and the protected directory | Accepted: one helper process by design (simpler process model). Session-bus replies are handled through typed zbus proxies and treated as untrusted. A bug there could forge helper answers, so that code is kept minimal and reviewed as security-sensitive. |
 | A swapped macOS notifier bundle | Launched only to post notifications; no security weight, so swapping it gains nothing (§11) |
 | Fake polkit, D-Bus or `pkttyagent` | System bus path pinned; authority uid 0; fixed `/usr/bin/pkttyagent` with ownership check (§5, §6.1) |
 | Password capture at a tty prompt | Documented (§6.1); key-based methods preferred ([policy §6](policy.md)) |
@@ -778,3 +779,4 @@ macOS (separate implementation, §11):
 - 2026-10-23: macOS backends rewritten around Developer ID build tiers: embedded Developer ID notifier or locally assembled ad-hoc notifier, keychain store per tier.
 - 2026-10-23: Notifier extraction hardened: fresh directory per version and flavour, quarantine removed and designated requirement checked before launch, launch by full path, separate bundle ids per flavour.
 - 2026-10-23: Notifier cleanup is by disuse, not by version, since versions run side by side.
+- 2026-10-23: Decided: a single platform helper process; session-bus exposure recorded as an accepted risk (§12).
