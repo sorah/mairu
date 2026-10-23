@@ -429,7 +429,7 @@ The process that spawns `pkttyagent` is the one making the RPC, so polkit's subj
 - a fake prompt written to the pty first
 - ptrace of the terminal path when `kernel.yama.ptrace_scope = 0`
 
-This is the same exposure as `sudo`'s prompt in the same pane, and `auth_self` asks for the same login password. So on a host where the user types the sudo password into tmux, same-user code can already become root, which defeats everything here ([hardening §2.2](hardening.md)). The mairu prompt adds more opportunities, not a new kind of exposure. Prefer ssh-agent presence ([policy §6.2](policy.md)). For `sudo` itself, the analogous fix is FIDO-backed PAM: `pam_u2f` locally, or `pam_ssh_agent_auth` with an `sk-` key over SSH.
+This is the same exposure as `sudo`'s prompt in the same pane, and `auth_self` asks for the same login password. So on a host where the user types the sudo password into tmux, same-user code can already become root, which defeats everything here ([hardening §2.2](hardening.md)). The mairu prompt adds more opportunities, not a new kind of exposure. Prefer ssh-agent presence ([policy §6.2](policy.md)). For `sudo` itself, the analogous fix is PAM backed by a key: `pam_u2f` locally, or `pam_ssh_agent_auth` with an approval-protected key over SSH.
 
 ### 6.2 LocalAuthentication (macOS)
 
@@ -578,7 +578,7 @@ Both need only a trusted peer ([hardening §5.1](hardening.md)), never authoriza
 
 ```mermaid
 flowchart LR
-  laptop["laptop: FIDO key + ssh-agent"] -- "ssh -A" --> host["remote host"]
+  laptop["laptop: ssh-agent<br/>(its own lock)"] -- "ssh -A" --> host["remote host"]
   host --> pane["tmux pane<br/>(own session)"]
   pane --> mairu["mairu exec"]
   mairu -- "challenge" --> sock["forwarded $SSH_AUTH_SOCK"]
@@ -591,7 +591,7 @@ The reference workflow is long-lived **tmux sessions on a remote host, reached o
 | Capability | GUI session | SSH + tmux | No session bus | No polkitd |
 |---|---|---|---|---|
 | Peer verification | ✓ | ✓ | ✓ | ✓ |
-| ssh-agent presence | ✓ (if agent has an sk key) | ✓ (forwarded agent) | ✓ | ✓ |
+| ssh-agent presence | ✓ (registered key in your agent) | ✓ (forwarded agent) | ✓ | ✓ |
 | polkit prompt | GUI agent | `pkttyagent` in the pane (§6.1) | ✓ (system bus) | ✗ → `UNAVAILABLE` |
 | Integrity: protected directory | ✓ (hardened) | ✓ (hardened) | ✓ (hardened) | ✓ (hardened) |
 | Integrity: Secret Service | usually ✓ | usually ✗ | ✗ | — |
@@ -608,7 +608,7 @@ The reference workflow is long-lived **tmux sessions on a remote host, reached o
 
 **Admin guidance** (README):
 - polkit's PAM stack (`/etc/pam.d/polkit-1`) can use `pam_fprintd` or `pam_u2f` on local machines.
-- For SSH, the ssh-agent method is preferred, because a FIDO key on the local machine cannot be reached through PAM on the remote host.
+- For SSH, the ssh-agent method is preferred: it reaches your local SSH agent, under whatever lock it applies, which PAM on the remote host cannot.
 
 ## 10. WSL2
 

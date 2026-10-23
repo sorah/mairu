@@ -16,7 +16,7 @@ flowchart LR
   R["AssumeRole"] --> D{"Cedar permits with<br/>what is remembered?"}
   D -- "yes" --> V["vend credentials"]
   D -- "no" --> F{"would a fresh<br/>human check permit?"}
-  F -- "yes" --> Ask["ask: ssh-agent touch /<br/>Windows Hello / platform"]
+  F -- "yes" --> Ask["ask: ssh-agent /<br/>Windows Hello / platform"]
   Ask --> V
   F -- "no" --> X["refuse:<br/>FORBIDDEN or NOT_PERMITTED"]
 ```
@@ -170,7 +170,7 @@ sequenceDiagram
   participant K as ssh-agent or Windows Hello
   C->>A: AssumeRole
   A-->>C: CHALLENGE {statement, acceptable keys, 60 s}
-  C->>K: sign statement (touch or Hello)
+  C->>K: sign statement (the agent's own approval, or Hello)
   K-->>C: signature
   C->>A: AssumeRole again, same ClientContext + signature
   A->>A: single use, same peer, same request, registered key, UP flag
@@ -182,7 +182,7 @@ A presence method asks the human and proves the answer to the agent. Methods are
 | Method | Mechanism | Proof |
 |---|---|---|
 | `platform` | The platform's facility: polkit on Linux, LocalAuthentication on macOS ([platform-helper §6](platform-helper.md)) | A yes/no from the verified platform helper |
-| `ssh-agent` | FIDO touch through the forwarded SSH agent (§6.2) | Signature over a challenge |
+| `ssh-agent` | A signature from your SSH agent, usually forwarded, which applies its own lock (§6.2) | Signature over a challenge |
 | `windows-hello` | Windows Hello key credential on WSL2 (§6.3) | Signature over a challenge |
 
 ### 6.1 Platform method
@@ -197,7 +197,7 @@ PlatformServices::authorize(ACTION_ASSUME_ROLE, subject = peer, details)   → p
 
 The agent calls `PlatformServices::authorize`, which the platform helper serves ([platform-helper §4](platform-helper.md)), with action `ACTION_ASSUME_ROLE` or `ACTION_APPROVE_POLICY`, the peer as the subject, and the details of §7. Results map as in §4 (step 4). The Linux backend, including the `pkttyagent` fallback for headless sessions, is specified in [platform-helper §6.1](platform-helper.md), and the macOS one in [platform-helper §11](platform-helper.md).
 
-### 6.2 ssh-agent presence (FIDO touch through the forwarded agent)
+### 6.2 ssh-agent presence (approval through your SSH agent)
 
 ```text
 verify(response)
@@ -205,16 +205,20 @@ verify(response)
   not expired; same peer (pid, start); same request digest
   sshsig namespace == "co.0w0.mairu.authorize"
   key ∈ ssh_agent_keys and key.verify(statement, sshsig)
-  sk key: flags & UP (and & UV if required)      # ssh-key crate does not check flags
+  sk- key only: flags & UP (and & UV if required) # the one lock visible in a signature
 ```
 
-This is a platform-independent method. On headless hosts, and inside tmux over SSH in particular, it beats a tty password because a signature cannot be replayed.
+This is a platform-independent method. mairu asks your SSH agent, usually forwarded over SSH, to sign a challenge with a key you registered.
+
+**The lock on that key belongs to your SSH agent, not to mairu.** mairu cannot know what an agent requires before it signs: a FIDO touch, an `ssh-add -c` confirmation, Touch ID (for example Secretive or a password manager's SSH agent), or nothing at all. Registering a key states that its use requires your approval. Choosing such a key, and configuring its agent, is your responsibility.
+
+On headless hosts, and inside tmux over SSH in particular, this is often the only way to reach you. Unlike a typed password, a signature over a one-time challenge cannot be replayed.
 
 **Registration** (`authorization.json`, §9.5), as `ssh_agent_keys[]`:
 
-- `{"key": "<OpenSSH public key line>"}` is accepted only for `sk-ssh-ed25519@openssh.com` and `sk-ecdsa-sha2-nistp256@openssh.com`.
-- Other key types require `"presence": "unverified-confirm"`. The agent cannot verify presence for them; the user must load them with `ssh-add -c`.
-- Optional `"require_user_verification": true` additionally requires the UV flag (a PIN or biometric on the key).
+- `{"key": "<OpenSSH public key line>"}`, for any key type an SSH agent can sign with: `ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, `ssh-rsa` (signed as `rsa-sha2-512`), `sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`.
+- For `sk-` keys the signature carries a user-present flag, so mairu also requires it. That flag is the only lock visible in a signature.
+- Optional `"require_user_verification": true` (`sk-` keys only) additionally requires the user-verified flag: a PIN or biometric on the key.
 
 **Challenge.** In step 4 of §4, when keys are registered and ssh-agent is the selected method, the agent:
 
@@ -225,7 +229,7 @@ This is a platform-independent method. On headless hosts, and inside tmux over S
 **Client relay** (`src/ssh_agent_presence.rs`):
 
 1. Connect to `$SSH_AUTH_SOCK` and send `SSH_AGENTC_REQUEST_IDENTITIES`. Pick the first identity whose `SHA256:` fingerprint is in `key_fingerprints`. If there is no socket or no key, retry with `declined`.
-2. Print the context (§7) with `:: mairu :: Touch your security key (<comment>) to authorize …`, or "confirm on your SSH agent" for confirm keys.
+2. Print the context (§7) with `:: mairu :: Approve the signature on your SSH agent (<key comment>) to authorize …`.
 3. Build the SSHSIG signed-data blob for namespace `co.0w0.mairu.authorize`, hash `sha512`, message = `statement` bytes, and send `SSH_AGENTC_SIGN_REQUEST`. Wrap the result into a binary SSHSIG.
 4. Retry once with `authorization_response{challenge_id, sshsig}` and the same `ClientContext`.
 
@@ -237,12 +241,12 @@ This is a platform-independent method. On headless hosts, and inside tmux over S
 4. `request_digest` matches the retried request.
 5. The SSHSIG namespace is `co.0w0.mairu.authorize`.
 6. The public key equals a registered key.
-7. The signature verifies with the `ssh-key` crate (`PublicKey::verify` supports sk-ed25519 and sk-p256).
+7. The signature verifies with the `ssh-key` crate (`PublicKey::verify`, which covers the key types above, including sk-ed25519 and sk-p256).
 8. For `sk-*` keys, mairu **parses the flags byte itself**, because `ssh-key` does not check it: the trailer after the inner signature is `flags (u8) || counter (u32)`. It requires `UP (0x01)`, plus `UV (0x04)` when configured.
 
 A failure at any step returns `REASON_INVALID_RESPONSE`.
 
-**Residual risk.** Same-user code can also reach the forwarded agent socket and request a signature. It still needs a physical touch, the challenge is bound to the requesting process and request, and a touch satisfies one pending request. An attacker who times a request to coincide with the user's own can steal one touch. This is documented.
+**Residual risk.** Same-user code can also reach the agent socket and request a signature. The only thing between that code and a signature is the agent's own lock. With an unlocked key, this method proves no more than "the agent is reachable", which is why the choice of key is yours (above). The challenge is bound to the requesting process and request, and one approval satisfies one pending request. An attacker who times a request to coincide with the user's own can steal one approval. This is documented.
 
 **tmux note.** `SSH_AUTH_SOCK` in a long-lived pane points at a forwarded socket that disappears when that SSH login ends. The README recommends a stable symlink (`~/.ssh/rc` updating `~/.ssh/agent.sock`, plus `set -g update-environment` / `SSH_AUTH_SOCK=~/.ssh/agent.sock`). `doctor` reports reachability, and a stale socket declines to the next method.
 
@@ -303,7 +307,7 @@ While waiting, the client prints context to its terminal through `crate::termina
 :: mairu ::   command: terraform apply
 :: mairu ::   cwd:     /home/u/src/infra
 :: mairu ::   from:    /dev/pts/3 (zsh, tmux pane)   ai-agent: claude (ancestor)
-:: mairu :: Approve in the system dialog.             # or: enter your password below / touch your security key
+:: mairu :: Approve in the system dialog.             # or: enter your password below / approve on your SSH agent
 ```
 
 The same keys go into polkit `details`:
@@ -404,7 +408,7 @@ namespace Mairu {
   };
 
   type Presence = {
-    // A human check (ssh-agent touch or platform prompt) covers this request.
+    // A human check (ssh-agent signature, Windows Hello or platform prompt) covers this request.
     verified: Bool,
     // "none"; "request": checked for this very request; "process": the lease of this running
     // `mairu exec`; "session": a grant for this terminal session.
@@ -495,9 +499,9 @@ permit (
   resource == Mairu::Role::"contoso:123456789012/ReadOnly"
 );
 
-// Admin: touch the security key for every new command.
+// Admin: approve through the SSH agent for every new command.
 // A running `mairu exec` keeps its approval.
-@id("admin-touch")
+@id("admin-ssh-agent")
 permit (
   principal,
   action == Mairu::Action::"AssumeRole",
@@ -542,7 +546,7 @@ requester-chosen   intent · exec_command · cwd · chained_role_arn · env name
 authorization.json
 ├── methods            # order to ask for AssumeRole
 ├── approval_methods   # who may approve the next change → becomes the approval anchor
-├── ssh_agent_keys     # sk- keys (others only with unverified-confirm)
+├── ssh_agent_keys     # any key type; its lock is your SSH agent's (§6.2)
 ├── windows_hello_keys
 ├── ai_agent_detection # extra process / env names
 └── grant_retention_secs
@@ -560,7 +564,7 @@ authorization.json
   "ssh_agent_keys": [
     {"key": "sk-ssh-ed25519@openssh.com AAAA... me@laptop"},
     {"key": "sk-ecdsa-sha2-nistp256@openssh.com AAAA... spare", "require_user_verification": true},
-    {"key": "ssh-ed25519 AAAA... confirm-key", "presence": "unverified-confirm"}
+    {"key": "ecdsa-sha2-nistp256 AAAA... secretive@mac"}
   ],
   "windows_hello_keys": [
     // base64 SubjectPublicKeyInfo (§6.3)
@@ -966,7 +970,7 @@ replayed or relayed signatures     ✗ single-use challenge bound to peer and re
 | A `permit` that relies only on requester-chosen context (`cwd`, `exec_command`, …) | Documented (§9.4); `check` and `approve` list every permit that needs no human check |
 | Schema drift after an upgrade | Approved policy re-validated at load; invalid → `UNAPPROVED` (§9.8) |
 | Password capture in tmux/tty | Documented ([platform-helper §6.1](platform-helper.md)); key-based methods preferred (§6) |
-| Abuse of the forwarded ssh-agent or the Windows Hello credential | Physical touch or Windows Hello required; challenge bound to peer + request; single use; 60 s (§6.2, §6.3) |
+| Abuse of the forwarded ssh-agent or the Windows Hello credential | The SSH agent's own lock (the user's choice of key; the user-present flag is verified for `sk-` keys), or Windows Hello. Challenge bound to peer + request; single use; 60 s (§6.2, §6.3). |
 
 Every guarantee here is also bounded by the trust chain in [hardening §2.4](hardening.md).
 
@@ -1023,3 +1027,4 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - 2026-10-23: Added show-me style visual summaries to every section (additive; Mermaid blocks validated with mermaid 11.4.1).
 - 2026-10-23: The platform method goes through the separate platform helper.
 - 2026-10-23: Leases last the process lifetime under policy control, with a 1 h idle timeout counted from the expiry of the last credentials obtained on demand; auto-refresh pre-fetches are marked and never prompt (§4, §9.6, §10). IDE relaxation documented rather than built in (§9.6).
+- 2026-10-23: The ssh-agent method accepts any registered key type; the lock on a key is the SSH agent's and the user's responsibility. `sk-` keys still have their user-present flag checked (§6.2).

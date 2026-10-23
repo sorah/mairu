@@ -98,14 +98,14 @@ Credentials *after delivery* are also out of scope. Once `mairu exec` hands cred
 ### 2.3 What is a boundary and what is a guardrail
 
 ```text
-boundary   platform prompt / FIDO touch / Windows Hello
+boundary   platform prompt / ssh-agent approval / Windows Hello
            + mutual verification (prompt contents are true)
            + policy integrity
 guardrail  AI-agent detection · disallow_roles · .mairu.json trust prompt
 ```
 
 - **Boundary**:
-  - The platform authorization step (polkit, macOS LocalAuthentication, or the ssh-agent FIDO touch).
+  - The platform authorization step: polkit, macOS LocalAuthentication, a signature through your SSH agent under its own lock, or Windows Hello.
   - The mutual verification that makes the prompt's contents truthful: a genuine client reports what it will actually do with the credentials.
   - Integrity of the policy that decides when to prompt.
 - **Guardrails**, best-effort and never relied on alone:
@@ -150,10 +150,10 @@ The effective strength of a deployment is the **weakest** of:
 2. approving a policy change (`approval_methods`, [policy §9.5](policy.md), anchored in the protected record)
 3. the presence methods that a role's `permit` policies accept (`context.presence.method`)
 
-Registering a FIDO or Windows Hello key strengthens 2 and 3. It does nothing for 1. A password that passes `sudo` also passes polkit `auth_self` ([platform-helper §6.1](platform-helper.md)), so on a host where that password can be captured, key-based methods only add a guardrail.
+Registering an ssh-agent key whose use needs your approval, or a Windows Hello key, strengthens 2 and 3. It does nothing for 1. A password that passes `sudo` also passes polkit `auth_self` ([platform-helper §6.1](platform-helper.md)), so on a host where that password can be captured, key-based methods only add a guardrail.
 
 Recommendations (README; `mairu doctor` warns where it can detect the condition, §12):
-- Back `sudo` and the `polkit-1` PAM stack with FIDO: `pam_u2f` locally, `pam_ssh_agent_auth` with an `sk-` key over SSH, `pam_wsl_hello` on WSL2. Avoid `NOPASSWD` and root-equivalent groups for the user.
+- Back `sudo` and the `polkit-1` PAM stack with something a captured password cannot replay: `pam_u2f` locally, `pam_ssh_agent_auth` with an approval-protected key over SSH, `pam_wsl_hello` on WSL2. Avoid `NOPASSWD` and root-equivalent groups for the user.
 - Once keys are registered, keep `approval_methods` key-only (the default, [policy §9.5](policy.md)), and require a key-based `context.presence.method` in permits for sensitive roles.
 - On WSL2, disable interop for strong guarantees (§8).
 
