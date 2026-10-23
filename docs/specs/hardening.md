@@ -217,6 +217,10 @@ This means no team identifier is hardcoded:
 
 Both sides also require the hardened-runtime flag and the absence of `com.apple.security.get-task-allow`. The agent keeps `PT_DENY_ATTACH`. Use the audit token's pid version (`audit_token_to_pidversion`) wherever a pid is recorded. Details, and the questions still open, are in §9.
 
+**Asymmetry with Linux (confirmed on macOS 27.2).** `SO_PEERCRED` on Linux is a snapshot taken at `connect()`/`listen()`. On macOS, `LOCAL_PEERTOKEN` and `LOCAL_PEERPID` are **not** snapshots: they report the last process that did I/O on the peer socket. Only `LOCAL_PEERCRED` is a snapshot, and it carries uid and groups but no pid.
+
+That makes one check per connection unsound. An unsigned process can connect, hand the connected fd to a genuine signed mairu as its stdout, and let it write anything. The peer token then names the genuine binary, while the attacker keeps the fd and continues talking. The transport on macOS is therefore open (Q-M10, §9.2).
+
 ## 4. Hardened installation (Linux)
 
 ```mermaid
@@ -715,7 +719,15 @@ client ── LOCAL_PEERTOKEN ──► agent's audit token ──► satisfies 
 agent  ── LOCAL_PEERTOKEN ──► client's audit token ──► same checks, then the minimum client version (§9.3)
 ```
 
-§3.2, in both directions. **Q-M8:** confirm that `LOCAL_PEERTOKEN` on the *client's* connected socket yields the listener's token, the counterpart of Linux listen-time credentials. If not, the agent proves itself another way, such as XPC with a code-signing requirement.
+§3.2, in both directions.
+
+- **Q-M8 (confirmed, with a caveat).** On the client's connected socket, `LOCAL_PEERTOKEN`/`LOCAL_PEERPID` give the listener's pid, pid version and audit session. `SecCodeCheckValidity` against the verifier's own requirement succeeds for the same build and fails with `errSecCSReqFailed` for a different one, in both directions. The caveat is §3.2's asymmetry: these values follow the last process to do I/O, so a genuine process lent the fd can stand in for an attacker.
+- **Q-M10: the macOS transport.** The options:
+  - (a) Keep the Unix socket. Check the token right after `accept()`, before any read. Re-check after every read, closing the connection if the pid or pid version changes. This narrows the fd-lending attack to a race (the attacker writes, then the lent genuine process writes before the agent re-checks), but does not close it.
+  - (b) XPC through a per-user LaunchAgent `MachService`. Every message carries the sender's audit token, which can be checked per message (`xpc_connection_set_peer_code_signing_requirement`, or the token of each message). The protobuf messages travel unchanged inside XPC messages. A LaunchAgent also puts the agent in the GUI session, which addresses Q-M2.
+  - (c) A challenge that only a genuine, non-lent process can answer. No such answer exists without a secret, and mairu binaries hold none.
+
+  (b) is the robust option. Whether it is adopted is a decision for the macOS work.
 
 ### 9.3 Minimum client version (downgrade protection)
 
@@ -828,12 +840,13 @@ cargo install                                ad-hoc
 ```text
 Q-M1 socketpair peer info      Q-M2 GUI session / LaunchAgent   Q-M3 notifier authorization
 Q-M4 permission across upgrade Q-M5 notifier icon and cleanup   Q-M6 ad-hoc integrity store
-Q-M7 Homebrew (decided)       Q-M8 LOCAL_PEERTOKEN on client   Q-M9 harden for ad-hoc builds
+Q-M7 Homebrew (decided)       Q-M8 LOCAL_PEERTOKEN (confirmed) Q-M9 harden for ad-hoc builds
+Q-M10 macOS transport (socket vs XPC)
 ```
 
 - Q-M1 to Q-M6: [platform-helper §4, §11](platform-helper.md)
 - Q-M7: §9.8
-- Q-M8: §9.2
+- Q-M8, Q-M10: §9.2
 - Q-M9: §9.5
 
 ## 10. BSD (design only)
@@ -1084,3 +1097,4 @@ Future:
 - 2026-10-23: Decided: dev profile on by default for debug builds; official-only checks as a releng checklist step; release dry run for pipeline PRs (§15).
 - 2026-10-23: Security floor renamed to minimum client version (`minimum-client-version`, `MairuMinimumClientVersion`), raised only in releases fixing a client-side or protocol-level flaw (§9.3).
 - 2026-10-23: WSL2 findings from a Windows 11 25H2 host: Q-W1 confirmed, with interop off protecting only against processes inside the distribution; Q-W4 not the default; Q-W5 settled (§8).
+- 2026-10-23: Interim macOS findings: LOCAL_PEERTOKEN follows the last I/O process, so per-connection checks are unsound on macOS (§3.2); Q-M8 confirmed; Q-M10 (socket vs XPC transport) opened (§9.2).

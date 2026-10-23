@@ -312,7 +312,12 @@ Rules:
 5. **Failure.** If the helper fails verification, exits or crashes, `HelperClient` returns `RESULT_UNAVAILABLE` (`helper-unavailable` or `helper-unverified`) and empty capabilities, and the agent fails closed. It respawns the helper at most once per 30 s. `GetAgentStatus` reports the helper's state ([hardening §7.1](hardening.md)).
 6. **Unhardened Linux:** the checks reduce to uid plus pid pinning.
 7. **macOS:** the same process model, with the same binary (§11). The agent and the helper therefore have the same designated requirement: team-based for Developer ID builds, cdhash for ad-hoc ones ([hardening §9.1](hardening.md)). Each checks the other against its own requirement, as clients and the agent do.
-   - **Q-M1:** whether a socketpair yields usable peer information there. `LOCAL_PEERTOKEN` on a socketpair may report the creator, as `SO_PEERCRED` does on Linux. If it does not, the helper checks its parent's code signature through `getppid()` and its audit token, and pins the pid and pid version.
+   - **Q-M1 (confirmed).** On a socketpair whose end is inherited across fork and exec:
+     - Before any I/O, both ends report the creator (`LOCAL_PEERPID`, `LOCAL_PEERTOKEN` with its pid version, and `LOCAL_PEERCRED`).
+     - Once the child does I/O, the creator's end reports the child, by the last-I/O rule ([hardening §3.2](hardening.md)). The child's end keeps reporting the creator.
+     - After the child exits, the token query fails with `EINVAL`, while `LOCAL_PEERCRED` still works.
+
+     So the helper checks `token.pid == getppid()` and `SecCodeCheckValidity` on that token before serving. The agent keeps "trusted by construction" plus pid pinning as its primary check, because a later token query on its end still follows the last I/O.
    - A separately signed helper executable, bundled or not, follows the same rules. The helper then verifies its caller against identifier `co.0w0.mairu` with the same team ID, and the agent verifies the helper against identifier `co.0w0.mairu.platform-helper` with its own team ID. Use `xpc_connection_set_peer_code_signing_requirement` / `NSXPCConnection.setCodeSigningRequirement:` when on XPC, or `LOCAL_PEERTOKEN` on a socket. Ad-hoc builds need a cdhash pin recorded at install time.
 
 ## 5. Verifying system services (Linux helper backends)
@@ -456,7 +461,7 @@ The stores hold the `IntegrityRecord` (§3) of [policy §9.7](policy.md): a dige
   | `PROTECTED_DIRECTORY` | Helper hardened (it inherits the marker through the setgid exec, §4), and `/var/lib/mairu` is `root:mairu`, mode `2770` with no "other" bits, not FUSE | `/var/lib/mairu/users/<uid>/policy.record` (the record JSON of [policy §9.7](policy.md)), written atomically (temp + rename + fsync) by the helper inside `with_privileged_gid` | Strong: unreachable by same-user code. Authoritative when present. |
   | `SECRET_SERVICE` | Session bus reachable, `org.freedesktop.secrets` present, default collection unlocked. A locked collection is `UNAVAILABLE`; the helper never triggers an unlock prompt. | Item in the default collection: label `mairu policy record (uid N)`, attributes `{application: "co.0w0.mairu", kind: "policy-record", name: "policy", uid: "N"}`, secret = the record JSON | Weak: same-user code can read and write it. It catches offline or careless edits, and on hardened hosts any disagreement with the protected directory. |
 
-- **macOS stores** (§11): Developer ID builds keep the record in a keychain item whose access is limited to their team-based requirement. Ad-hoc builds follow Q-M6.
+- **macOS stores** (§11): the legacy keychain gives other apps confidentiality but no integrity, so it is a weak store at best. A strong store needs the protected directory through `harden` (Q-M6).
 
 ## 8. Convenience features: notifications and opening URLs
 
@@ -651,13 +656,17 @@ The platform helper is the same binary as the agent and is never bundled. Everyt
 1. **Authorization.**
    - `LAContext.evaluatePolicy(.deviceOwnerAuthentication, localizedReason:)`, with the reason built from [policy §7](policy.md). It works from a plain binary, signed ad-hoc or with a Developer ID.
    - Track lid/clamshell state (Touch ID unavailable) and fall back to password.
+   - `LAError -4` ("system authentication is running", for example while the screen is locked) maps to `UNAVAILABLE`, which can be retried.
    - **Q:** whether to use a Secure Enclave key gated by `.userPresence` so the result is cryptographic rather than boolean. Optional, because the agent enforcing the result is itself protected.
    - Over SSH there is no UI, so the ssh-agent method ([policy §6.2](policy.md)) applies unchanged.
    - **Q-M2:** an agent first started from an SSH login, and so its helper, may sit outside the user's GUI session, where the LocalAuthentication UI cannot appear (`UNAVAILABLE`). The candidate fix is a per-user LaunchAgent plist that runs the plain binary in the GUI session; it needs no bundle.
 2. **Integrity store.**
-   - **Developer ID builds:** a Keychain generic-password item in the legacy file-based keychain, holding the record, with access limited to the build's team-based designated requirement. The access survives upgrades, and it needs no entitlements. This is the planned store, `IntegrityStoreKind` `KEYCHAIN`.
-   - The alternative is a Secure Enclave P-256 key (`kSecAttrTokenIDSecureEnclave`) signing the digest, with the signature in `$HOME` and the latest record kept in the Keychain against rollback. It needs `keychain-access-groups`. That in turn needs an app bundle and a provisioning profile, so it is not planned. It would report `SECURE_ENCLAVE`.
-   - **Ad-hoc builds, Q-M6:** an item limited to a cdhash would prompt after every upgrade. The options are no store, so policy only tightens as on headless unhardened Linux, or porting the Linux protected directory to macOS through `harden` (Q-M9). Setgid binaries on macOS are restricted processes, so the marker group carries over.
+   - **The legacy keychain provides no integrity** (confirmed on macOS 27.2). Same-user code deleted an item with `security delete-generic-password` and no prompt. An unrelated unsigned binary then created a new item with the same service and account, whose access list trusts only mairu, holding forged content. mairu read it without a prompt, and the planted access list is indistinguishable from a genuine one. This applies to any requirement, team-based or cdhash. A MAC key kept in the keychain does not help either, because both items can be deleted and planted again. A legacy keychain item (`KEYCHAIN`) is therefore a **weak** store, like Secret Service on Linux: it catches careless edits only.
+   - **The data-protection keychain needs an entitlement.** From an unbundled, unentitled binary, `SecItemAdd` fails with `-34018`. `keychain-access-groups`, and with it a Secure Enclave key whose signature would protect the record (`SECURE_ENCLAVE`), therefore need an app bundle and a provisioning profile. They are not planned.
+   - **Strong store: the protected directory through `harden`, for both tiers (Q-M6, Q-M9).** `LOCAL_PEERCRED` reports the effective gid as `cr_groups[0]` (confirmed), so the Linux marker group carries over.
+     - A setgid binary run by a **member** of its group got the egid, but was not a restricted process: `P_SUGID` was 0, `DYLD_INSERT_LIBRARIES` was honoured, and `task_for_pid` worked for the same user. This is consistent with the "user must not be a member" rule ([hardening §3.1](hardening.md)).
+     - The non-member case is still to be confirmed.
+   - Without `harden`, macOS policy integrity is like unhardened Linux: the weak keychain store only, so an unapproved policy only tightens.
    - Whatever the choice, the store must hold the whole `IntegrityRecord`, including the approval anchor, where same-user code cannot rewrite it.
 3. **Notifications: the notifier bundle.**
 
@@ -695,8 +704,14 @@ The platform helper is the same binary as the agent and is never bundled. Everyt
      - **Launch by full path.** `open -a <name>` resolves by name or bundle id and could pick a different copy.
    - It is launched through LaunchServices so that it is registered and authorized. It is not the helper's child and doesn't need to be: it carries no security weight, so a same-user process that swaps it gains nothing.
    - The platform helper itself is never the bundle. LaunchServices cannot pass the socketpair (§4), and a bundle in a user-writable location would break "trusted by construction".
-   - **Q-M3:** does a LaunchServices-launched notifier get notification authorization and appear in System Settings, for both the Developer ID and the ad-hoc flavour on current macOS? Does that hold when the agent itself was started from an SSH login while a GUI session exists? One source claims unsigned apps can never be authorized, while ad-hoc or self-signed ones can. Also: does quarantine carry over from a cask-quarantined mairu process to files it writes?
-   - **Q-M4:** does the permission survive an ad-hoc notifier's upgrade, where the cdhash changes but the bundle id does not?
+   - **Q-M3:** does a LaunchServices-launched notifier get notification authorization and appear in System Settings, for both the Developer ID and the ad-hoc flavour on current macOS? Does that hold when the agent itself was started from an SSH login while a GUI session exists?
+
+     Interim results on macOS 27.2 (an MDM-managed host, screen locked):
+     - **Bundle location.** Bundles under temporary directories are rejected ("Failed to find or validate client"). A bundle under `~/Library/Application Support` registers.
+     - **Ad-hoc authorization.** An ad-hoc bundle came back already denied, with no prompt, with or without hardened runtime or `LSUIElement`. The lock screen, Focus and MDM-managed notification settings confound this result, so it is to be re-run unlocked. No ad-hoc app had ever been authorized on that host.
+     - **Unsigned.** An unsigned arm64 bundle does not launch at all.
+     - **Quarantine does not propagate from a CLI (confirmed).** Files written by a quarantined, user-approved CLI, and by its child, carried no quarantine. A quarantined, unnotarized ad-hoc CLI is blocked by Gatekeeper at exec.
+   - **Q-M4:** does the permission survive an ad-hoc notifier's upgrade, where the cdhash changes but the bundle id does not? The notification settings store a code requirement per app, which for an ad-hoc app is its cdhash. That suggests the permission is lost on every rebuild (inferred).
    - **Q-M5:** the notifier's icon and display name, and the cleanup period. Old notifiers are removed only when unused for a while, because installers such as mise run several mairu versions side by side.
 4. **Open URL.** `NSWorkspace` or `/usr/bin/open`, in the user's GUI session.
 5. **AI-agent ancestry** ([policy §5](policy.md)). The same rules, using `proc_pidinfo` (process facts in [hardening §9.6](hardening.md)). This is a process primitive in the agent, not a helper service.
@@ -713,6 +728,8 @@ spoofed notifications / URLs     · no security weight by design
 
 | Threat | Mitigation |
 |---|---|
+| Lending a connected fd to a genuine signed process on macOS, so its audit token stands in for the attacker | Last-I/O semantics of `LOCAL_PEERTOKEN` ([hardening §3.2](hardening.md)); open as Q-M10 (re-check per read, or XPC with per-message tokens) |
+| Deleting or forging a legacy keychain item on macOS | The keychain store is weak by design; strong integrity needs the protected directory through `harden` (§11) |
 | Rogue platform helper or rogue helper caller | Inherited socketpair with no filesystem rendezvous; the helper checks its parent's credentials, and the agent trusts the child it exec'd; fail closed (§4) |
 | A bug reached through D-Bus, Secret Service, notification, portal or LocalAuthentication code | Platform services run only in the helper, which holds no tokens (§1) |
 | Session-bus input (notification daemon, desktop portal, Secret Service) reaching the same helper that answers `Authorize` and the protected directory | Accepted: one helper process by design (simpler process model). Session-bus replies are handled through typed zbus proxies and treated as untrusted. A bug there could forge helper answers, so that code is kept minimal and reviewed as security-sensitive. |
@@ -788,3 +805,4 @@ macOS (separate implementation, §11):
 - 2026-10-23: Notifier cleanup is by disuse, not by version, since versions run side by side.
 - 2026-10-23: Decided: a single platform helper process; session-bus exposure recorded as an accepted risk (§12).
 - 2026-10-23: WSL2 `open_url` uses `rundll32.exe url.dll,FileProtocolHandler` (explorer.exe fallback); `auto` honors `$BROWSER`; WSLg findings recorded (§8.2, §10).
+- 2026-10-23: Interim macOS findings: Q-M1 confirmed (socketpair reports the creator until the child does I/O); the legacy keychain has no integrity, so `KEYCHAIN` is weak and strong integrity needs `harden`; the data-protection keychain needs an entitlement; Q-M3 interim results (§4, §7, §11, §12).
