@@ -627,7 +627,7 @@ isolated   (interop off)   ssh -A from Windows into the distro · native-Linux s
 |---|---|---|
 | Root reachable by same-user Linux code | Yes, through `wsl.exe -u root` | Not from inside this distribution. From Windows-side processes and from other distributions with interop on: yes (§8.2) |
 | Strength | A guardrail against over-eager tools such as AI agents, and against accidents. Not a boundary against malicious code. | As native Linux (§2.4) against code inside the distribution. Code running as the Windows user, or in another distribution with interop on, is out of scope. |
-| Presence methods | `windows-hello` ([policy §6.3](policy.md)). `ssh-agent` through a relay of the Windows OpenSSH agent (npiperelay + socat, or `wsl2-ssh-agent`). `platform` through `pkttyagent`. | `ssh-agent`, by SSHing into the distribution from Windows with `ssh -A`. This is the headless reference workflow ([platform-helper §9](platform-helper.md)). `platform` through `pkttyagent`. |
+| Presence methods | `windows-hello` ([policy §6.3](policy.md)). `ssh-agent` through a relay of the Windows OpenSSH agent (npiperelay + socat, or `wsl2-ssh-agent`). `platform` through `pkttyagent`. | `ssh-agent`, by SSHing into the distribution from Windows with `ssh -A`. This is the headless reference workflow ([platform-helper §9](platform-helper.md)). The key is whatever the Windows SSH agent holds: Windows Hello is not available through it (Q-W3), but a USB security key is. `platform` through `pkttyagent`. |
 | `open_url` in `auto` mode | The Windows default browser, through `rundll32.exe url.dll,FileProtocolHandler <url>` ([platform-helper §10](platform-helper.md)) | URL printed, or `command` mode |
 | `notify` in `auto` mode | None: WSLg has no notification daemon. Use `command` mode with a Windows toast helper. | None |
 | Secret Service | Usually absent | Usually absent |
@@ -668,13 +668,19 @@ sudo     pam_wsl_hello closes the sudo row of §2.4, not the interop row
 ### 8.5 Open questions (need a WSL2 host)
 
 ```text
-Q-W1 root via interop (confirmed)   Q-W2 Hello signature padding   Q-W3 Hello through OpenSSH FIDO
+Q-W1 root via interop (confirmed)   Q-W2 Hello padding (confirmed) Q-W3 Hello via OpenSSH FIDO (no)
 Q-W4 channel without interop (not default)   Q-W5 WSLg and auto modes (settled)
 ```
 
 - **Q-W1** (confirmed): `wsl.exe -u root` started from inside a WSL2 session obtains root without authentication. Interop off blocks this only from inside, never from outside (§8.2).
-- **Q-W2**: the padding of KeyCredential signatures, PSS or PKCS #1 v1.5. Microsoft's documentation contradicts itself; pin it with a test vector.
-- **Q-W3**: whether Windows OpenSSH's FIDO support (`webauthn.dll`) can use Windows Hello itself as the authenticator on current builds. Reports vary by build. If it can, the isolated profile gets Windows Hello through ssh-agent forwarding with no helper at all.
+- **Q-W2** (confirmed): KeyCredential signatures are RSA-2048 PKCS #1 v1.5 with SHA-256, not PSS. The test vector is in [policy §6.3](policy.md).
+- **Q-W3** (answered: no). Whether Windows OpenSSH's FIDO support (`webauthn.dll`) can use Windows Hello itself as the authenticator, which would give the isolated profile Windows Hello through ssh-agent forwarding with no helper. Tested with OpenSSH_for_Windows 9.5p2 and WebAuthn API version 9 on Windows 11 25H2, `ssh-keygen -t ecdsa-sk`:
+  - The Windows Security dialog offered no "this device" (Windows Hello) option, only a third-party passkey provider. That OpenSSH asks for a cross-platform authenticator is inferred, not confirmed.
+  - The provider returned a self-attested credential, which libfido2 rejected (`FIDO_ERR_INVALID_ARGUMENT`, "invalid format"), so enrollment failed.
+  - libfido2 names every `webauthn.dll` device `windows://hello`, so that name in a log does not mean Windows Hello was used.
+  - `ed25519-sk` and resident keys were not tried.
+
+  Windows Hello on WSL2 therefore comes only from the KeyCredential helper ([policy §6.3](policy.md)), which needs interop. `sk-` keys through Windows OpenSSH are for USB security keys, and third-party passkey providers are expected to fail OpenSSH's attestation check.
 - **Q-W4** (answered: not the default). Whether a channel that doesn't use interop is practical for Windows Hello in the isolated profile, for example a Hyper-V socket (`AF_VSOCK`) to a Windows-side service:
   - A non-elevated Windows process can bind an `AF_HYPERV` listener, but the guest cannot reach it. Its `AF_VSOCK` connect returns EOF immediately.
   - Making it reachable needs a one-time administrator registration of a service GUID under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices`. That much is confirmed; whether it then works end to end is inferred, not tested.
@@ -691,6 +697,7 @@ transport     Unix socket                        XPC Mach service of a per-user 
 peer id       SO_PEERCRED + pidfd                audit token of each XPC message + pid version (both tiers)
 anti-tamper   AT_SECURE, non-dumpable            hardened runtime, PT_DENY_ATTACH (both tiers)
 location      /usr/local/libexec/mairu (root)    anywhere                                  harden copy recommended
+policy store  protected directory (harden)       data-protection keychain + harden dir     protected directory (harden)
 downgrade     old copies unreachable             signed minimum client version (§9.3)      cdhash differs per version
 top of chain  root                               administrator (sudo, /etc/authorization)
 ```
@@ -707,7 +714,7 @@ ad-hoc, hardened runtime                           ad-hoc        Hardened; peers
 no hardened runtime (plain cargo build)            unhardened    Unverifiable peers, as today; doctor explains §15
 ```
 
-The runtime decides from **its own observed signature**, never from build flags. The comparison is always "the peer satisfies my own designated requirement" (§3.2), so every tier runs the same verification code. A Developer ID changes how stable the identity is, not which features exist.
+The runtime decides from **its own observed signature**, never from build flags. The comparison is always "the peer satisfies my own designated requirement" (§3.2), so every tier runs the same verification code. A Developer ID changes how stable the identity is. It adds one feature, the data-protection keychain store, which needs a provisioning profile ([platform-helper §11](platform-helper.md)). Every other feature exists in every hardened tier.
 
 - **Official.** Built by the upstream release pipeline (§9.4) from a signed tag. Signed with the project's Developer ID (hardened runtime, `--timestamp`, identifier `co.0w0.mairu`) and notarized. The team ID is recorded here once the Developer ID is issued.
 - **Third-party signed.** Someone else's Developer ID: the same mechanics under that team. Such builds do not interoperate with official installs, because their designated requirements differ. That is by design.
@@ -796,28 +803,40 @@ release   minimum-client-version
 signed tag vX.Y.Z on upstream
 └─ release workflow, GitHub environment "release" (Developer ID certificate, notary API key)
    ├─ mairu-notifier → Mairu Notifier.app → codesign (Developer ID, runtime) → notarytool → stapler → archive
-   ├─ mairu, built with MAIRU_NOTIFIER_ARCHIVE=<archive> (embedded, platform-helper §11)
+   ├─ mairu-platform-helper → Mairu Helper.app + embedded.provisionprofile
+   │    → codesign (Developer ID, runtime, keychain-access-groups) → notarytool → stapler → archive
+   ├─ mairu, built with MAIRU_NOTIFIER_ARCHIVE and MAIRU_HELPER_ARCHIVE (embedded, platform-helper §11)
    ├─ codesign mairu (Developer ID, runtime, timestamp, identifier co.0w0.mairu) → notarytool (zip)
    └─ publish aarch64 and universal tarballs
 ```
 
 - The secrets live in a protected GitHub environment. Workflows triggered from forks never receive them.
 - A bare Mach-O cannot carry a stapled ticket. Gatekeeper checks notarization online for quarantined downloads only. Tarballs fetched by mise, aqua or curl are usually not quarantined.
+- The helper bundle's provisioning profile is a Developer ID profile for the explicit App ID `co.0w0.mairu.platform-helper`, with the keychain access group `<TEAMID>.co.0w0.mairu`. It is created once in the developer account and kept in the `release` environment with the certificate. It is not secret, but it is bound to the team.
 - Maintainers check the signed artifact before publishing the draft release (§15.5).
 
-### 9.5 Ad-hoc builds
+### 9.5 `harden` on macOS
 
 ```text
-sudo mairu harden   (macOS, ad-hoc builds)
-  copy to /usr/local/libexec/mairu/mairu (root-owned)
-  codesign --force --sign - --options runtime --identifier co.0w0.mairu
-  re-exec from other installs, as on Linux (§4.3)
+sudo mairu harden   (macOS, every tier)
+  dseditgroup -o create mairu                         refuse if the user is a member (§3.1)
+  /usr/local/libexec/mairu/mairu                      copy, root:mairu, mode 2755
+    ad-hoc: codesign --force --sign - --options runtime --identifier co.0w0.mairu   (before chown/chmod)
+  /usr/local/libexec/mairu/Mairu Helper.app           Developer ID builds with a helper bundle: copy, executable root:mairu 2755
+  /private/var/db/mairu                               root:mairu 2770; the helper creates users/<uid>
+  LaunchAgent plist → the hardened copy (§9.2); other installs re-exec into it (§4.3)
 ```
 
-- Peers match only byte-identical binaries. Each upgrade therefore replaces the running agent (§5.3) and drops its sessions.
-- **Q-M9:** `sudo mairu harden` on macOS for ad-hoc builds. It would copy the binary to root-owned `/usr/local/libexec/mairu/mairu`, re-sign it ad-hoc with `-o runtime`, and add re-exec as on Linux. Ad-hoc builds usually live in user-writable locations, such as `/opt/homebrew` or `~/.cargo/bin`. A replaced binary there would run attacker code whenever the user invokes it, though it still could not pass peer verification.
-- The integrity store for ad-hoc builds is **Q-M6** ([platform-helper §11](platform-helper.md)).
-- The notifier bundle is assembled locally ([platform-helper §11](platform-helper.md)).
+`harden` is the macOS counterpart of §4.4, for every tier. It provides the **protected directory**, the strong policy store that needs no app bundle ([platform-helper §7, §11](platform-helper.md)). Ad-hoc builds also get a root-owned location and the hardened runtime.
+
+- **Copies.** Mode bits are not covered by a code signature, so the setgid bit leaves a Developer ID signature valid. Ad-hoc builds are re-signed with the runtime before the mode is set.
+- **The helper bundle**, when the build carries one, is copied too and its executable made setgid `mairu`. The helper then holds both the entitlement for the data-protection keychain and the marker for the protected directory, so both strong stores are written together.
+- **Protected directory.** `/private/var/db/mairu/users/<uid>/policy.record`, with the Linux rules: the helper writes it holding the marker gid, and checks the ancestors are root-owned and not group- or other-writable. `/var` is a symlink, so the canonical path is used.
+- **Upgrades.** Re-run `sudo mairu harden` after upgrading. Until then, other installs re-exec the older hardened copy and warn about the version skew (§4.3). The cask can run it in a `postflight` step with `sudo`; that is a decision for the tap.
+- **Ad-hoc peers** match only byte-identical binaries. Each upgrade therefore replaces the running agent (§5.3) and drops its sessions.
+- **Q-M9:** confirm the non-member case. Does a setgid exec by a user outside the group set `P_SUGID`, making a restricted process? Neither tier depends on it: the hardened runtime, which every hardened tier has, already ignores `DYLD_*` variables and refuses task ports to same-user code. The member case was observed: the egid was granted but `P_SUGID` stayed 0 ([platform-helper §11](platform-helper.md)).
+- **Q-M6 (decided 2026-10-23):** ad-hoc builds get strong policy integrity only through `harden`. Without it, they have only the weak legacy keychain, and their policy only tightens ([policy §9.8](policy.md)).
+- The notifier bundle of ad-hoc builds is assembled locally ([platform-helper §11](platform-helper.md)).
 
 ### 9.6 Process facts
 
@@ -839,6 +858,8 @@ administrator (sudo, /etc/authorization) ──► everything on the host
 ```
 
 On macOS the top of the trust chain (§2.4) is the administrator account: `sudo`, and authorization rights in `/etc/authorization`.
+
+For official builds, the data-protection keychain also trusts whoever holds the project's Developer ID key, who could sign a helper that rewrites the record. That adds nothing new: the same key can already sign a mairu that every official client trusts.
 
 ### 9.8 Distribution
 
@@ -878,15 +899,15 @@ cargo install                                ad-hoc
 
 ```text
 Q-M1 socketpair peer info      Q-M2 GUI session / LaunchAgent   Q-M3 notifier authorization
-Q-M4 permission across upgrade Q-M5 notifier icon and cleanup   Q-M6 ad-hoc integrity store
-Q-M7 Homebrew (decided)       Q-M8 LOCAL_PEERTOKEN (confirmed) Q-M9 harden for ad-hoc builds
-Q-M10 transport (XPC, decided) Q-M11 LaunchAgent over SSH
+Q-M4 permission across upgrade Q-M5 notifier icon and cleanup   Q-M6 ad-hoc store (decided)
+Q-M7 Homebrew (decided)       Q-M8 LOCAL_PEERTOKEN (confirmed) Q-M9 setgid non-member case
+Q-M10 transport (XPC, decided) Q-M11 LaunchAgent over SSH      Q-M12 helper bundle and keychain
 ```
 
-- Q-M1 to Q-M6: [platform-helper §4, §11](platform-helper.md)
+- Q-M1 to Q-M5, Q-M12: [platform-helper §4, §11](platform-helper.md)
 - Q-M7: §9.8
 - Q-M8, Q-M10, Q-M11: §9.2
-- Q-M9: §9.5
+- Q-M6, Q-M9: §9.5
 
 ## 10. BSD (design only)
 
@@ -922,6 +943,7 @@ root via sudo / groups / WSL       ! out of scope, bounds everything; doctor war
 | Marker leaking to children | Permanent drop before every exec; `hardening::command()` (§4.2) |
 | Socket squatter or rogue agent stealing OAuth codes | Client checks the agent's listen-time marker (§5.2); hardened clients replace unverified agents (§5.3) |
 | Lending a connected socket to a genuine signed process (macOS) | XPC: every message carries its sender's audit token (§9.2) |
+| Forging the policy record (macOS) | Only strong stores count on hardened tiers: the helper bundle's data-protection keychain and the protected directory through `harden`. The forgeable legacy keychain never approves ([policy §9.8](policy.md)). |
 | Rewritten LaunchAgent plist or a squatted service name (macOS) | Clients verify whatever answers on every message; squatting only denies service (§9.2) |
 | Pid reuse | `SO_PEERPIDFD`/pidfd, start times in every identity, liveness re-checks (§5.1, §6) |
 | Root reached through `sudo`/polkit passwords, `NOPASSWD`, root-equivalent groups | Out of scope, but it bounds everything (§2.4); `doctor` warns (§12) |
@@ -938,7 +960,8 @@ Authorization-related threats are in [policy §11](policy.md), and helper- and b
 ```text
 upgrade     sudo mairu harden (or the package manager) → mairu kill-agent
 uninstall   sudo mairu harden --uninstall [--purge] → groupdel mairu
-recover     sudo mairu harden --reset-policy-record --user <name>
+recover     sudo mairu harden --reset-policy-record --user <name>     # Linux
+            mairu policy reset-record (administrator authorization)    # macOS
 diagnose    mairu doctor
 ```
 
@@ -1058,9 +1081,9 @@ rebuild                           → new cdhash → the dev agent is replaced a
 - Plain `cargo build` output has no hardened-runtime flag, so it runs unhardened (§9.1).
 - `script/macos-dev-sign` re-signs a build ad-hoc with the hardened runtime. Processes from that build then verify each other by cdhash, through the same code path official builds use with a team requirement.
 - The notifier bundle is assembled from the dev binary and signed ad-hoc as `co.0w0.mairu.dev.notifier` ([platform-helper §11](platform-helper.md)). The notification permission may be asked again after rebuilds (Q-M4).
-- The keychain integrity store follows Q-M6. To exercise its code, `MAIRU_DEV_KEYCHAIN=1` in the dev profile uses an item scoped to the cdhash and accepts a keychain prompt after each rebuild.
+- Integrity stores: the weak legacy keychain store works in every build. The protected directory needs `sudo mairu harden`, best in a disposable VM as on Linux (§15.2). The data-protection keychain needs the project's provisioning profile, so only official builds have it.
 - LocalAuthentication works with ad-hoc binaries.
-- Not possible without the program: an official identity, notarization, team-requirement acceptance across versions, the minimum client version between signed versions, and the embedded Developer ID notifier. Maintainers cover these (§15.5).
+- Not possible without the program: an official identity, notarization, team-requirement acceptance across versions, the minimum client version between signed versions, the embedded Developer ID notifier, and the helper bundle with its data-protection keychain. Maintainers cover these (§15.5).
 
 ### 15.4 Contributors with their own Developer ID
 
@@ -1078,11 +1101,11 @@ pull_request (forks included)    build + test on Linux and macOS, no secrets
   macos job                      macos-dev-sign; verification between two processes; notifier assembly (ad-hoc)
 push of a signed tag (upstream)  environment "release": Developer ID + notary key → §9.4
 release dry run (maintainers)    manual trigger on a branch: build, sign, notarize, no publish; same environment
-maintainer check (draft release) signed artifact: doctor, notifier, minimum client version, upgrade keeps sessions
+maintainer check (draft release) signed artifact: doctor, notifier, helper bundle store, minimum client version, upgrade keeps sessions
 ```
 
 - Designated-requirement strings and minimum-client-version parsing are unit-tested, so the team-requirement logic is covered without signing.
-- Properties only an official build has are checked by a maintainer on the draft release before publishing it: acceptance of the previous release under the team requirement, the minimum client version, and the embedded notifier. The same step raises `minimum-client-version` when the release fixes a client-side or protocol-level flaw (§9.3). This is a checklist step in the `releng` skill (`.claude/skills/releng/SKILL.md`), between the release workflow and publishing.
+- Properties only an official build has are checked by a maintainer on the draft release before publishing it: acceptance of the previous release under the team requirement, the minimum client version, the embedded notifier, and the helper bundle reporting the data-protection keychain. The same step raises `minimum-client-version` when the release fixes a client-side or protocol-level flaw (§9.3). This is a checklist step in the `releng` skill (`.claude/skills/releng/SKILL.md`), between the release workflow and publishing.
 - Pull requests that change the signing or notarization pipeline cannot exercise it from a fork, because forks never receive the secrets. A maintainer runs a **release dry run** on the PR's branch. It is a manually triggered workflow that builds, signs and notarizes without publishing, gated by the `release` environment's reviewers.
 
 ## Current Status
@@ -1101,15 +1124,15 @@ Linux:
 
 WSL2 (§8):
 - [ ] Detection and `context.wsl_interop`
-- [ ] Settle Q-W1 and Q-W4 on a WSL2 host
+- [x] Settle Q-W1 to Q-W5 on a WSL2 host (§8.5)
 
 macOS (separate implementation, §9):
 - [ ] Settle the open Q-M items (§9.9) and write them back here
 - [ ] XPC transport through the `co.0w0.mairu.agent` LaunchAgent: install, replace, message mapping (§9.2); settle Q-M11
 - [ ] Code-signature peer verification for every tier, on every message (§9.1, §9.2)
 - [ ] Embedded `Info.plist` and the minimum client version (§9.3)
-- [ ] Release pipeline: Developer ID signing, notarization, embedded notifier (§9.4)
-- [ ] Ad-hoc tier: `harden` on macOS (Q-M9)
+- [ ] Release pipeline: Developer ID signing, notarization, embedded notifier and helper bundle with its provisioning profile (§9.4)
+- [ ] `harden` on macOS for every tier: setgid copies, protected directory, LaunchAgent repointing (§9.5); settle Q-M9
 
 Development process (§15):
 - [ ] Dev profile (§15.1)
@@ -1141,3 +1164,6 @@ Future:
 - 2026-10-23: WSL2 findings from a Windows 11 25H2 host: Q-W1 confirmed, with interop off protecting only against processes inside the distribution; Q-W4 not the default; Q-W5 settled (§8).
 - 2026-10-23: Interim macOS findings: LOCAL_PEERTOKEN follows the last I/O process, so per-connection checks are unsound on macOS (§3.2); Q-M8 confirmed; Q-M10 (socket vs XPC transport) opened (§9.2).
 - 2026-10-23: Q-M10 decided: macOS clients reach the agent over XPC through a per-user LaunchAgent, verified on every message; this addresses Q-M2. Q-M11 (reaching it from SSH logins) opened (§3.2, §9.2).
+- 2026-10-23: Q-W2 confirmed: KeyCredential signatures are RSA-2048 PKCS #1 v1.5 with SHA-256 (§8.5).
+- 2026-10-23: macOS policy integrity: `harden` provides the protected directory for every tier, and Developer ID builds add a signed helper bundle with the data-protection keychain (§9.1, §9.4, §9.5, §9.7); Q-M6 decided, Q-M12 opened.
+- 2026-10-23: Q-W3 answered: Windows OpenSSH FIDO does not offer Windows Hello as the authenticator, so the isolated profile has no Windows Hello (§8.3, §8.5).

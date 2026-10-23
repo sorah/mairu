@@ -259,7 +259,7 @@ client (WSL2, interop)
     RequestSignAsync              → Windows Hello dialog
   → windows_hello_signature
 agent
-  RSA-2048 / SHA-256 verify with windows_hello_keys     # padding: Q-W2
+  RSA-2048 PKCS #1 v1.5 / SHA-256 verify with windows_hello_keys   # Q-W2 (confirmed)
 ```
 
 This is a key-based method, like ssh-agent (§6.2), for WSL2 distributions with interop enabled ([hardening §8](hardening.md)). It follows the pattern of WSL-Hello-sudo (`pam_wsl_hello`):
@@ -270,8 +270,9 @@ The helper's output is never trusted on its own; only the signature counts.
 
 **Helper.** `mairu-windows-hello.exe` is a small Rust binary in this repository (`windows-hello-helper/`), built for `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` with the `windows` crate. It is published with releases. It uses `Windows.Security.Credentials.KeyCredentialManager` with credential name `co.0w0.mairu`:
 - `create`: `RequestCreateAsync(…, FailIfExists)` creates the key, then prints the base64 SubjectPublicKeyInfo of the public key.
-- `public-key`: `OpenAsync` the existing key, then print its public key.
+- `public-key`: `OpenAsync` the existing key, then print its public key. Neither shows a prompt.
 - `sign`: read base64 bytes on stdin, `OpenAsync`, then `RequestSignAsync`, which shows the Windows Hello dialog. Print the base64 signature.
+- A console process owns no foreground window, so the dialog can open behind other windows (observed). The helper makes sure it comes to the front, for example by creating a foreground window to own it. `UserCanceled` and timeouts are a denial.
 
 The client locates the helper through its own unprotected configuration: `config.json` `windows_hello_helper`, default `$(wslpath "$(cmd.exe /c echo %LOCALAPPDATA%)")/mairu/mairu-windows-hello.exe`. A replaced helper can trigger prompts, but cannot forge a signature.
 
@@ -283,8 +284,16 @@ The client locates the helper through its own unprotected configuration: `config
 **Challenge and verification.** This is the same flow as §6.2, with `AuthorizationChallenge.method = "windows-hello"`:
 
 1. The client pipes the `statement` bytes to `sign` through WSL interop, and retries with `windows_hello_signature`.
-2. The agent verifies the signature over the statement bytes with the registered key: RSA-2048 with SHA-256. Microsoft's documentation contradicts itself on the padding ("PKCS #1 RSA PSS"), so the scheme is **Q-W2** ([hardening §8](hardening.md)). Implementation fixes it empirically and pins it with a test vector.
+2. The agent verifies the signature over the statement bytes with the registered key: RSA-2048, **PKCS #1 v1.5 with SHA-256** (Q-W2, confirmed on Windows 11 25H2). Microsoft's documentation says PSS, but every PSS salt length fails. Windows hashes the data itself, so the helper passes the statement, never a digest.
 3. Windows Hello itself requires the PIN or biometric, so a valid signature means a verified user.
+
+**Test vector (Q-W2).** From a Windows Hello key on Windows 11 25H2, verified with OpenSSL 3.5.5 (`openssl dgst -sha256 -verify`). Unit tests pin the verifier with it.
+
+```text
+spki       MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzXqNwEiMhTbmSIZQbFz7qICqSP/pTwGiwHPzu5pUh6uIK72wZGT2NgfmkahtC0wZBW2VXw9Z37fCLdYdAhtIl7dU//58lktKckkwfXCKkYQ4QD/K1R5CvnceXUuqIgwR3qxJCV1KW1Kv7CvH7NiZK1VaiAtqbPNOe4Uilk14rntMfH0OhPfS6HiTg7UmRoaYsR4q70owKnC6ahHBYILwDY6X4h3Lip8k9sOUUGVsE2CSCON78jejJqism166CNYsP99nlundVddlhh2m3BhcYoqObg7WVNGqZH/ovQQluuh0oktVGsrvvBpTFs7LKoHZMHt/YWSF+A1CSUue+PpFaQIDAQAB
+data       bWFpcnUgUS1XMiB0ZXN0IHZlY3RvcjogaGVsbG8=      ("mairu Q-W2 test vector: hello")
+signature  yQ3hK8Zppf577e0I86Kr1jmsENGG5By1w6viC81BSRsbkmP+TFTDCcuF1Wmp3qPkCD6E9fpJoVL8nM6YFEAETsLDdCbGRSodBGV8konQrp3AZCcLN768hU6UtJ0VNOooZ7aJh3RvyMd3hQ2RdWaRyR15gPESvlWNRVN+Q9G65A+iGgEFyIyH7O6pLeJIT8t1JazKyzfSCKT37BZiOd3WVwolruy7vKHV96+i5XWGF6mkrx+F2ArjwBnnRTuUWfu6ntswzh2zc0lSS8obKzHCX1hSEfQlwbCZjiTcTqhmSjRtOiGUroq4UoRtIOTHvdTVs35iYRJ5i6uvcrVHVf8oBA==
+```
 
 **Residual risk.** This is the same as ssh-agent:
 - Same-user code (Windows-side, or Linux-side through interop) can run its own program against the same key credential and cause a Windows Hello dialog. The human still has to pass it.
@@ -673,19 +682,21 @@ when {
 approve #1 (no record yet)   ask via platform        → record {digest₁, anchor: [ssh-agent, key A]}
 approve #2                   ask via anchor: key A   → record {digest₂, anchor from the new files}
 attacker edits files         anchor unchanged        → still needs key A
-every key lost               root resets the record  → anchor falls back to platform
+every key lost               admin resets the record → anchor falls back to platform
 ```
 
 - **Digest**: `SHA-256("mairu.policy.v1\0" || part(policy.cedar) || part(authorization.json))`, where `part(f)` is `0x00` when the file is absent, and `0x01 || u64be(len) || bytes` otherwise.
-- **Record**: name `"policy"`, content `IntegrityRecord` ([platform-helper §3](platform-helper.md)): the digest plus the **approval anchor**, which holds the `approval_methods` and the corresponding registered keys from the approved `authorization.json`. Stores serialize it as JSON:
+- **Record**: name `"policy"`, content `IntegrityRecord` ([platform-helper §3](platform-helper.md)): a **generation**, the digest, and the **approval anchor**, which holds the `approval_methods` and the corresponding registered keys from the approved `authorization.json`. Each approval writes a generation one higher than any strong store held, which orders records when strong stores disagree (§9.8). Stores serialize it as JSON:
 
   ```json
-  {"version": 1, "digest": "<hex>",
+  {"version": 1, "generation": 7, "digest": "<hex>",
    "approval": {"methods": ["ssh-agent"], "ssh_agent_keys": ["sk-ssh-ed25519@openssh.com AAAA..."], "windows_hello_keys": []}}
   ```
 
   The anchor lives with the digest so that the next approval is authorized by what was *last approved*, never by whatever the home-directory files say now. Editing `authorization.json`, or tampering with it and forcing lockdown, cannot downgrade approval to a password.
-- **Stores** that hold the record, and when each is available, are specified in [platform-helper §7](platform-helper.md). Linux runs two concurrently: the protected directory, which is authoritative on hardened hosts, and Secret Service, which is weak.
+- **Stores** that hold the record, and when each is available, are specified in [platform-helper §7](platform-helper.md). They are either **strong**, writable only by a genuine mairu helper, or **weak**, writable by any process of the user.
+  - Linux runs two concurrently: the protected directory (strong) after hardening, and Secret Service (weak).
+  - macOS runs up to three: the protected directory after `harden` and the data-protection keychain of the helper bundle (both strong), and a legacy keychain item (weak).
 
 ### 9.8 Integrity state and effective policy
 
@@ -696,7 +707,7 @@ stateDiagram-v2
   UNAPPROVED --> APPROVED: mairu policy approve
   APPROVED --> TAMPERED: files differ from record
   TAMPERED --> APPROVED: approve via anchor
-  APPROVED --> UNAPPROVED: root resets record
+  APPROVED --> UNAPPROVED: administrator resets record
 ```
 
 ```text
@@ -709,21 +720,25 @@ TAMPERED    lockdown + your forbid policies only
 **Record** (approve) writes the record (digest and approval anchor) to every available store. It fails if none is available.
 
 **Approval anchor in force:**
-- Hardened: the protected directory's record. Secret Service is never consulted for it.
-- Unhardened: the Secret Service record. This is weak, since same-user code can rewrite it.
-- No record (never approved, or reset by root): `["platform"]`.
+- The strong record (below), when a strong store holds one. Weak stores are never consulted for it then.
+- Otherwise, on an unhardened agent: the weak record. Same-user code can rewrite it, but an unhardened agent verifies no peers either.
+- No record (never approved, or reset by an administrator): `["platform"]`.
 
 **Verify** collects per-store statuses, then:
+
+1. **Strong record.** Among the strong stores that hold a record, the one with the highest generation is the strong record. A strong store holding a lower generation missed an approval while it was unavailable, so it is overwritten with the strong record before step 2. Only strong stores take part: a weak store could claim any generation.
+2. **State:**
 
 | Situation | State |
 |---|---|
 | Both files absent and no store has a record | `ABSENT` |
-| Any store `MISMATCHED` (including a record existing while both files are absent) | `TAMPERED` |
-| Hardened, protected directory `NOT_RECORDED` | `UNAPPROVED`. Re-approve after hardening, whatever Secret Service says. |
-| Hardened, protected directory `MATCHED`, Secret Service `NOT_RECORDED` | `APPROVED`, and backfill the Secret Service record |
-| Hardened, protected directory `MATCHED`, Secret Service `MATCHED` or `UNAVAILABLE` | `APPROVED` |
-| Unhardened, Secret Service `MATCHED` | `APPROVED` |
-| Unhardened, Secret Service `NOT_RECORDED` or `UNAVAILABLE` | `UNAPPROVED` |
+| Any store `MISMATCHED` after step 1 (including a record existing while both files are absent) | `TAMPERED` |
+| A strong store `MATCHED` | `APPROVED`, and backfill every available store that is `NOT_RECORDED` |
+| A strong store is available, and none `MATCHED` | `UNAPPROVED`. Re-approve after hardening, whatever weak stores say. |
+| No strong store available, unhardened agent, a weak store `MATCHED` | `APPROVED` |
+| Otherwise | `UNAPPROVED` |
+
+On Linux this means that hardened hosts are approved by the protected directory alone, and unhardened ones by Secret Service. On a hardened macOS build without a strong store (no helper bundle, no `harden`), a policy is never `APPROVED`. The legacy keychain can be forged by same-user code, so counting it would let that code relax a policy that the build's signature checks otherwise enforce ([platform-helper §11](platform-helper.md)).
 
 An `APPROVED` policy that no longer validates against this binary's schema, for example after an upgrade, is treated as `UNAPPROVED`, and the user is warned to re-approve.
 
@@ -741,7 +756,7 @@ Verification runs:
 - before every authorization decision, cached by `(dev, ino, mtime, size)` of both files plus a 5 s TTL
 - after `ApprovePolicy`
 
-Rollback: only the latest digest is kept. Restoring older files plus their record works against Secret Service only; the protected directory, which is authoritative when hardened, does not allow it.
+Rollback: only the latest record is kept. Restoring older files plus their record works against weak stores only; strong stores do not allow it.
 
 ### 9.9 Validation and commands
 
@@ -775,6 +790,7 @@ Policies without `@id` are shown as `policy.cedar#<n>`, and `check` warns about 
   - Evaluates it locally for every candidate presence of §4: none, process lease, session grant at a given age and idle time, and fresh per method.
   - Prints each decision with its determining policy ids. This answers "what would happen if…".
 - `mairu policy schema`: prints the schema.
+- `mairu policy reset-record` (macOS): the recovery below.
 - `mairu policy approve`:
   1. The client runs `check`, prints both files and the summary, and computes the digest.
   2. It sends `ApprovePolicy{expected_digest}`.
@@ -783,7 +799,11 @@ Policies without `@id` are shown as `policy.cedar#<n>`, and `check` warns about 
   5. The agent asks the human with action `approve-policy`. This always asks and never uses grants. It uses only the methods and keys of the **approval anchor in force** (§9.8), never those of the files being approved or of the current effective settings. Before any approval, that anchor is `["platform"]`, which is how the first key registration is bootstrapped.
   6. It records the new digest, with the new files' `approval_methods` and keys as the next anchor, into all available stores, and returns the per-store results.
 
-**Recovery.** When every approval key is lost, root removes the record with `sudo mairu harden --reset-policy-record --user <name>`. The state becomes `UNAPPROVED`, and the anchor falls back to `["platform"]`. A stale Secret Service record then reads as `MISMATCHED`, so lockdown applies until the next approval. Requiring root here is deliberate: root is already the top of the trust chain ([hardening §2.4](hardening.md)).
+**Recovery.** When every approval key is lost, an administrator removes the record from every strong store:
+- **Linux:** `sudo mairu harden --reset-policy-record --user <name>`.
+- **macOS:** `mairu policy reset-record`, through `ResetPolicyRecord` (§10). Root cannot reach the data-protection keychain item; only the helper bundle can. The helper therefore first requires an administrator authorization (`AuthorizationCopyRights` for `system.privilege.admin`, which asks for an administrator's name and password), then removes the record from every strong store it can reach. It needs a GUI login to show that dialog.
+
+The state becomes `UNAPPROVED`, and the anchor falls back to `["platform"]`. A stale weak record then reads as `MISMATCHED`, so lockdown applies until the next approval. Requiring root or an administrator here is deliberate: either is already the top of the trust chain ([hardening §2.4, §9.7](hardening.md)).
 
 ## 10. Agent protocol (`proto/mairu.proto`)
 
@@ -791,7 +811,7 @@ Policies without `@id` are shown as `policy.cedar#<n>`, and `check` warns about 
 AssumeRoleRequest
 └── ClientContext {intent, cwd, auto_config_path, env_names, authorization_response?}
 non-OK status → details: AuthorizationError {reason, challenge?, policy_ids, ai_agent}
-GetPolicy · ApprovePolicy · RevokeAuthorizations · PingAgentResponse.policy_integrity
+GetPolicy · ApprovePolicy · ResetPolicyRecord (macOS) · RevokeAuthorizations · PingAgentResponse.policy_integrity
 ```
 
 ```proto
@@ -801,6 +821,7 @@ service Agent {
   // ... existing RPCs ...
   rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
   rpc ApprovePolicy(ApprovePolicyRequest) returns (ApprovePolicyResponse);
+  rpc ResetPolicyRecord(ResetPolicyRecordRequest) returns (ResetPolicyRecordResponse);
   rpc RevokeAuthorizations(RevokeAuthorizationsRequest) returns (RevokeAuthorizationsResponse);
 }
 
@@ -920,6 +941,14 @@ message ApprovePolicyResponse {
   repeated mairu.platform.IntegrityStoreResult stores = 2;
 }
 
+// macOS: the helper asks for an administrator authorization first (§9.9).
+// Linux: UNIMPLEMENTED; root uses `mairu harden --reset-policy-record` instead.
+message ResetPolicyRecordRequest {}
+message ResetPolicyRecordResponse {
+  PolicyIntegrity integrity = 1;
+  repeated mairu.platform.IntegrityStoreResult stores = 2;
+}
+
 message RevokeAuthorizationsRequest {
   enum Scope {
     SCOPE_UNSPECIFIED = 0;
@@ -983,7 +1012,7 @@ in    decision procedure · Cedar policy · methods · integrity states · mairu
 out   the platform facilities themselves · servers.d and trust-record integrity
 ```
 
-**In scope:** §2–§10, plus the `mairu policy` and `mairu lock` commands. The Windows Hello helper and its open questions (Q-W2, Q-W3 in [hardening §8.5](hardening.md)) need a Windows host with WSL2.
+**In scope:** §2–§10, plus the `mairu policy` and `mairu lock` commands. The Windows Hello helper needs a Windows host with WSL2 to verify; its questions are settled ([hardening §8.5](hardening.md)).
 
 **Out of scope:** the platform facilities themselves ([platform-helper.md](platform-helper.md)), and integrity for `servers.d` and `.mairu.json` trust records ([hardening §13](hardening.md)).
 
@@ -1011,12 +1040,12 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 
 - [ ] Cedar engine: schema, entities, built-in policies, fail-closed evaluation
 - [ ] `Authorizer`: grants, leases, singleflight, decision procedure (§4)
-- [ ] Agent RPCs: `ClientContext`, `AuthorizationError`, `GetPolicy`, `ApprovePolicy`, `RevokeAuthorizations`, `PingAgentResponse.policy_integrity`
+- [ ] Agent RPCs: `ClientContext`, `AuthorizationError`, `GetPolicy`, `ApprovePolicy`, `RevokeAuthorizations`, `PingAgentResponse.policy_integrity`; `ResetPolicyRecord` with the macOS work
 - [ ] AI-agent signals
 - [ ] Policy files: `policy.cedar` + `authorization.json`, integrity states, forbid-only when unapproved, lockdown
 - [ ] Approval anchor in integrity records; recovery through `harden --reset-policy-record`
 - [ ] ssh-agent presence method
-- [ ] Windows Hello method and `mairu-windows-hello.exe`; settle Q-W2 and Q-W3
+- [ ] Windows Hello method and `mairu-windows-hello.exe` (Q-W2 and Q-W3 settled)
 - [ ] `mairu lock`, `mairu policy init|check|show|explain|schema|approve|enroll-windows-hello`
 
 ### Updates
@@ -1028,3 +1057,5 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - 2026-10-23: The platform method goes through the separate platform helper.
 - 2026-10-23: Leases last the process lifetime under policy control, with a 1 h idle timeout counted from the expiry of the last credentials obtained on demand; auto-refresh pre-fetches are marked and never prompt (§4, §9.6, §10). IDE relaxation documented rather than built in (§9.6).
 - 2026-10-23: The ssh-agent method accepts any registered key type; the lock on a key is the SSH agent's and the user's responsibility. `sk-` keys still have their user-present flag checked (§6.2).
+- 2026-10-23: Integrity stores classified as strong or weak, with a generation in each record to order strong stores; weak stores count as approval only on unhardened agents; macOS recovery through `mairu policy reset-record` with an administrator authorization (§9.7–§9.9, §10).
+- 2026-10-23: Q-W2 confirmed: Windows Hello KeyCredential signatures are RSA-2048 PKCS #1 v1.5 with SHA-256; test vector recorded (§6.3).
