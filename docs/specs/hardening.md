@@ -610,7 +610,7 @@ Confirmed on Windows 11 25H2 (build 26200), WSL 3.0.3, with Ubuntu 26.04 (Q-W1):
 
 So with interop on, same-user Linux code can become root and bypass the marker group, the protected directory and the agent's memory protection (§2.4). mairu still runs hardened in this mode, reports `context.wsl_interop = true`, and `harden` and `doctor` warn.
 
-Turning interop off protects a distribution only against processes **inside** it. The Windows user session, and every other distribution with interop on, remain root-equivalent over it. Like root, they are outside the threat model: on WSL2 the Windows account sits at the top of the trust chain. `doctor` therefore also warns when another registered distribution has interop on.
+Turning interop off protects a distribution only against processes **inside** it. The Windows user session, and every other distribution with interop on, remain root-equivalent over it. Like root, they are outside the threat model: on WSL2 the Windows account sits at the top of the trust chain. `doctor` states this limit on every WSL2 host. From inside an interop-off distribution it cannot list the other distributions, because doing so needs interop.
 
 ### 8.3 Profiles
 
