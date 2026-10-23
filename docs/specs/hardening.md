@@ -211,7 +211,7 @@ Identity comes from the peer's audit token, never a pid:
 
 This means no team identifier is hardcoded:
 
-- Developer ID builds match on team and identifier `co.0w0.mairu`, so any version from the same team matches. A signed security floor rejects old versions (§9.3).
+- Developer ID builds match on team and identifier `co.0w0.mairu`, so any version from the same team matches. A signed minimum client version rejects old versions (§9.3).
 - Ad-hoc builds (`cargo`, Homebrew from source, forks) match only a byte-identical binary, through the cdhash.
 - A binary without the hardened-runtime flag, such as plain `cargo build` output, is treated as unhardened (§9.1).
 
@@ -676,7 +676,7 @@ anchor        setgid marker group                team + identifier co.0w0.mairu 
 peer id       SO_PEERCRED + pidfd                LOCAL_PEERTOKEN audit token + pid version (both tiers)
 anti-tamper   AT_SECURE, non-dumpable            hardened runtime, PT_DENY_ATTACH (both tiers)
 location      /usr/local/libexec/mairu (root)    anywhere                                  harden copy recommended
-downgrade     old copies unreachable             signed security floor (§9.3)              cdhash differs per version
+downgrade     old copies unreachable             signed minimum client version (§9.3)      cdhash differs per version
 top of chain  root                               administrator (sudo, /etc/authorization)
 ```
 
@@ -702,24 +702,32 @@ The runtime decides from **its own observed signature**, never from build flags.
 
 ```text
 client ── LOCAL_PEERTOKEN ──► agent's audit token ──► satisfies my DR? + runtime flag + no get-task-allow
-agent  ── LOCAL_PEERTOKEN ──► client's audit token ──► same checks, then the security floor (§9.3)
+agent  ── LOCAL_PEERTOKEN ──► client's audit token ──► same checks, then the minimum client version (§9.3)
 ```
 
 §3.2, in both directions. **Q-M8:** confirm that `LOCAL_PEERTOKEN` on the *client's* connected socket yields the listener's token, the counterpart of Linux listen-time credentials. If not, the agent proves itself another way, such as XPC with a code-signing requirement.
 
-### 9.3 Security floor (downgrade protection)
+### 9.3 Minimum client version (downgrade protection)
 
 ```text
-build.rs  → -Wl,-sectcreate,__TEXT,__info_plist,<generated Info.plist>    # covered by the signature
-Info.plist  CFBundleIdentifier co.0w0.mairu · CFBundleShortVersionString X.Y.Z · MairuSecurityFloor A.B.C
-peer check  SecCodeCopySigningInformation(kSecCodeInfoPList).version >= my MairuSecurityFloor
+Cargo.toml  [package.metadata.mairu] minimum-client-version = "A.B.C"
+build.rs    → -Wl,-sectcreate,__TEXT,__info_plist,<generated Info.plist>       # covered by the signature
+Info.plist  CFBundleIdentifier co.0w0.mairu · CFBundleShortVersionString X.Y.Z · MairuMinimumClientVersion A.B.C
+peer check  peer's signed CFBundleShortVersionString >= my MairuMinimumClientVersion
+
+release   minimum-client-version
+0.18.1    0.13.0      ← has a security bug
+0.18.2    0.18.2      fixes it: raised in this release
+0.20.0    0.18.2      a mise-pinned 0.19.0 still works; a downloaded 0.18.1 is refused
 ```
 
 - With a team-based requirement, *every* official release ever published satisfies it, including ones with a fixed vulnerability, and they are all downloadable.
-- Every macOS build therefore embeds an `Info.plist` in the `__TEXT,__info_plist` section through a `build.rs` link argument. The code signature covers it.
-- Each peer reads the other's signed `Info.plist` (`SecCodeCopySigningInformation`, `kSecCodeInfoPList`) and refuses one whose version is below its own `MairuSecurityFloor`. A hardened client that finds an agent below the floor replaces it (§5.3).
-- The floor is raised only for security fixes. Versions installed side by side, such as per-directory mise versions, keep working.
-- Linux needs no floor: every installation re-execs the single hardened copy (§4.3), and old copies are unreachable.
+- Every macOS build therefore embeds an `Info.plist` in the `__TEXT,__info_plist` section through a `build.rs` link argument. The code signature covers it. It carries the build's version and its `MairuMinimumClientVersion`, taken from `[package.metadata.mairu] minimum-client-version` in `Cargo.toml`.
+- Each peer reads the other's signed `Info.plist` (`SecCodeCopySigningInformation`, `kSecCodeInfoPList`) and checks its version against its own `MairuMinimumClientVersion`. The same binary is both client and agent, so one value covers both directions:
+  - the agent refuses a client older than its minimum client version
+  - a hardened client replaces an agent older than its minimum client version (§5.3)
+- **When to raise it:** only in a release that contains a security fix, and then to that release's version. This is a step of the `releng` skill. Versions newer than the last raise keep working side by side, such as per-directory mise versions. Raising it in every release would lock out any older install as soon as a newer agent runs.
+- Linux needs no minimum client version: every installation re-execs the single hardened copy (§4.3), and old copies are unreachable. Ad-hoc macOS builds don't need one either, because their cdhash identity already differs per version.
 
 ### 9.4 Release pipeline (official builds)
 
@@ -988,7 +996,7 @@ rebuild                           → new cdhash → the dev agent is replaced a
 - The notifier bundle is assembled from the dev binary and signed ad-hoc as `co.0w0.mairu.dev.notifier` ([platform-helper §11](platform-helper.md)). The notification permission may be asked again after rebuilds (Q-M4).
 - The keychain integrity store follows Q-M6. To exercise its code, `MAIRU_DEV_KEYCHAIN=1` in the dev profile uses an item scoped to the cdhash and accepts a keychain prompt after each rebuild.
 - LocalAuthentication works with ad-hoc binaries.
-- Not possible without the program: an official identity, notarization, team-requirement acceptance across versions, the security floor between signed versions, and the embedded Developer ID notifier. Maintainers cover these (§15.5).
+- Not possible without the program: an official identity, notarization, team-requirement acceptance across versions, the minimum client version between signed versions, and the embedded Developer ID notifier. Maintainers cover these (§15.5).
 
 ### 15.4 Contributors with their own Developer ID
 
@@ -1006,11 +1014,11 @@ pull_request (forks included)    build + test on Linux and macOS, no secrets
   macos job                      macos-dev-sign; verification between two processes; notifier assembly (ad-hoc)
 push of a signed tag (upstream)  environment "release": Developer ID + notary key → §9.4
 release dry run (maintainers)    manual trigger on a branch: build, sign, notarize, no publish; same environment
-maintainer check (draft release) signed artifact: doctor, notifier, security floor, upgrade keeps sessions
+maintainer check (draft release) signed artifact: doctor, notifier, minimum client version, upgrade keeps sessions
 ```
 
-- Designated-requirement strings and security-floor parsing are unit-tested, so the team-requirement logic is covered without signing.
-- Properties only an official build has are checked by a maintainer on the draft release before publishing it: acceptance of the previous release under the team requirement, the floor, and the embedded notifier. This is a checklist step in the `releng` skill (`.claude/skills/releng/SKILL.md`), between the release workflow and publishing.
+- Designated-requirement strings and minimum-client-version parsing are unit-tested, so the team-requirement logic is covered without signing.
+- Properties only an official build has are checked by a maintainer on the draft release before publishing it: acceptance of the previous release under the team requirement, the minimum client version, and the embedded notifier. The same step raises `minimum-client-version` when the release contains a security fix (§9.3). This is a checklist step in the `releng` skill (`.claude/skills/releng/SKILL.md`), between the release workflow and publishing.
 - Pull requests that change the signing or notarization pipeline cannot exercise it from a fork, because forks never receive the secrets. A maintainer runs a **release dry run** on the PR's branch. It is a manually triggered workflow that builds, signs and notarizes without publishing, gated by the `release` environment's reviewers.
 
 ## Current Status
@@ -1034,7 +1042,7 @@ WSL2 (§8):
 macOS (separate implementation, §9):
 - [ ] Settle Q-M1 to Q-M9 (§9.9) and write them back here
 - [ ] Code-signature peer verification for every tier (§9.1, §9.2)
-- [ ] Embedded `Info.plist` and the security floor (§9.3)
+- [ ] Embedded `Info.plist` and the minimum client version (§9.3)
 - [ ] Release pipeline: Developer ID signing, notarization, embedded notifier (§9.4)
 - [ ] Ad-hoc tier: `harden` on macOS (Q-M9)
 
@@ -1064,3 +1072,4 @@ Future:
 - 2026-10-23: Homebrew research recorded under Q-M7 (§9.8); a cask is the proposed shape for official builds.
 - 2026-10-23: Homebrew decided: cask `mairu` for official builds, formula `mairu-src` from source. aqua, mise and ubi install the self-extracting official binary unchanged (§9.8).
 - 2026-10-23: Decided: dev profile on by default for debug builds; official-only checks as a releng checklist step; release dry run for pipeline PRs (§15).
+- 2026-10-23: Security floor renamed to minimum client version (`minimum-client-version`, `MairuMinimumClientVersion`), raised only in releases containing a security fix (§9.3).
