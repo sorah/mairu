@@ -49,6 +49,9 @@ agent
 | grant | A remembered authorization keyed by (session identity, server, rolespec), with an idle timeout and a hard cap. |
 | lease | A remembered authorization tied to one live `mairu exec` sidecar process, valid for that process's lifetime. |
 | integrity record | A digest (or signature) of the user policy file, kept where same-user code cannot rewrite it. |
+| official build | Built by the upstream release pipeline from a signed tag and signed with the project's Apple Developer ID (§9.1). |
+| ad-hoc build | Any build without a Developer ID signature: `cargo build`/`cargo install`, Homebrew from source, forks (§9.1). |
+| dev profile | The isolated socket, state and record names that debug builds use by default, so a contributor's build never touches an installed mairu (§15.1). |
 | platform helper | The separate process, spawned by the agent and sharing its lifetime, that serves the `mairu.platform.PlatformHelper` service. Every platform service runs there. |
 
 ## 2. Threat model
@@ -208,8 +211,9 @@ Identity comes from the peer's audit token, never a pid:
 
 This means no team identifier is hardcoded:
 
-- Developer ID builds match on team and identifier `co.0w0.mairu`.
-- Ad-hoc builds (Homebrew from source) match only a byte-identical binary, through the cdhash.
+- Developer ID builds match on team and identifier `co.0w0.mairu`, so any version from the same team matches. A signed security floor rejects old versions (§9.3).
+- Ad-hoc builds (`cargo`, Homebrew from source, forks) match only a byte-identical binary, through the cdhash.
+- A binary without the hardened-runtime flag, such as plain `cargo build` output, is treated as unhardened (§9.1).
 
 Both sides also require the hardened-runtime flag and the absence of `com.apple.security.get-task-allow`. The agent keeps `PT_DENY_ATTACH`. Use the audit token's pid version (`audit_token_to_pidversion`) wherever a pid is recorded. Details, and the questions still open, are in §9.
 
@@ -667,26 +671,130 @@ Q-W4 channel without interop   Q-W5 WSLg and auto modes
 ## 9. macOS hardening (implemented separately)
 
 ```text
-              Linux                              macOS
-anchor        setgid marker group                code signature (my own designated requirement)
-peer id       SO_PEERCRED + pidfd                LOCAL_PEERTOKEN audit token + pid version
-anti-tamper   AT_SECURE, non-dumpable            hardened runtime, PT_DENY_ATTACH
-location      /usr/local/libexec/mairu (root)    Developer ID: anywhere; ad-hoc: harden copy
+              Linux                              macOS, Developer ID build                 macOS, ad-hoc build
+anchor        setgid marker group                team + identifier co.0w0.mairu            cdhash (byte-identical binaries)
+peer id       SO_PEERCRED + pidfd                LOCAL_PEERTOKEN audit token + pid version (both tiers)
+anti-tamper   AT_SECURE, non-dumpable            hardened runtime, PT_DENY_ATTACH (both tiers)
+location      /usr/local/libexec/mairu (root)    anywhere                                  harden copy recommended
+downgrade     old copies unreachable             signed security floor (§9.3)              cdhash differs per version
 top of chain  root                               administrator (sudo, /etc/authorization)
 ```
 
 This section and [platform-helper §11](platform-helper.md) are the brief for the macOS implementation. Items marked **Q** must be settled there and written back into these specs.
 
-1. **Distribution and signing.**
-   - Release binaries (`aarch64-apple-darwin`, `universal-apple-darwin`) become Developer ID–signed with hardened runtime (`-o runtime`), identifier `co.0w0.mairu`, and notarized. This changes the release workflow.
-   - **Q:** Homebrew builds from source are ad-hoc signed and live in user-writable `/opt/homebrew`. Mirror §4: a `sudo mairu harden` that copies to root-owned `/usr/local/libexec/mairu/mairu`, signs it ad-hoc with `-o runtime`, and adds re-exec. The self-DR then pins the cdhash.
-2. **Peer verification** (§3.2) on the existing Unix socket, in both directions. **Q:** confirm that `LOCAL_PEERTOKEN` on the *client's* connected socket yields the listener's token (the counterpart of Linux listen-time credentials); if not, the agent proves itself another way, such as XPC with a code-signing requirement.
-3. **Process facts** (the counterpart of §6):
-   - `proc_pidinfo(PROC_PIDTBSDINFO)`: start time `pbi_start_tvsec/usec`, `pbi_ppid`, `e_tdev` for the tty
-   - `getsid` for the session
-   - `proc_pidpath` for the executable
-   - Pid reuse defeated with the audit-token pid version
-4. **Trust chain.** On macOS the top of the trust chain (§2.4) is the administrator account: `sudo`, and authorization rights in `/etc/authorization`.
+### 9.1 Build identities
+
+```text
+own signature (SecCodeCopySelf → signing information)        treatment
+Developer ID, hardened runtime, team = upstream    official      Hardened; peers satisfy team + identifier
+Developer ID, hardened runtime, other team         third-party   Hardened; peers satisfy that team + identifier
+ad-hoc, hardened runtime                           ad-hoc        Hardened; peers satisfy the cdhash
+no hardened runtime (plain cargo build)            unhardened    Unverifiable peers, as today; doctor explains §15
+```
+
+The runtime decides from **its own observed signature**, never from build flags. The comparison is always "the peer satisfies my own designated requirement" (§3.2), so every tier runs the same verification code. A Developer ID changes how stable the identity is, not which features exist.
+
+- **Official.** Built by the upstream release pipeline (§9.4) from a signed tag. Signed with the project's Developer ID (hardened runtime, `--timestamp`, identifier `co.0w0.mairu`) and notarized. The team ID is recorded here once the Developer ID is issued.
+- **Third-party signed.** Someone else's Developer ID: the same mechanics under that team. Such builds do not interoperate with official installs, because their designated requirements differ. That is by design.
+- **Ad-hoc.** Everything else. Linker-signed ad-hoc binaries lack the hardened-runtime flag and so run unhardened. `sudo mairu harden` (§9.5) or `script/macos-dev-sign` (§15.3) re-signs them with it.
+
+### 9.2 Peer verification
+
+```text
+client ── LOCAL_PEERTOKEN ──► agent's audit token ──► satisfies my DR? + runtime flag + no get-task-allow
+agent  ── LOCAL_PEERTOKEN ──► client's audit token ──► same checks, then the security floor (§9.3)
+```
+
+§3.2, in both directions. **Q-M8:** confirm that `LOCAL_PEERTOKEN` on the *client's* connected socket yields the listener's token, the counterpart of Linux listen-time credentials. If not, the agent proves itself another way, such as XPC with a code-signing requirement.
+
+### 9.3 Security floor (downgrade protection)
+
+```text
+build.rs  → -Wl,-sectcreate,__TEXT,__info_plist,<generated Info.plist>    # covered by the signature
+Info.plist  CFBundleIdentifier co.0w0.mairu · CFBundleShortVersionString X.Y.Z · MairuSecurityFloor A.B.C
+peer check  SecCodeCopySigningInformation(kSecCodeInfoPList).version >= my MairuSecurityFloor
+```
+
+- With a team-based requirement, *every* official release ever published satisfies it, including ones with a fixed vulnerability, and they are all downloadable.
+- Every macOS build therefore embeds an `Info.plist` in the `__TEXT,__info_plist` section through a `build.rs` link argument. The code signature covers it.
+- Each peer reads the other's signed `Info.plist` (`SecCodeCopySigningInformation`, `kSecCodeInfoPList`) and refuses one whose version is below its own `MairuSecurityFloor`. A hardened client that finds an agent below the floor replaces it (§5.3).
+- The floor is raised only for security fixes. Versions installed side by side, such as per-directory mise versions, keep working.
+- Linux needs no floor: every installation re-execs the single hardened copy (§4.3), and old copies are unreachable.
+
+### 9.4 Release pipeline (official builds)
+
+```text
+signed tag vX.Y.Z on upstream
+└─ release workflow, GitHub environment "release" (Developer ID certificate, notary API key)
+   ├─ mairu-notifier → Mairu Notifier.app → codesign (Developer ID, runtime) → notarytool → stapler → archive
+   ├─ mairu, built with MAIRU_NOTIFIER_ARCHIVE=<archive> (embedded, platform-helper §11)
+   ├─ codesign mairu (Developer ID, runtime, timestamp, identifier co.0w0.mairu) → notarytool (zip)
+   └─ publish aarch64 and universal tarballs
+```
+
+- The secrets live in a protected GitHub environment. Workflows triggered from forks never receive them.
+- A bare Mach-O cannot carry a stapled ticket. Gatekeeper checks notarization online for quarantined downloads only. Tarballs fetched by mise, aqua or curl are usually not quarantined.
+- Maintainers check the signed artifact before publishing the draft release (§15.5).
+
+### 9.5 Ad-hoc builds
+
+```text
+sudo mairu harden   (macOS, ad-hoc builds)
+  copy to /usr/local/libexec/mairu/mairu (root-owned)
+  codesign --force --sign - --options runtime --identifier co.0w0.mairu
+  re-exec from other installs, as on Linux (§4.3)
+```
+
+- Peers match only byte-identical binaries. Each upgrade therefore replaces the running agent (§5.3) and drops its sessions.
+- **Q-M9:** `sudo mairu harden` on macOS for ad-hoc builds. It would copy the binary to root-owned `/usr/local/libexec/mairu/mairu`, re-sign it ad-hoc with `-o runtime`, and add re-exec as on Linux. Ad-hoc builds usually live in user-writable locations, such as `/opt/homebrew` or `~/.cargo/bin`. A replaced binary there would run attacker code whenever the user invokes it, though it still could not pass peer verification.
+- The integrity store for ad-hoc builds is **Q-M6** ([platform-helper §11](platform-helper.md)).
+- The notifier bundle is assembled locally ([platform-helper §11](platform-helper.md)).
+
+### 9.6 Process facts
+
+```text
+proc_pidinfo(PROC_PIDTBSDINFO) → start time, ppid, tty · getsid · proc_pidpath · audit-token pid version
+```
+
+The counterpart of §6:
+
+- `proc_pidinfo(PROC_PIDTBSDINFO)`: start time `pbi_start_tvsec/usec`, `pbi_ppid`, `e_tdev` for the tty
+- `getsid` for the session
+- `proc_pidpath` for the executable
+- Pid reuse defeated with the audit-token pid version
+
+### 9.7 Trust chain
+
+```text
+administrator (sudo, /etc/authorization) ──► everything on the host
+```
+
+On macOS the top of the trust chain (§2.4) is the administrator account: `sudo`, and authorization rights in `/etc/authorization`.
+
+### 9.8 Distribution
+
+```text
+GitHub release tarball · mise · aqua   official (Developer ID)
+cargo install                          ad-hoc
+Homebrew                               pending: Q-M7
+```
+
+- GitHub release tarballs, mise and aqua deliver official builds as they are.
+- `cargo install` produces ad-hoc builds.
+- **Q-M7:** Homebrew. The tap's formula builds from source (ad-hoc), and Homebrew re-signs relocated binaries ad-hoc. Which shape keeps the Developer ID signature, for example a cask or a formula that installs the signed artifact, is being researched. It will be settled together with the tap (`sorah/homebrew-sorah`).
+
+### 9.9 Open questions (macOS)
+
+```text
+Q-M1 socketpair peer info      Q-M2 GUI session / LaunchAgent   Q-M3 notifier authorization
+Q-M4 permission across upgrade Q-M5 notifier icon and cleanup   Q-M6 ad-hoc integrity store
+Q-M7 Homebrew shape            Q-M8 LOCAL_PEERTOKEN on client   Q-M9 harden for ad-hoc builds
+```
+
+- Q-M1 to Q-M6: [platform-helper §4, §11](platform-helper.md)
+- Q-M7: §9.8
+- Q-M8: §9.2
+- Q-M9: §9.5
 
 ## 10. BSD (design only)
 
@@ -765,7 +873,7 @@ in    marker group · harden + re-exec · mutual verification · GetAgentStatus/
 out   macOS implementation · WSL1 · BSD · TPM token wrapping · servers.d integrity · AUR/Homebrew
 ```
 
-**In scope (Linux):** §3–§8, plus the `mairu harden` and `mairu doctor` commands. The WSL2 parts can be built on Linux; verifying §8.5 needs a Windows host with WSL2.
+**In scope (Linux):** §3–§8 and §15, plus the `mairu harden` and `mairu doctor` commands. The WSL2 parts can be built on Linux; verifying §8.5 needs a Windows host with WSL2.
 
 **Out of scope, and future work:**
 - macOS implementation (§9)
@@ -782,7 +890,7 @@ out   macOS implementation · WSL1 · BSD · TPM token wrapping · servers.d int
        ← headless ← ai-agents ← policy ← ssh-agent ← wsl ← notify
 ```
 
-The three specs are delivered together as one `gh stack`, one PR per layer, in this order. Each layer updates `README.md`, `CHANGELOG.md` (`[not yet released]`) and the Current Status of every spec it implements.
+The three specs are delivered together as one `gh stack`, one PR per layer, in this order. Each layer updates `README.md`, `CHANGELOG.md` (`[not yet released]`) and the Current Status of every spec it implements. The dev profile (§15.1) lands with `hardening/peer-verification`, and the linux-hardened CI job (§15.5) with `hardening/install`. The macOS work (§9, §15.3–§15.5) plans its own layers.
 
 | Layer | Specs | Files |
 |---|---|---|
@@ -798,6 +906,88 @@ The three specs are delivered together as one `gh stack`, one PR per layer, in t
 | `hardening/ssh-agent` | policy | `src/ssh_agent_presence.rs`, `proto/mairu.proto` (challenge messages), client relay, `Cargo.toml` (`ssh-key`, `ssh-encoding`) |
 | `hardening/wsl` | hardening, policy, platform-helper | `src/platform/process/linux/wsl.rs` (detection, `wsl_interop`), `src/platform/services/linux/wsl.rs` (Windows-side `open_url`), `src/windows_hello.rs`, `windows-hello-helper/`, `src/cmd/policy.rs` (`enroll-windows-hello`), `proto/mairu.proto` (`windows_hello_signature`), `.github/workflows/release.yml`, README WSL2 guide |
 | `hardening/notify` | platform-helper | `src/convenience.rs`, `src/config.rs` (`UserConfig.open_url`, `UserConfig.notify`), `src/platform/services/linux/{notify,open_url}.rs`, `proto/mairu.proto` (`OpenUrl`, `Notify`, `PingAgentResponse.policy_integrity`), `proto/mairu_platform.proto` (`SessionHint`), `src/agent.rs`, `src/cmd/{login,exec}.rs` |
+
+## 15. Development process and contributors
+
+```mermaid
+flowchart LR
+  PR["pull request<br/>(forks included)"] --> CI["CI on Linux and macOS<br/>no secrets"]
+  CI --> L["linux-hardened job<br/>sudo harden in the runner"]
+  CI --> M["macOS job<br/>ad-hoc + runtime signing"]
+  TAG["signed tag on upstream"] --> REL["release environment<br/>Developer ID + notary key"]
+  REL --> CHK["maintainer check<br/>before publishing"]
+```
+
+Every code path must run without Apple Developer Program membership. A Developer ID only makes the identity stable across versions (§9.1). Contributors therefore develop and test the same code paths with ad-hoc builds, and only a small set of official-only properties is checked by maintainers before a release.
+
+### 15.1 Dev profile
+
+```text
+debug build (cfg(debug_assertions))  → profile "dev"        MAIRU_PROFILE=dev|default overrides
+  agent socket       $XDG_RUNTIME_DIR/mairu/mairu-dev-agent.sock
+  state directory    ~/.local/state/mairu-dev
+  integrity records  name "policy-dev" in every store
+  notifier           co.0w0.mairu.dev.notifier
+  re-exec            off, as if MAIRU_NO_HARDENED_REEXEC=1
+  configuration      shared: ~/.config/mairu (servers.d, policy files)
+```
+
+A contributor's build must never touch their installed mairu. Its identity differs from the installed agent's, so without isolation it would replace that agent (§5.3), dropping its sessions, and it could overwrite the installed integrity records.
+
+- Debug builds therefore default to the **dev profile**, and release builds to `default`. `MAIRU_PROFILE` overrides either way.
+- Configuration is shared, but integrity records are not. A dev agent sees the user's policy files as `UNAPPROVED` until they are approved under the dev profile, so it applies only their `forbid` policies ([policy §9.8](policy.md)).
+- The profile appears in `GetAgentStatus` and `doctor`.
+- Setting `MAIRU_PROFILE` on someone else's mairu gains nothing. A separate agent has no sessions, and unapproved policy can only tighten.
+
+### 15.2 Linux contributors
+
+```text
+unhardened debug build   Cedar policy · decision procedure · key-based methods (test vectors)
+                         · convenience modes · platform helper (uid + pid pinning)
+disposable VM/container  sudo ./target/debug/mairu harden → marker gid, re-exec, protected directory
+polkit without a human   /etc/polkit-1/rules.d/49-mairu-test.rules → YES/NO for co.0w0.mairu.*
+```
+
+- Unhardened debug builds exercise most of the code: the Cedar policy and decision procedure, ssh-agent and Windows Hello verification (with recorded test vectors), convenience modes, and the platform helper, which falls back to uid plus pid pinning.
+- Hardened paths need root: the marker gid, re-exec, the protected directory and polkit actions. Contributors run `sudo ./target/debug/mairu harden` in a disposable VM or container. CI does the same on its runners.
+- polkit is driven without a human by a test-only rules file, `/etc/polkit-1/rules.d/49-mairu-test.rules`, that returns `YES` or `NO` for `co.0w0.mairu.*`. That covers the result mapping of [platform-helper §6.1](platform-helper.md). `pkttyagent` is exercised through a pty in an integration test.
+
+### 15.3 macOS contributors
+
+```text
+cargo build                       → unhardened: no peer verification, as today
+script/macos-dev-sign <binary>    → codesign --force --sign - --options runtime --identifier co.0w0.mairu
+                                    → hardened ad-hoc: two processes of this build verify each other
+rebuild                           → new cdhash → the dev agent is replaced automatically
+```
+
+- Plain `cargo build` output has no hardened-runtime flag, so it runs unhardened (§9.1).
+- `script/macos-dev-sign` re-signs a build ad-hoc with the hardened runtime. Processes from that build then verify each other by cdhash, through the same code path official builds use with a team requirement.
+- The notifier bundle is assembled from the dev binary and signed ad-hoc as `co.0w0.mairu.dev.notifier` ([platform-helper §11](platform-helper.md)). The notification permission may be asked again after rebuilds (Q-M4).
+- The keychain integrity store follows Q-M6. To exercise its code, `MAIRU_DEV_KEYCHAIN=1` in the dev profile uses an item scoped to the cdhash and accepts a keychain prompt after each rebuild.
+- LocalAuthentication works with ad-hoc binaries.
+- Not possible without the program: an official identity, notarization, team-requirement acceptance across versions, the security floor between signed versions, and the embedded Developer ID notifier. Maintainers cover these (§15.5).
+
+### 15.4 Contributors with their own Developer ID
+
+```text
+their Developer ID → third-party tier (§9.1): full strength under their team, separate from official installs
+```
+
+Their signed builds are the third-party tier (§9.1). They get full strength under their own team, but do not interoperate with official installs. The dev profile keeps the two apart on the same machine.
+
+### 15.5 CI and release
+
+```text
+pull_request (forks included)    build + test on Linux and macOS, no secrets
+  linux-hardened job             sudo harden in the runner; marker, re-exec, helper socketpair, polkit test rule
+  macos job                      macos-dev-sign; verification between two processes; notifier assembly (ad-hoc)
+push of a signed tag (upstream)  environment "release": Developer ID + notary key → §9.4
+maintainer check (draft release) signed artifact: doctor, notifier, security floor, upgrade keeps sessions
+```
+
+- Designated-requirement strings and security-floor parsing are unit-tested, so the team-requirement logic is covered without signing.
+- Properties only an official build has are checked by a maintainer on the draft release before publishing it, as a step of the release process: team-requirement acceptance from the previous release, the floor, and the embedded notifier.
 
 ## Current Status
 
@@ -818,9 +1008,17 @@ WSL2 (§8):
 - [ ] Settle Q-W1 and Q-W4 on a WSL2 host
 
 macOS (separate implementation, §9):
-- [ ] Settle the Q items in §9 and write them back here
-- [ ] Code-signature peer verification
-- [ ] Signing and notarization in the release workflow
+- [ ] Settle Q-M1 to Q-M9 (§9.9) and write them back here
+- [ ] Code-signature peer verification for every tier (§9.1, §9.2)
+- [ ] Embedded `Info.plist` and the security floor (§9.3)
+- [ ] Release pipeline: Developer ID signing, notarization, embedded notifier (§9.4)
+- [ ] Ad-hoc tier: `harden` on macOS (Q-M9)
+
+Development process (§15):
+- [ ] Dev profile (§15.1)
+- [ ] linux-hardened CI job and polkit test rules (§15.2, §15.5)
+- [ ] macOS CI job and `script/macos-dev-sign` (§15.3, §15.5)
+- [ ] Maintainer check for official-only properties in the release process (§15.5)
 
 BSD:
 - [ ] Design only (§10)
@@ -828,7 +1026,7 @@ BSD:
 Future:
 - [ ] TPM/Secure Enclave token wrapping and zeroizing allocator
 - [ ] `servers.d` and trust-record integrity
-- [ ] AUR and Homebrew packaging updates
+- [ ] AUR and Homebrew packaging updates (Homebrew: Q-M7)
 
 ### Updates
 
@@ -838,3 +1036,4 @@ Future:
 - 2026-10-23: Split into hardening, policy and platform-helper specs.
 - 2026-10-23: Added show-me style visual summaries to every section (additive; Mermaid blocks validated with mermaid 11.4.1).
 - 2026-10-23: Platform services moved permanently into a separate platform helper process (platform-helper §1, §4); the helper layer moves early in the stack.
+- 2026-10-23: macOS rewritten around Developer ID build tiers (§9): official, third-party and ad-hoc, a signed security floor, the release pipeline; development process for contributors without Apple Developer Program access (§15).

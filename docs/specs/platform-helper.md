@@ -38,7 +38,7 @@ Platform-dependent code lives in four places, each with one home:
 - **One code path.** The agent reaches every service through `HelperClient` (§2), always over IPC, with no in-process/IPC branching, on every OS.
 - **Clients make one connection**, to the agent. They reach services only through agent RPCs (`AssumeRole`, `ApprovePolicy`, `OpenUrl`, `Notify`, …), never directly.
 - **The helper shares the agent's lifetime** (§4): the agent spawns it, talks to it over an inherited socketpair, and the helper exits when the agent goes away.
-- **Packaging does not matter.** The helper is `mairu platform-helper`, the same binary, by default. A separately signed executable, inside an app bundle or not, can serve the same protocol under the same checks, and nothing else in these specs changes. No bundle is planned (§11).
+- **Packaging does not matter.** The helper is `mairu platform-helper`, the same binary, by default. A separately signed executable, inside an app bundle or not, can serve the same protocol under the same checks, and nothing else in these specs changes. The platform helper is never bundled. On macOS, notifications alone use a separate notifier app bundle, installed from the single binary and kept off the security path (§11).
 - Inside the helper, the Linux backends verify the system services they call (§5).
 - Backends: authorization facilities (§6), integrity stores (§7), and notifications and opening URLs (§8). Notifications and opening URLs carry no security weight, and each client chooses how they are delivered.
 - Headless Linux (§9) and WSL2 (§10) are first-class environments. The macOS backends are briefed in §11.
@@ -311,7 +311,7 @@ Rules:
 4. Both ends reject requests whose `uid` differs from their own (§3).
 5. **Failure.** If the helper fails verification, exits or crashes, `HelperClient` returns `RESULT_UNAVAILABLE` (`helper-unavailable` or `helper-unverified`) and empty capabilities, and the agent fails closed. It respawns the helper at most once per 30 s. `GetAgentStatus` reports the helper's state ([hardening §7.1](hardening.md)).
 6. **Unhardened Linux:** the checks reduce to uid plus pid pinning.
-7. **macOS:** the same process model, with the same binary (§11).
+7. **macOS:** the same process model, with the same binary (§11). The agent and the helper therefore have the same designated requirement: team-based for Developer ID builds, cdhash for ad-hoc ones ([hardening §9.1](hardening.md)). Each checks the other against its own requirement, as clients and the agent do.
    - **Q-M1:** whether a socketpair yields usable peer information there. `LOCAL_PEERTOKEN` on a socketpair may report the creator, as `SO_PEERCRED` does on Linux. If it does not, the helper checks its parent's code signature through `getppid()` and its audit token, and pins the pid and pid version.
    - A separately signed helper executable, bundled or not, follows the same rules. The helper then verifies its caller against identifier `co.0w0.mairu` with the same team ID, and the agent verifies the helper against identifier `co.0w0.mairu.platform-helper` with its own team ID. Use `xpc_connection_set_peer_code_signing_requirement` / `NSXPCConnection.setCodeSigningRequirement:` when on XPC, or `LOCAL_PEERTOKEN` on a socket. Ad-hoc builds need a cdhash pin recorded at install time.
 
@@ -456,7 +456,7 @@ The stores hold the `IntegrityRecord` (§3) of [policy §9.7](policy.md): a dige
   | `PROTECTED_DIRECTORY` | Helper hardened (it inherits the marker through the setgid exec, §4), and `/var/lib/mairu` is `root:mairu`, mode `2770` with no "other" bits, not FUSE | `/var/lib/mairu/users/<uid>/policy.record` (the record JSON of [policy §9.7](policy.md)), written atomically (temp + rename + fsync) by the helper inside `with_privileged_gid` | Strong: unreachable by same-user code. Authoritative when present. |
   | `SECRET_SERVICE` | Session bus reachable, `org.freedesktop.secrets` present, default collection unlocked. A locked collection is `UNAVAILABLE`; the helper never triggers an unlock prompt. | Item in the default collection: label `mairu policy record (uid N)`, attributes `{application: "co.0w0.mairu", kind: "policy-record", name: "policy", uid: "N"}`, secret = the record JSON | Weak: same-user code can read and write it. It catches offline or careless edits, and on hardened hosts any disagreement with the protected directory. |
 
-- **macOS stores** are briefed in §11.
+- **macOS stores** (§11): Developer ID builds keep the record in a keychain item whose access is limited to their team-based requirement. Ad-hoc builds follow Q-M6.
 
 ## 8. Convenience features: notifications and opening URLs
 
@@ -629,30 +629,58 @@ Profiles, interop and the root path are in [hardening §8](hardening.md). Platfo
 
 ```mermaid
 flowchart LR
-  A["mairu agent"] -- "inherited socketpair<br/>verified both ways" --> H["mairu platform-helper<br/>same binary, no bundle"]
+  A["mairu agent"] -- "inherited socketpair<br/>verified both ways" --> H["mairu platform-helper<br/>same binary, unbundled"]
   H --> LA["LocalAuthentication<br/>(Touch ID, password)"]
-  H --> KC["legacy keychain item<br/>integrity record"]
+  H --> KC["keychain item<br/>integrity record"]
   H --> OP["/usr/bin/open"]
+  H -- "open -g -n -a<br/>(LaunchServices)" --> N["Mairu Notifier.app<br/>no security weight"]
+  N --> UN["UNUserNotificationCenter"]
 ```
 
 Together with [hardening §9](hardening.md), this is the brief for the macOS implementation. Items marked **Q** must be settled there and written back into these specs.
 
-The helper is the same binary as the agent, with no app bundle. Everything below runs in the helper process, never in the agent (§1, §4).
+The platform helper is the same binary as the agent and is never bundled. Everything below runs in the helper process, never in the agent (§1, §4). The one exception is the notifier, a separate app bundle that only posts notifications.
 
 1. **Authorization.**
-   - `LAContext.evaluatePolicy(.deviceOwnerAuthentication, localizedReason:)`, with the reason built from [policy §7](policy.md). It works from a plain binary.
+   - `LAContext.evaluatePolicy(.deviceOwnerAuthentication, localizedReason:)`, with the reason built from [policy §7](policy.md). It works from a plain binary, signed ad-hoc or with a Developer ID.
    - Track lid/clamshell state (Touch ID unavailable) and fall back to password.
    - **Q:** whether to use a Secure Enclave key gated by `.userPresence` so the result is cryptographic rather than boolean. Optional, because the agent enforcing the result is itself protected.
    - Over SSH there is no UI, so the ssh-agent method ([policy §6.2](policy.md)) applies unchanged.
    - **Q-M2:** an agent first started from an SSH login, and so its helper, may sit outside the user's GUI session, where the LocalAuthentication UI cannot appear (`UNAVAILABLE`). The candidate fix is a per-user LaunchAgent plist that runs the plain binary in the GUI session; it needs no bundle.
-2. **Integrity store.** **Q:** choose between:
-   - (a) a Keychain generic-password item holding the record, with an ACL restricted to mairu's code requirement. This is the legacy file-based keychain and needs no entitlements, so it is the planned option, or
-   - (b) a Secure Enclave P-256 key (`kSecAttrTokenIDSecureEnclave`) signing the digest, with the signature in `$HOME` and the latest record also kept in the Keychain to prevent rollback.
+2. **Integrity store.**
+   - **Developer ID builds:** a Keychain generic-password item in the legacy file-based keychain, holding the record, with access limited to the build's team-based designated requirement. The access survives upgrades, and it needs no entitlements. This is the planned store, `IntegrityStoreKind` `KEYCHAIN`.
+   - The alternative is a Secure Enclave P-256 key (`kSecAttrTokenIDSecureEnclave`) signing the digest, with the signature in `$HOME` and the latest record kept in the Keychain against rollback. It needs `keychain-access-groups`. That in turn needs an app bundle and a provisioning profile, so it is not planned. It would report `SECURE_ENCLAVE`.
+   - **Ad-hoc builds, Q-M6:** an item limited to a cdhash would prompt after every upgrade. The options are no store, so policy only tightens as on headless unhardened Linux, or porting the Linux protected directory to macOS through `harden` (Q-M9). Setgid binaries on macOS are restricted processes, so the marker group carries over.
+   - Whatever the choice, the store must hold the whole `IntegrityRecord`, including the approval anchor, where same-user code cannot rewrite it.
+3. **Notifications: the notifier bundle.**
 
-   Option (b) needs `keychain-access-groups`, which means an app bundle and a provisioning profile, so it is not planned. Report the result through `IntegrityStoreKind` `KEYCHAIN` / `SECURE_ENCLAVE`. Whatever the choice, the store must hold the whole `IntegrityRecord`, including the approval anchor, where same-user code cannot rewrite it.
-3. **Notifications.** `UNUserNotificationCenter` requires an app bundle, which is not planned. The helper reports `notifications = false`, and `command` mode with a user-chosen notifier is the documented option (§8.3).
+   ```text
+   Developer ID build carrying an embedded notifier of the same team
+     extract   ~/Library/Application Support/mairu/notifier-<version>/Mairu Notifier.app   (no signing at run time)
+     check     SecStaticCodeCheckValidity: same team, identifier co.0w0.mairu.notifier
+   any other build
+     assemble  Contents/Info.plist + Contents/MacOS/mairu-notifier = clonefile(own binary)
+     sign      /usr/bin/codesign --force --sign - --options runtime   (codesign ships with macOS)
+   both
+     rename into place atomically; remove older versions
+   each notification
+     open -g -n -a <bundle> --args notifier --title … --body … --event …
+     notifier: request authorization the first time, add the request, exit
+   fallback (bundle unusable, no GUI session)
+     osascript display notification, else delivered = false
+   ```
+
+   - `UNUserNotificationCenter` requires the calling process to be the main executable of a signed app bundle. A bare binary fails with `bundleProxyForCurrentProcess is nil`. An ad-hoc signature is enough for local builds.
+   - **Official builds** embed a notifier built, Developer ID–signed, notarized and stapled by the release pipeline ([hardening §9.4](hardening.md)). Its executable is a small dedicated binary target, `mairu-notifier` (objc2 + UserNotifications). It cannot be a copy of mairu, which would then have to embed itself. A single `mairu` binary remains the only artifact, and the notifier's identity is stable, so its permission survives upgrades.
+   - **Other builds** carry no notifier. They assemble one from their own binary, run in `notifier` mode, and sign it ad-hoc.
+   - The bundle sets `CFBundleIdentifier` `co.0w0.mairu.notifier` (`co.0w0.mairu.dev.notifier` under the dev profile, [hardening §15.1](hardening.md)), `LSUIElement` true, `CFBundleName` `mairu`, and an icon.
+   - It is launched through LaunchServices so that it is registered and authorized. It is not the helper's child and doesn't need to be: it carries no security weight, so a same-user process that swaps it gains nothing.
+   - The platform helper itself is never the bundle. LaunchServices cannot pass the socketpair (§4), and a bundle in a user-writable location would break "trusted by construction".
+   - **Q-M3:** does a LaunchServices-launched notifier get notification authorization and appear in System Settings? Does that hold when the agent itself was started from an SSH login while a GUI session exists?
+   - **Q-M4:** does the permission survive an ad-hoc notifier's upgrade, where the cdhash changes but the bundle id does not?
+   - **Q-M5:** the notifier's icon, display name, and cleanup of old versions.
 4. **Open URL.** `NSWorkspace` or `/usr/bin/open`, in the user's GUI session.
-5. **AI-agent ancestry** ([policy §5](policy.md)). The same rules, using `proc_pidinfo` (process facts in [hardening §9](hardening.md)). This is a process primitive in the agent, not a helper service.
+5. **AI-agent ancestry** ([policy §5](policy.md)). The same rules, using `proc_pidinfo` (process facts in [hardening §9.6](hardening.md)). This is a process primitive in the agent, not a helper service.
 
 ## 12. Security considerations
 
@@ -668,6 +696,7 @@ spoofed notifications / URLs     · no security weight by design
 |---|---|
 | Rogue platform helper or rogue helper caller | Inherited socketpair with no filesystem rendezvous; the helper checks its parent's credentials, and the agent trusts the child it exec'd; fail closed (§4) |
 | A bug reached through D-Bus, Secret Service, notification, portal or LocalAuthentication code | Platform services run only in the helper, which holds no tokens (§1) |
+| A swapped macOS notifier bundle | Launched only to post notifications; no security weight, so swapping it gains nothing (§11) |
 | Fake polkit, D-Bus or `pkttyagent` | System bus path pinned; authority uid 0; fixed `/usr/bin/pkttyagent` with ownership check (§5, §6.1) |
 | Password capture at a tty prompt | Documented (§6.1); key-based methods preferred ([policy §6](policy.md)) |
 | Secret Service read or rewritten by same-user code | Secondary store; the protected directory is authoritative when hardened (§7) |
@@ -724,7 +753,9 @@ macOS (separate implementation, §11):
 - [ ] Settle the Q items in §11 and write them back here
 - [ ] LocalAuthentication backend
 - [ ] Integrity store
-- [ ] Helper on macOS (same binary, no bundle); settle Q-M1 and Q-M2
+- [ ] Helper on macOS (same binary, unbundled); settle Q-M1 and Q-M2
+- [ ] Notifier bundle: embedded Developer ID notifier (`mairu-notifier`) and ad-hoc assembly; settle Q-M3 to Q-M5
+- [ ] Keychain integrity store for Developer ID builds; settle Q-M6 for ad-hoc builds
 
 ### Updates
 
@@ -732,3 +763,4 @@ macOS (separate implementation, §11):
 - 2026-10-23: Split out of the combined spec.
 - 2026-10-23: Added show-me style visual summaries to every section (additive; Mermaid blocks validated with mermaid 11.4.1).
 - 2026-10-23: Platform services always run in a separate platform helper that shares the agent's lifetime (inherited socketpair), on every OS; process primitives split into their own trait; convenience modes reduced to `auto|agent|command|none` with a session hint; no app bundle planned on macOS.
+- 2026-10-23: macOS backends rewritten around Developer ID build tiers: embedded Developer ID notifier or locally assembled ad-hoc notifier, keychain store per tier.
