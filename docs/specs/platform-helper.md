@@ -500,7 +500,7 @@ per feature (open_url, notify):   auto | agent | command | none
 
 | Mode | Behavior |
 |---|---|
-| `auto` (default) | `agent` |
+| `auto` (default) | For `open_url`: `$BROWSER` in the client's environment, run in `command` mode, when it is set. Otherwise `agent`. For `notify`: `agent`. |
 | `agent` | Ask the agent through the `OpenUrl`/`Notify` RPCs (§8.5). The agent passes the request, with the client's `SessionHint`, to the platform helper, whose backend (§8.4) decides where to deliver it. The helper delivers to the client's desktop session when the hint names one, even if the agent was started elsewhere. It reports `opened`/`delivered = false`, rather than using some other session, when the hint shows SSH without a display, or no display at all. On WSL2 with interop it uses the Windows side (§10). |
 | `command` | Run a different helper program supplied by the user (§8.3) |
 | `none` | Disabled |
@@ -613,17 +613,24 @@ The reference workflow is long-lived **tmux sessions on a remote host, reached o
 ## 10. WSL2
 
 ```text
-WSL2 + interop   open_url → wslview / explorer.exe   notify → command   auth → windows-hello, pkttyagent
-WSL2 isolated    open_url → printed                   notify → none      auth → ssh -A from Windows
+WSL2 + interop   open_url → rundll32.exe url.dll,FileProtocolHandler (explorer.exe fallback)
+                 notify   → command (Windows toast helper)        auth → windows-hello, pkttyagent
+WSL2 isolated    open_url → printed   notify → terminal only      auth → ssh -A from Windows
 ```
 
-Profiles, interop and the root path are in [hardening §8](hardening.md). Platform-specific behavior inside a WSL2 distribution:
+Profiles, interop and the root path are in [hardening §8](hardening.md). Platform-specific behavior inside a WSL2 distribution, measured on Windows 11 25H2 with WSLg 1.0.79 (Q-W5):
 
-- **`open_url`.** On WSL2 with interop, the helper's `open_url` backend uses `wslview` when installed, otherwise `explorer.exe` located through `wslpath`, started via `hardening::command()`. The helper runs in the same distribution as the agent, so it has interop whenever the agent does. This takes precedence over WSLg's `DISPLAY`/`WAYLAND_DISPLAY`, since the Linux side usually has no browser.
-- **`notify`.** The helper has no WSL2 notification backend, so `agent` mode reports `delivered = false`. `command` mode with a Windows toast helper is the documented option.
+- **What WSLg provides.** `DISPLAY=:0`, `WAYLAND_DISPLAY=wayland-0` and a session bus. It provides no Linux browser, no `xdg-open`, and no `org.freedesktop.Notifications` owner, and `wslview` (wslu) is not installed by default. WSLg's display variables therefore never select a Linux-side backend.
+- **`open_url`.** With interop on, the helper's backend opens the URL in the Windows default browser:
+  1. `rundll32.exe url.dll,FileProtocolHandler <url>`, which exits 0 on success.
+  2. `explorer.exe <url>` as the fallback. Its exit status is 1 even on success, so it is ignored.
+
+  Both are located through `wslpath` and started via `hardening::command()`. The URL is passed as its own argv element, never through `cmd.exe /c start`, which mangles `&`. The helper runs in the same distribution as the agent, so it has interop whenever the agent does. WSL forwards localhost, so a loopback OAuth redirect listener in WSL is reachable from the Windows browser.
+- **`notify`.** The helper has no WSL2 notification backend: the D-Bus backend applies only when `org.freedesktop.Notifications` has an owner, and WSLg provides none. `agent` mode reports `delivered = false`, and terminal output always remains. `command` mode with a Windows toast helper is the documented option.
+- **`$BROWSER`.** When the client's environment sets it, `auto` honors it for `open_url` (§8.2), which also covers users who installed `wslview`.
+- **Isolated profile (interop off).** URLs are printed and notifications stay on the terminal.
 - **Authorization facility.** WSL2 normally has no polkit agent, so the `pkttyagent` fallback (§6.1) applies. The key-based methods ([policy §6](policy.md)) are preferred.
 - **Integrity stores.** Secret Service is usually absent, so hardened distributions rely on the protected directory alone.
-- **Q-W5** ([hardening §8.5](hardening.md)): how WSLg should influence `auto` modes beyond this.
 
 ## 11. macOS backends (implemented separately)
 
@@ -780,3 +787,4 @@ macOS (separate implementation, §11):
 - 2026-10-23: Notifier extraction hardened: fresh directory per version and flavour, quarantine removed and designated requirement checked before launch, launch by full path, separate bundle ids per flavour.
 - 2026-10-23: Notifier cleanup is by disuse, not by version, since versions run side by side.
 - 2026-10-23: Decided: a single platform helper process; session-bus exposure recorded as an accepted risk (§12).
+- 2026-10-23: WSL2 `open_url` uses `rundll32.exe url.dll,FileProtocolHandler` (explorer.exe fallback); `auto` honors `$BROWSER`; WSLg findings recorded (§8.2, §10).

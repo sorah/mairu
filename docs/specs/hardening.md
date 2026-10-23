@@ -143,7 +143,7 @@ Ways a same-user attacker reaches root:
 | `sudo`, `su` | PAM, usually the user's password, which is capturable at a tty ([platform-helper §6.1](platform-helper.md)). Also `NOPASSWD` rules and cached sudo timestamps. |
 | polkit administrator actions | `auth_admin` actions such as `pkexec` and systemd units; PAM again |
 | Root-equivalent group memberships | `docker`, `lxd`, `incus-admin`, `disk` |
-| WSL2 interop | `wsl.exe -u root` (§8) |
+| WSL2 interop | `wsl.exe -u root`, from inside the distribution, from any other distribution with interop on, or from any Windows process of the user (§8.2) |
 
 The effective strength of a deployment is the **weakest** of:
 1. becoming root
@@ -596,15 +596,21 @@ These facts are agent-determined and feed `context.wsl_interop` ([policy §9.2](
 ### 8.2 Interop makes root reachable
 
 ```text
-interop on    same-uid code → wsl.exe -u root → root (Q-W1) → context.wsl_interop = true, warnings
-any time      Windows-side code as the same Windows user outranks the distro (out of scope)
+inside, interop on     same-uid code → /mnt/c/…/wsl.exe -u root → uid 0, no prompt        (confirmed)
+inside, interop off    wsl.exe fails (host refuses the interop socket)                      (confirmed)
+from outside           any Windows process of the user, or any distribution with interop on,
+                       → wsl.exe -d <distro> -u root → uid 0, interop setting irrelevant    (confirmed)
 ```
 
-With interop enabled, any process in the distribution can run Windows programs as the Windows user, including `wsl.exe`. `wsl.exe -u root` opens a root shell in the distribution without authentication. This is documented from the Windows side; **Q-W1** confirms it from inside a session.
+Confirmed on Windows 11 25H2 (build 26200), WSL 3.0.3, with Ubuntu 26.04 (Q-W1):
+
+- **Inside a distribution with interop on**, a normal user runs `/mnt/c/Windows/System32/wsl.exe -u root -e id` and gets `uid=0` with no prompt. It can, for example, read `/etc/shadow`.
+- **Inside a distribution with interop off**, `wsl.exe` fails (`UtilAcceptVsock … accept4 failed 110`), and so does every bypass tried: running `/init` directly, or setting `WSL_INTEROP` by hand. The host enforces it; the `WSLInterop` binfmt entry still reads "enabled", because binfmt_misc is shared across the VM.
+- **From outside**, any non-elevated Windows process of the user can run `wsl.exe -d <distro> -u root` and get root in any distribution, whatever its interop setting. So can a process in any *other* distribution that has interop on.
 
 So with interop on, same-user Linux code can become root and bypass the marker group, the protected directory and the agent's memory protection (§2.4). mairu still runs hardened in this mode, reports `context.wsl_interop = true`, and `harden` and `doctor` warn.
 
-Windows-side code running as the same Windows user can do this with or without interop. Like root, it is outside the threat model: on WSL2 the Windows account sits at the top of the trust chain.
+Turning interop off protects a distribution only against processes **inside** it. The Windows user session, and every other distribution with interop on, remain root-equivalent over it. Like root, they are outside the threat model: on WSL2 the Windows account sits at the top of the trust chain. `doctor` therefore also warns when another registered distribution has interop on.
 
 ### 8.3 Profiles
 
@@ -615,11 +621,11 @@ isolated   (interop off)   ssh -A from Windows into the distro · native-Linux s
 
 | | Integrated (interop on, the WSL default) | Isolated (interop off) |
 |---|---|---|
-| Root reachable by same-user Linux code | Yes, through `wsl.exe -u root` | No; as native Linux |
-| Strength | A guardrail against over-eager tools such as AI agents, and against accidents. Not a boundary against malicious code. | As native Linux (§2.4) |
+| Root reachable by same-user Linux code | Yes, through `wsl.exe -u root` | Not from inside this distribution. From Windows-side processes and from other distributions with interop on: yes (§8.2) |
+| Strength | A guardrail against over-eager tools such as AI agents, and against accidents. Not a boundary against malicious code. | As native Linux (§2.4) against code inside the distribution. Code running as the Windows user, or in another distribution with interop on, is out of scope. |
 | Presence methods | `windows-hello` ([policy §6.3](policy.md)). `ssh-agent` through a relay of the Windows OpenSSH agent (npiperelay + socat, or `wsl2-ssh-agent`). `platform` through `pkttyagent`. | `ssh-agent`, by SSHing into the distribution from Windows with `ssh -A`. This is the headless reference workflow ([platform-helper §9](platform-helper.md)). `platform` through `pkttyagent`. |
-| `open_url` in `auto` mode | The Windows default browser: `wslview` when installed, otherwise `explorer.exe <url>` | URL printed, or `command` mode |
-| `notify` in `auto` mode | None. Use `command` mode with a Windows toast helper. | None |
+| `open_url` in `auto` mode | The Windows default browser, through `rundll32.exe url.dll,FileProtocolHandler <url>` ([platform-helper §10](platform-helper.md)) | URL printed, or `command` mode |
+| `notify` in `auto` mode | None: WSLg has no notification daemon. Use `command` mode with a Windows toast helper. | None |
 | Secret Service | Usually absent | Usually absent |
 
 To disable interop, write `/etc/wsl.conf` and then restart the distribution from Windows (`wsl.exe --terminate <distro>`). Turning it back on requires root inside the distribution, or Windows-side access.
@@ -658,15 +664,19 @@ sudo     pam_wsl_hello closes the sudo row of §2.4, not the interop row
 ### 8.5 Open questions (need a WSL2 host)
 
 ```text
-Q-W1 root via interop?   Q-W2 Hello signature padding   Q-W3 Hello through OpenSSH FIDO
-Q-W4 channel without interop   Q-W5 WSLg and auto modes
+Q-W1 root via interop (confirmed)   Q-W2 Hello signature padding   Q-W3 Hello through OpenSSH FIDO
+Q-W4 channel without interop (not default)   Q-W5 WSLg and auto modes (settled)
 ```
 
-- **Q-W1**: `wsl.exe -u root` started from inside a WSL2 session obtains root without authentication.
+- **Q-W1** (confirmed): `wsl.exe -u root` started from inside a WSL2 session obtains root without authentication. Interop off blocks this only from inside, never from outside (§8.2).
 - **Q-W2**: the padding of KeyCredential signatures, PSS or PKCS #1 v1.5. Microsoft's documentation contradicts itself; pin it with a test vector.
 - **Q-W3**: whether Windows OpenSSH's FIDO support (`webauthn.dll`) can use Windows Hello itself as the authenticator on current builds. Reports vary by build. If it can, the isolated profile gets Windows Hello through ssh-agent forwarding with no helper at all.
-- **Q-W4**: whether a channel that doesn't use interop is practical for Windows Hello in the isolated profile. For example, a Hyper-V socket (`AF_VSOCK`) to a Windows-side service; registering one needs Windows administrator rights.
-- **Q-W5**: how WSLg should influence `auto` modes beyond [platform-helper §10](platform-helper.md).
+- **Q-W4** (answered: not the default). Whether a channel that doesn't use interop is practical for Windows Hello in the isolated profile, for example a Hyper-V socket (`AF_VSOCK`) to a Windows-side service:
+  - A non-elevated Windows process can bind an `AF_HYPERV` listener, but the guest cannot reach it. Its `AF_VSOCK` connect returns EOF immediately.
+  - Making it reachable needs a one-time administrator registration of a service GUID under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices`. That much is confirmed; whether it then works end to end is inferred, not tested.
+  - vsock also carries no peer credentials: any process of any uid in any distribution of the shared VM could connect.
+  - The isolated profile therefore keeps using `ssh -A` into the distribution.
+- **Q-W5** (settled): WSLg sets `DISPLAY=:0` and `WAYLAND_DISPLAY=wayland-0`, and the session bus exists. But the Linux side has no browser, no `xdg-open`, no notification daemon, and no `wslview` by default. `auto` therefore ignores WSLg ([platform-helper §8.2, §10](platform-helper.md)).
 
 ## 9. macOS hardening (implemented separately)
 
@@ -1073,3 +1083,4 @@ Future:
 - 2026-10-23: Homebrew decided: cask `mairu` for official builds, formula `mairu-src` from source. aqua, mise and ubi install the self-extracting official binary unchanged (§9.8).
 - 2026-10-23: Decided: dev profile on by default for debug builds; official-only checks as a releng checklist step; release dry run for pipeline PRs (§15).
 - 2026-10-23: Security floor renamed to minimum client version (`minimum-client-version`, `MairuMinimumClientVersion`), raised only in releases fixing a client-side or protocol-level flaw (§9.3).
+- 2026-10-23: WSL2 findings from a Windows 11 25H2 host: Q-W1 confirmed, with interop off protecting only against processes inside the distribution; Q-W4 not the default; Q-W5 settled (§8).
