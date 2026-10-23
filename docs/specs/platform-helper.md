@@ -675,9 +675,9 @@ The platform helper is the same binary as the agent, except on Developer ID buil
    - `LAContext.evaluatePolicy(.deviceOwnerAuthentication, localizedReason:)`, with the reason built from [policy §7](policy.md). It works from a plain binary, signed ad-hoc or with a Developer ID.
    - Track lid/clamshell state (Touch ID unavailable) and fall back to password.
    - `LAError -4` ("system authentication is running", for example while the screen is locked) maps to `UNAVAILABLE`, which can be retried.
-   - **Q:** whether to use a Secure Enclave key gated by `.userPresence` so the result is cryptographic rather than boolean. Optional, because the agent enforcing the result is itself protected.
-   - Over SSH there is no UI, so the ssh-agent method ([policy §6.2](policy.md)) applies unchanged.
-   - **Q-M2 (addressed):** an agent first started from an SSH login, and so its helper, could sit outside the user's GUI session, where the LocalAuthentication UI cannot appear (`UNAVAILABLE`). The agent always runs as a LaunchAgent in `gui/<uid>`, a plain binary with no bundle ([hardening §9.2](hardening.md)), and its helper inherits that session. What an SSH-only login reaches is Q-M11 there.
+   - **Secure Enclave `.userPresence` keys are not used** (tested). An unentitled binary can create one as a CryptoKit `dataRepresentation` blob. But any other binary that reads the blob can sign with it after Touch ID, under its own prompt text. A signature would then prove that someone was present at this Mac, not that mairu asked. Permanent keys need an entitlement (`-34018`). The helper that reports the `LAContext` result is itself verified (§4), so a boolean result is enough.
+   - **Where the sheet appears.** coreauthd shows it on the console whenever a GUI session exists, even for a helper outside that session (confirmed for a Background job). A request from an SSH session therefore prompts on the Mac's screen, not in the terminal, and the client's waiting message says so. With no GUI session it is `UNAVAILABLE`. The ssh-agent method ([policy §6.2](policy.md)) is the one that reaches a remote user.
+   - **Q-M2 (addressed):** the agent runs as a LaunchAgent in `gui/<uid>` whenever a GUI login exists ([hardening §9.2](hardening.md)), and its helper inherits that session. LocalAuthentication works from either launchd domain while a GUI session exists (confirmed), but the administrator dialog needs `gui/<uid>`.
 2. **Integrity store.**
    - **The legacy keychain provides no integrity** (confirmed on macOS 27.2). Same-user code deleted an item with `security delete-generic-password` and no prompt. An unrelated unsigned binary then created a new item with the same service and account, whose access list trusts only mairu, holding forged content. mairu read it without a prompt, and the planted access list is indistinguishable from a genuine one. This applies to any requirement, team-based or cdhash. A MAC key kept in the keychain does not help either, because both items can be deleted and planted again. A legacy keychain item (`LEGACY_KEYCHAIN`) is therefore a **weak** store, like Secret Service on Linux: it catches careless edits only. The record is not secret, so the item's access list allows every application, which avoids prompts after ad-hoc rebuilds.
    - **Strong store for Developer ID builds: the data-protection keychain, through the helper bundle.**
@@ -702,7 +702,7 @@ The platform helper is the same binary as the agent, except on Developer ID buil
        1. a restricted entitlement with an embedded profile is honored when the bundle's executable is exec'd directly by a non-LaunchServices parent, also with the setgid bit set;
        2. the item is reachable from the helper of the LaunchAgent-run agent, and from an SSH-only login (Q-M11);
        3. the item survives an upgrade of the bundle (same team, same access group);
-       4. `AuthorizationCopyRights` for `system.privilege.admin` works from the helper, for `ResetIntegrity` ([policy §9.9](policy.md)).
+       4. `AuthorizationCopyRights` for `system.privilege.admin` works from the helper, for `ResetIntegrity` ([policy §9.9](policy.md)). Confirmed for an unbundled ad-hoc binary: the dialog appears from a terminal and from a `gui/<uid>` LaunchAgent, and a Background job gets `-60007` at once.
    - **Strong store for every tier: the protected directory through `harden`** ([hardening §9.5](hardening.md); Q-M6, Q-M9). `LOCAL_PEERCRED` reports the effective gid as `cr_groups[0]` (confirmed), so the Linux marker group carries over.
      - A setgid binary run by a **member** of its group got the egid, but was not a restricted process: `P_SUGID` was 0, `DYLD_INSERT_LIBRARIES` was honoured, and `task_for_pid` worked for the same user. This is consistent with the "user must not be a member" rule ([hardening §3.1](hardening.md)).
      - The non-member case is still to be confirmed.
@@ -729,10 +729,10 @@ The platform helper is the same binary as the agent, except on Developer ID buil
      write into a fresh directory per version and flavour; never modify an existing bundle
      strip com.apple.quarantine from what mairu wrote; check the designated requirement
      rename into place atomically; touch its mtime on every launch
-     remove notifier directories unused for 30 days   # versions may run side by side
+     remove notifier directories unused for 30 days, keep at most 5 per flavour (Q-M5)
    each notification
      open -g -n -a <full path to the bundle> --args notifier --title … --body … --event …
-     notifier: request authorization the first time, add the request, exit
+     notifier: request authorization the first time, write its status, add the request if authorized, exit
    fallback (bundle unusable, no GUI session)
      osascript display notification, else delivered = false
    ```
@@ -740,10 +740,10 @@ The platform helper is the same binary as the agent, except on Developer ID buil
    - `UNUserNotificationCenter` requires the calling process to be the main executable of a signed app bundle. A bare binary fails with `bundleProxyForCurrentProcess is nil`. An ad-hoc signature is enough for local builds.
    - **Official builds** embed a notifier built, Developer ID–signed, notarized and stapled by the release pipeline ([hardening §9.4](hardening.md)). Its executable is a small dedicated binary target, `mairu-notifier` (objc2 + UserNotifications). It cannot be a copy of mairu, which would then have to embed itself. A single `mairu` binary remains the only artifact, and the notifier's identity is stable, so its permission survives upgrades.
    - **Other builds** carry no notifier. They assemble one from their own binary, run in `notifier` mode, and sign it ad-hoc.
-   - The bundle sets `LSUIElement` true, `CFBundleName` `mairu`, an icon, and a `CFBundleIdentifier` per flavour:
-     - official builds: `co.0w0.mairu.notifier`
-     - ad-hoc builds: `co.0w0.mairu.notifier.adhoc`
-     - the dev profile: `co.0w0.mairu.dev.notifier` ([hardening §15.1](hardening.md))
+   - The bundle sets `LSUIElement` true, an icon (Q-M5), and a `CFBundleIdentifier` and display name per flavour:
+     - official builds: `co.0w0.mairu.notifier`, shown as `mairu`
+     - ad-hoc builds: `co.0w0.mairu.notifier.adhoc`, shown as `mairu (ad-hoc)`
+     - the dev profile: `co.0w0.mairu.dev.notifier`, shown as `mairu (dev)` ([hardening §15.1](hardening.md))
 
      Separate identifiers keep LaunchServices from resolving to another flavour's copy, and keep an ad-hoc mairu away from the official bundle.
    - Extraction and assembly follow these rules:
@@ -752,15 +752,21 @@ The platform helper is the same binary as the agent, except on Developer ID buil
      - **Launch by full path.** `open -a <name>` resolves by name or bundle id and could pick a different copy.
    - It is launched through LaunchServices so that it is registered and authorized. It is not the helper's child and doesn't need to be: it carries no security weight, so a same-user process that swaps it gains nothing.
    - The notifier is not the helper bundle. It must be launched through LaunchServices to be authorized, and LaunchServices cannot pass the socketpair (§4). The helper bundle is exec'd directly and verified as a running child (§4).
-   - **Q-M3:** does a LaunchServices-launched notifier get notification authorization and appear in System Settings, for both the Developer ID and the ad-hoc flavour on current macOS? Does that hold when the agent itself was started from an SSH login while a GUI session exists?
-
-     Interim results on macOS 27.2 (an MDM-managed host, screen locked):
-     - **Bundle location.** Bundles under temporary directories are rejected ("Failed to find or validate client"). A bundle under `~/Library/Application Support` registers.
-     - **Ad-hoc authorization.** An ad-hoc bundle came back already denied, with no prompt, with or without hardened runtime or `LSUIElement`. The lock screen, Focus and MDM-managed notification settings confound this result, so it is to be re-run unlocked. No ad-hoc app had ever been authorized on that host.
-     - **Unsigned.** An unsigned arm64 bundle does not launch at all.
+   - **Q-M3 (confirmed for ad-hoc builds).** Tested on macOS 27.2 with the screen unlocked:
+     - An ad-hoc bundle with the hardened runtime, under `~/Library/Application Support` and launched by full path with `open -g -n -a … --args`, registers and appears in System Settings → Notifications.
+     - It starts out denied, before any request. `requestAuthorization` returns `UNErrorDomain` 1 with no prompt, with or without the runtime flag and `LSUIElement`. Once the user turns on "Allow notifications" in System Settings, it is authorized.
+     - Whether that default comes from macOS 27 for apps without a team, or from this MDM-managed host, is unknown.
+     - So the notifier writes its authorization status to `status` in its version directory. The helper reads it into `Capabilities.notes`. While the notifier is not authorized, `notify` reports `delivered = false`, and both `doctor` and the first undelivered notification tell the user to turn on "mairu" in System Settings → Notifications. mairu does not route around a denial with `osascript`.
+     - Bundles under temporary directories are rejected ("Failed to find or validate client"). An unsigned arm64 bundle does not launch at all.
      - **Quarantine does not propagate from a CLI (confirmed).** Files written by a quarantined, user-approved CLI, and by its child, carried no quarantine. A quarantined, unnotarized ad-hoc CLI is blocked by Gatekeeper at exec.
-   - **Q-M4:** does the permission survive an ad-hoc notifier's upgrade, where the cdhash changes but the bundle id does not? The notification settings store a code requirement per app, which for an ad-hoc app is its cdhash. That suggests the permission is lost on every rebuild (inferred).
-   - **Q-M5:** the notifier's icon and display name, and the cleanup period. Old notifiers are removed only when unused for a while, because installers such as mise run several mairu versions side by side.
+     - Not yet tested: the Developer ID flavour, which needs the identity, and launching the notifier from an SSH session.
+   - **Q-M4 (confirmed): the permission survives upgrades.**
+     - It is keyed by bundle id, not by cdhash. After the binary changed, both a fresh directory and an in-place rewrite stayed authorized with no user action.
+     - Any same-user bundle claiming the id inherits the permission. That is acceptable, because the notifier carries no security weight.
+   - **Q-M5 (settled 2026-10-23): name, icon and cleanup.**
+     - Display names (`CFBundleName`, `CFBundleDisplayName`) differ per flavour, as listed above. System Settings shows each bundle id as its own row, and rows with identical names cannot be told apart.
+     - The icon is `pkg/macos/mairu.icns` (`CFBundleIconFile`). Without one, the row shows a blank icon. Ad-hoc assembly writes it into `Contents/Resources` from bytes embedded in the binary.
+     - Cleanup removes notifier directories unused for 30 days (their mtime is touched on each launch), keeps at most the 5 most recent per flavour, never removes the running version's, and unregisters removed bundles with `lsregister -u`.
 4. **Open URL.** `NSWorkspace` or `/usr/bin/open`, in the user's GUI session.
 5. **AI-agent ancestry** ([policy §5](policy.md)). The same rules, using `proc_pidinfo` (process facts in [hardening §9.6](hardening.md)). This is a process primitive in the agent, not a helper service.
 
@@ -840,7 +846,7 @@ macOS (separate implementation, §11):
 - [ ] LocalAuthentication backend
 - [ ] Integrity stores: legacy keychain (weak), protected directory after `harden` (strong)
 - [ ] Helper on macOS: unbundled, or the signed helper bundle verified as a running child; spawned by the LaunchAgent-run agent (Q-M1 confirmed, Q-M2 addressed)
-- [ ] Notifier bundle: embedded Developer ID notifier (`mairu-notifier`) and ad-hoc assembly; settle Q-M3 to Q-M5
+- [ ] Notifier bundle: embedded Developer ID notifier (`mairu-notifier`) and ad-hoc assembly, authorization status file, per-flavour names, icon `pkg/macos/mairu.icns`, cleanup (Q-M3 to Q-M5 settled for ad-hoc builds; confirm the Developer ID flavour)
 - [ ] Helper bundle `mairu-platform-helper` with the data-protection keychain store, and `ResetIntegrity` with an administrator authorization; settle Q-M12 (Q-M6 decided)
 
 ### Updates
@@ -857,3 +863,4 @@ macOS (separate implementation, §11):
 - 2026-10-23: Interim macOS findings: Q-M1 confirmed (socketpair reports the creator until the child does I/O); the legacy keychain has no integrity, so `KEYCHAIN` is weak and strong integrity needs `harden`; the data-protection keychain needs an entitlement; Q-M3 interim results (§4, §7, §11, §12).
 - 2026-10-23: Q-M2 addressed by the LaunchAgent transport decided in [hardening §9.2](hardening.md) (§11, §12).
 - 2026-10-23: macOS integrity: Developer ID builds run a signed helper bundle holding the data-protection keychain (strong), every tier gets the protected directory through `harden` (strong), the legacy keychain is weak; store kinds renamed, `generation` added to `IntegrityRecord`, `ResetIntegrity` added (§1, §3, §4, §7, §11, §12).
+- 2026-10-23: macOS update 2: LocalAuthentication shows its sheet on the console from either launchd domain; Secure Enclave keys not used; `AuthorizationCopyRights` confirmed from `gui/<uid>`; Q-M3 confirmed (ad-hoc notifiers start denied), Q-M4 confirmed (permission keyed by bundle id), Q-M5 settled (§11).

@@ -801,7 +801,7 @@ Policies without `@id` are shown as `policy.cedar#<n>`, and `check` warns about 
 
 **Recovery.** When every approval key is lost, an administrator removes the record from every strong store:
 - **Linux:** `sudo mairu harden --reset-policy-record --user <name>`.
-- **macOS:** `mairu policy reset-record`, through `ResetPolicyRecord` (§10). Root cannot reach the data-protection keychain item; only the helper bundle can. The helper therefore first requires an administrator authorization (`AuthorizationCopyRights` for `system.privilege.admin`, which asks for an administrator's name and password), then removes the record from every strong store it can reach. It needs a GUI login to show that dialog.
+- **macOS:** `mairu policy reset-record`, through `ResetPolicyRecord` (§10). Root cannot reach the data-protection keychain item; only the helper bundle can. The helper therefore first requires an administrator authorization (`AuthorizationCopyRights` for `system.privilege.admin`, which asks for an administrator's name and password), then removes the record from every strong store it can reach. It needs the agent in `gui/<uid>` ([hardening §9.2](hardening.md)). Elsewhere the authorization fails with `-60007`, and the command says to run it from a GUI login after `mairu kill-agent`.
 
 The state becomes `UNAPPROVED`, and the anchor falls back to `["platform"]`. A stale weak record then reads as `MISMATCHED`, so lockdown applies until the next approval. Requiring root or an administrator here is deliberate: either is already the top of the trust chain ([hardening §2.4, §9.7](hardening.md)).
 

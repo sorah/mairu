@@ -756,18 +756,23 @@ The protobuf messages and the agent's handlers are shared with Linux. Only the t
 - The agent pins the pid and pid version of the requester for grants and leases, as it does on Linux ([policy §4](policy.md)).
 
 **Installing and replacing the LaunchAgent.**
-- When the service does not answer, the client writes the plist, pointing at the binary to run (the hardened copy when there is one, §9.5), and runs `launchctl bootstrap gui/<uid> <plist>`.
+- When the service does not answer, the client writes the plist, pointing at the binary to run (the hardened copy when there is one, §9.5). It bootstraps it into `gui/<uid>`, or, when there is no GUI login, into `user/<uid>` with `LimitLoadToSessionType` `Background` (Q-M11).
 - Replacing an unverified or outdated agent (§5.3) is `launchctl bootout gui/<uid>/co.0w0.mairu.agent`, then rewriting the plist and bootstrapping it again.
 - The plist lives in a user-writable directory and is not trusted. Same-user code can rewrite it, or start the genuine binary with any arguments and environment, which the adversary can do anyway (§2.1). Whatever answers the service name must still pass the client's check.
 - A job that claims the service name first only denies service, which same-user code can also do by killing the agent.
 
-**Session.** A LaunchAgent bootstrapped into `gui/<uid>` runs in the user's GUI session, so the LocalAuthentication UI can appear. This addresses Q-M2 ([platform-helper §11](platform-helper.md)).
+**Session.**
+- An agent in `gui/<uid>` runs in the user's GUI session. Both the LocalAuthentication sheet and the administrator dialog (`AuthorizationCopyRights`) can appear from there. This addresses Q-M2 ([platform-helper §11](platform-helper.md)).
+- An agent in `user/<uid>` still gets the LocalAuthentication sheet on the console while a GUI session exists. `AuthorizationCopyRights` fails there at once with `errAuthorizationInteractionNotAllowed` (`-60007`). Both are confirmed.
+- An agent started in `user/<uid>` keeps running when a GUI login appears later. `mairu kill-agent` lets the next client start it in `gui/<uid>`.
 
-**Q-M11: SSH logins.**
-- Can a client in an SSH session look up a Mach service of a `gui/<uid>` LaunchAgent while the user is also logged in at the console?
-- What should the client bootstrap when there is no GUI login at all, as on a headless Mac reached only over SSH: the `user/<uid>` domain, with `LimitLoadToSessionType` `Background`?
+**Q-M11: SSH logins (partly confirmed).** Tested on macOS 27.2 with launchd jobs standing in for SSH sessions:
+- `launchctl bootstrap` into `gui/<uid>` and into `user/<uid>` both work as the user, without root.
+- A client running as a Background job in `user/<uid>` reaches a `gui/<uid>` Mach service while the console session exists (confirmed). A GUI client reaches a `user/<uid>` Background service too (confirmed).
+- A real sshd session is expected to behave like that Background job, since it also has its own audit session and resolves through the per-user bootstrap. This is inferred; it is to be tested with Remote Login on.
+- With no console login, `gui/<uid>` is expected not to exist, so the client bootstraps into `user/<uid>`. This is inferred and untested.
 
-There the ssh-agent method ([policy §6.2](policy.md)) applies, as on headless Linux.
+Over SSH, the ssh-agent method ([policy §6.2](policy.md)) is the one that reaches a remote user, as on headless Linux.
 
 **Unchanged by the transport.**
 - The agent ↔ helper channel stays an inherited socketpair ([platform-helper §4](platform-helper.md)). Lending needs a copy of an fd, and both ends live only in hardened-runtime processes, whose task ports same-user code cannot obtain.
@@ -898,10 +903,10 @@ cargo install                                ad-hoc
 ### 9.9 Open questions (macOS)
 
 ```text
-Q-M1 socketpair peer info      Q-M2 GUI session / LaunchAgent   Q-M3 notifier authorization
-Q-M4 permission across upgrade Q-M5 notifier icon and cleanup   Q-M6 ad-hoc store (decided)
-Q-M7 Homebrew (decided)       Q-M8 LOCAL_PEERTOKEN (confirmed) Q-M9 setgid non-member case
-Q-M10 transport (XPC, decided) Q-M11 LaunchAgent over SSH      Q-M12 helper bundle and keychain
+Q-M1  socketpair peer info (confirmed)   Q-M2  GUI session (addressed)         Q-M3  notifier authorization (confirmed)
+Q-M4  permission kept on upgrade         Q-M5  notifier name, icon (settled)   Q-M6  ad-hoc store (decided)
+Q-M7  Homebrew (decided)                 Q-M8  LOCAL_PEERTOKEN (confirmed)     Q-M9  setgid non-member case
+Q-M10 transport (XPC, decided)           Q-M11 LaunchAgent over SSH (partly)   Q-M12 helper bundle and keychain
 ```
 
 - Q-M1 to Q-M5, Q-M12: [platform-helper §4, §11](platform-helper.md)
@@ -1080,7 +1085,7 @@ rebuild                           → new cdhash → the dev agent is replaced a
 
 - Plain `cargo build` output has no hardened-runtime flag, so it runs unhardened (§9.1).
 - `script/macos-dev-sign` re-signs a build ad-hoc with the hardened runtime. Processes from that build then verify each other by cdhash, through the same code path official builds use with a team requirement.
-- The notifier bundle is assembled from the dev binary and signed ad-hoc as `co.0w0.mairu.dev.notifier` ([platform-helper §11](platform-helper.md)). The notification permission may be asked again after rebuilds (Q-M4).
+- The notifier bundle is assembled from the dev binary and signed ad-hoc as `co.0w0.mairu.dev.notifier` ([platform-helper §11](platform-helper.md)). Its notification permission starts out denied and is turned on once in System Settings (Q-M3). It is keyed by bundle id, so it survives rebuilds (Q-M4).
 - Integrity stores: the weak legacy keychain store works in every build. The protected directory needs `sudo mairu harden`, best in a disposable VM as on Linux (§15.2). The data-protection keychain needs the project's provisioning profile, so only official builds have it.
 - LocalAuthentication works with ad-hoc binaries.
 - Not possible without the program: an official identity, notarization, team-requirement acceptance across versions, the minimum client version between signed versions, the embedded Developer ID notifier, and the helper bundle with its data-protection keychain. Maintainers cover these (§15.5).
@@ -1167,3 +1172,4 @@ Future:
 - 2026-10-23: Q-W2 confirmed: KeyCredential signatures are RSA-2048 PKCS #1 v1.5 with SHA-256 (§8.5).
 - 2026-10-23: macOS policy integrity: `harden` provides the protected directory for every tier, and Developer ID builds add a signed helper bundle with the data-protection keychain (§9.1, §9.4, §9.5, §9.7); Q-M6 decided, Q-M12 opened.
 - 2026-10-23: Q-W3 answered: Windows OpenSSH 9.5p2 reaches Windows Hello but rejects its self-attested credential, so the isolated profile has no Windows Hello (§8.3, §8.5).
+- 2026-10-23: macOS update 2: Q-M11 partly confirmed (a Background client reaches a gui/<uid> service; `user/<uid>` when there is no GUI login), session behaviour of LocalAuthentication and the administrator dialog (§9.2); Q-M3, Q-M4 confirmed and Q-M5 settled (§9.9).
