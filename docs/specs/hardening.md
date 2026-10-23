@@ -716,7 +716,7 @@ Info.plist  CFBundleIdentifier co.0w0.mairu · CFBundleShortVersionString X.Y.Z 
 peer check  peer's signed CFBundleShortVersionString >= my MairuMinimumClientVersion
 
 release   minimum-client-version
-0.18.1    0.13.0      ← has a security bug
+0.18.1    0.13.0      ← has a client-side or protocol-level flaw
 0.18.2    0.18.2      fixes it: raised in this release
 0.20.0    0.18.2      a mise-pinned 0.19.0 still works; a downloaded 0.18.1 is refused
 ```
@@ -726,7 +726,7 @@ release   minimum-client-version
 - Each peer reads the other's signed `Info.plist` (`SecCodeCopySigningInformation`, `kSecCodeInfoPList`) and checks its version against its own `MairuMinimumClientVersion`. The same binary is both client and agent, so one value covers both directions:
   - the agent refuses a client older than its minimum client version
   - a hardened client replaces an agent older than its minimum client version (§5.3)
-- **When to raise it:** only in a release that contains a security fix, and then to that release's version. This is a step of the `releng` skill. Versions newer than the last raise keep working side by side, such as per-directory mise versions. Raising it in every release would lock out any older install as soon as a newer agent runs.
+- **When to raise it:** only in a release that fixes a **client-side flaw** or a **protocol-level flaw**, and then to that release's version. A flaw only in the agent's own handling does not raise it: upgrading the running agent fixes that. This is a step of the `releng` skill. Versions newer than the last raise keep working side by side, such as per-directory mise versions. Raising it in every release would lock out any older install as soon as a newer agent runs.
 - Linux needs no minimum client version: every installation re-execs the single hardened copy (§4.3), and old copies are unreachable. Ad-hoc macOS builds don't need one either, because their cdhash identity already differs per version.
 
 ### 9.4 Release pipeline (official builds)
@@ -1018,7 +1018,7 @@ maintainer check (draft release) signed artifact: doctor, notifier, minimum clie
 ```
 
 - Designated-requirement strings and minimum-client-version parsing are unit-tested, so the team-requirement logic is covered without signing.
-- Properties only an official build has are checked by a maintainer on the draft release before publishing it: acceptance of the previous release under the team requirement, the minimum client version, and the embedded notifier. The same step raises `minimum-client-version` when the release contains a security fix (§9.3). This is a checklist step in the `releng` skill (`.claude/skills/releng/SKILL.md`), between the release workflow and publishing.
+- Properties only an official build has are checked by a maintainer on the draft release before publishing it: acceptance of the previous release under the team requirement, the minimum client version, and the embedded notifier. The same step raises `minimum-client-version` when the release fixes a client-side or protocol-level flaw (§9.3). This is a checklist step in the `releng` skill (`.claude/skills/releng/SKILL.md`), between the release workflow and publishing.
 - Pull requests that change the signing or notarization pipeline cannot exercise it from a fork, because forks never receive the secrets. A maintainer runs a **release dry run** on the PR's branch. It is a manually triggered workflow that builds, signs and notarizes without publishing, gated by the `release` environment's reviewers.
 
 ## Current Status
@@ -1072,4 +1072,4 @@ Future:
 - 2026-10-23: Homebrew research recorded under Q-M7 (§9.8); a cask is the proposed shape for official builds.
 - 2026-10-23: Homebrew decided: cask `mairu` for official builds, formula `mairu-src` from source. aqua, mise and ubi install the self-extracting official binary unchanged (§9.8).
 - 2026-10-23: Decided: dev profile on by default for debug builds; official-only checks as a releng checklist step; release dry run for pipeline PRs (§15).
-- 2026-10-23: Security floor renamed to minimum client version (`minimum-client-version`, `MairuMinimumClientVersion`), raised only in releases containing a security fix (§9.3).
+- 2026-10-23: Security floor renamed to minimum client version (`minimum-client-version`, `MairuMinimumClientVersion`), raised only in releases fixing a client-side or protocol-level flaw (§9.3).
