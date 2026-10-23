@@ -776,12 +776,30 @@ On macOS the top of the trust chain (§2.4) is the administrator account: `sudo`
 ```text
 GitHub release tarball · mise · aqua   official (Developer ID)
 cargo install                          ad-hoc
-Homebrew                               pending: Q-M7
+Homebrew cask "mairu" (proposed)       official: binary symlinked from Caskroom, never re-signed
+Homebrew formula (from source)         ad-hoc
 ```
 
 - GitHub release tarballs, mise and aqua deliver official builds as they are.
 - `cargo install` produces ad-hoc builds.
-- **Q-M7:** Homebrew. The tap's formula builds from source (ad-hoc), and Homebrew re-signs relocated binaries ad-hoc. Which shape keeps the Developer ID signature, for example a cask or a formula that installs the signed artifact, is being researched. It will be settled together with the tap (`sorah/homebrew-sorah`).
+- **Q-M7: Homebrew.** Research findings, as of 2026-10-23:
+  - Homebrew policy:
+    - homebrew/core formulae must build from source, and Homebrew directs binary-only software to casks ([Acceptable Formulae](https://docs.brew.sh/Acceptable-Formulae)).
+    - GoReleaser moved from formulae (`brews`) to casks (`homebrew_casks`) after Homebrew maintainers called prebuilt-binary formulae unsupported. It added casks in v2.10 and deprecated `brews` in v2.16 ([v2.10](https://goreleaser.com/blog/goreleaser-v2.10/), [v2.16](https://goreleaser.com/blog/goreleaser-v2.16/)).
+    - Third-party taps are unrestricted, but since Homebrew 6.0.0 users must `brew trust` them ([Tap Trust](https://docs.brew.sh/Tap-Trust)).
+  - Signatures:
+    - Homebrew re-signs a Mach-O file ad-hoc only after rewriting it: install names, rpaths, or embedded prefix strings. mairu needs none of those, so an unrelocated bottle keeps its signature.
+    - A build from source is ad-hoc anyway, because the linker signs it.
+    - Casks never re-sign: a `binary` artifact is a symlink into `Caskroom/<token>/<version>/`.
+  - Quarantine and Gatekeeper:
+    - Cask downloads are quarantined; formula downloads are not. `--no-quarantine` is gone as of Homebrew 6.0.0.
+    - homebrew/cask has disabled casks that fail Gatekeeper since 2026-09-01. A notarized official build passes. A bare binary cannot be stapled, so its first run needs an online notarization check.
+  - **Proposed shape:**
+    - A cask `mairu` in `sorah/homebrew-sorah`: `binary "mairu"` pointing at the notarized release tarball, with Linux URLs too, and nothing that strips quarantine.
+    - Migrate users from the formula with `tap_migrations.json`.
+    - Keep a from-source formula under another name, such as `mairu-src`, for ad-hoc builds. When a formula and a cask share a name, `brew install` picks the formula.
+  - **Fallback:** a formula that installs the signed artifact, as hashicorp/tap and cirruslabs/tart do. It keeps the signature and avoids quarantine, but Homebrew maintainers call the pattern unsupported.
+  - Not decided yet: confirm the shape before changing the tap.
 
 ### 9.9 Open questions (macOS)
 
@@ -1037,3 +1055,4 @@ Future:
 - 2026-10-23: Added show-me style visual summaries to every section (additive; Mermaid blocks validated with mermaid 11.4.1).
 - 2026-10-23: Platform services moved permanently into a separate platform helper process (platform-helper §1, §4); the helper layer moves early in the stack.
 - 2026-10-23: macOS rewritten around Developer ID build tiers (§9): official, third-party and ad-hoc, a signed security floor, the release pipeline; development process for contributors without Apple Developer Program access (§15).
+- 2026-10-23: Homebrew research recorded under Q-M7 (§9.8); a cask is the proposed shape for official builds.

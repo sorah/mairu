@@ -662,9 +662,11 @@ The platform helper is the same binary as the agent and is never bundled. Everyt
      assemble  Contents/Info.plist + Contents/MacOS/mairu-notifier = clonefile(own binary)
      sign      /usr/bin/codesign --force --sign - --options runtime   (codesign ships with macOS)
    both
+     write into a fresh directory per version and flavour; never modify an existing bundle
+     strip com.apple.quarantine from what mairu wrote; check the designated requirement
      rename into place atomically; remove older versions
    each notification
-     open -g -n -a <bundle> --args notifier --title … --body … --event …
+     open -g -n -a <full path to the bundle> --args notifier --title … --body … --event …
      notifier: request authorization the first time, add the request, exit
    fallback (bundle unusable, no GUI session)
      osascript display notification, else delivered = false
@@ -673,10 +675,19 @@ The platform helper is the same binary as the agent and is never bundled. Everyt
    - `UNUserNotificationCenter` requires the calling process to be the main executable of a signed app bundle. A bare binary fails with `bundleProxyForCurrentProcess is nil`. An ad-hoc signature is enough for local builds.
    - **Official builds** embed a notifier built, Developer ID–signed, notarized and stapled by the release pipeline ([hardening §9.4](hardening.md)). Its executable is a small dedicated binary target, `mairu-notifier` (objc2 + UserNotifications). It cannot be a copy of mairu, which would then have to embed itself. A single `mairu` binary remains the only artifact, and the notifier's identity is stable, so its permission survives upgrades.
    - **Other builds** carry no notifier. They assemble one from their own binary, run in `notifier` mode, and sign it ad-hoc.
-   - The bundle sets `CFBundleIdentifier` `co.0w0.mairu.notifier` (`co.0w0.mairu.dev.notifier` under the dev profile, [hardening §15.1](hardening.md)), `LSUIElement` true, `CFBundleName` `mairu`, and an icon.
+   - The bundle sets `LSUIElement` true, `CFBundleName` `mairu`, an icon, and a `CFBundleIdentifier` per flavour:
+     - official builds: `co.0w0.mairu.notifier`
+     - ad-hoc builds: `co.0w0.mairu.notifier.adhoc`
+     - the dev profile: `co.0w0.mairu.dev.notifier` ([hardening §15.1](hardening.md))
+
+     Separate identifiers keep LaunchServices from resolving to another flavour's copy, and keep an ad-hoc mairu away from the official bundle.
+   - Extraction and assembly follow these rules:
+     - **Byte-exact, never in place.** Since macOS Ventura, Gatekeeper checks notarized apps on every launch, and any modification makes the app show as damaged. App Management may also block a process signed by another team from modifying a notarized bundle. Each version and flavour therefore gets a fresh directory.
+     - **Quarantine.** Unsandboxed tools don't quarantine the files they create by default. A process that inherited quarantine, for example one started from a terminal inside a quarantined GUI app, may get every file it writes quarantined. mairu therefore removes `com.apple.quarantine` from the bundle it wrote, then checks the designated requirement before launching it.
+     - **Launch by full path.** `open -a <name>` resolves by name or bundle id and could pick a different copy.
    - It is launched through LaunchServices so that it is registered and authorized. It is not the helper's child and doesn't need to be: it carries no security weight, so a same-user process that swaps it gains nothing.
    - The platform helper itself is never the bundle. LaunchServices cannot pass the socketpair (§4), and a bundle in a user-writable location would break "trusted by construction".
-   - **Q-M3:** does a LaunchServices-launched notifier get notification authorization and appear in System Settings? Does that hold when the agent itself was started from an SSH login while a GUI session exists?
+   - **Q-M3:** does a LaunchServices-launched notifier get notification authorization and appear in System Settings, for both the Developer ID and the ad-hoc flavour on current macOS? Does that hold when the agent itself was started from an SSH login while a GUI session exists? One source claims unsigned apps can never be authorized, while ad-hoc or self-signed ones can. Also: does quarantine carry over from a cask-quarantined mairu process to files it writes?
    - **Q-M4:** does the permission survive an ad-hoc notifier's upgrade, where the cdhash changes but the bundle id does not?
    - **Q-M5:** the notifier's icon, display name, and cleanup of old versions.
 4. **Open URL.** `NSWorkspace` or `/usr/bin/open`, in the user's GUI session.
@@ -764,3 +775,4 @@ macOS (separate implementation, §11):
 - 2026-10-23: Added show-me style visual summaries to every section (additive; Mermaid blocks validated with mermaid 11.4.1).
 - 2026-10-23: Platform services always run in a separate platform helper that shares the agent's lifetime (inherited socketpair), on every OS; process primitives split into their own trait; convenience modes reduced to `auto|agent|command|none` with a session hint; no app bundle planned on macOS.
 - 2026-10-23: macOS backends rewritten around Developer ID build tiers: embedded Developer ID notifier or locally assembled ad-hoc notifier, keychain store per tier.
+- 2026-10-23: Notifier extraction hardened: fresh directory per version and flavour, quarantine removed and designated requirement checked before launch, launch by full path, separate bundle ids per flavour.
