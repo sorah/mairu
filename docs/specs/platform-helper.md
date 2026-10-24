@@ -701,7 +701,7 @@ The platform helper is the same binary as the agent, except on Developer ID buil
      - The release pipeline signs and notarizes the bundle ([hardening §9.4](hardening.md)), and `mairu` embeds it. It is extracted like the notifier (item 3), to `~/Library/Application Support/mairu/helper-<version>/Mairu Helper.app`. After `harden`, the root-owned, setgid copy is used instead ([hardening §9.5](hardening.md)).
      - The agent execs it directly, not through LaunchServices, so the socketpair is inherited. It is verified as a running child (§4).
      - A Secure Enclave key signing the record would add nothing, since it would sit behind the same access group.
-     - **Q-M12**, to confirm on an official build:
+     - **Q-M12**, deferred until the Developer ID is issued, then confirmed on the first official build. If part 1 fails, the agent runs the unbundled helper (§4), and Developer ID builds rely on `harden` alone, like ad-hoc builds. The parts:
        1. a restricted entitlement with an embedded profile is honored when the bundle's executable is exec'd directly by a non-LaunchServices parent, also with the setgid bit set;
        2. the item is reachable from the helper of the LaunchAgent-run agent, and from an SSH-only login (Q-M11);
        3. the item survives an upgrade of the bundle (same team, same access group);
@@ -758,11 +758,11 @@ The platform helper is the same binary as the agent, except on Developer ID buil
    - **Q-M3 (confirmed for ad-hoc builds).** Tested on macOS 27.2 with the screen unlocked:
      - An ad-hoc bundle with the hardened runtime, under `~/Library/Application Support` and launched by full path with `open -g -n -a … --args`, registers and appears in System Settings → Notifications.
      - It starts out denied, before any request. `requestAuthorization` returns `UNErrorDomain` 1 with no prompt, with or without the runtime flag and `LSUIElement`. Once the user turns on "Allow notifications" in System Settings, it is authorized.
-     - Whether that default comes from macOS 27 for apps without a team, or from this MDM-managed host, is unknown.
+     - Whether that default comes from macOS 27 for apps without a team, or from this MDM-managed host, is unknown. It is not pursued, since no unmanaged Mac is available: the notifier handles both cases the same way, below.
      - So the notifier writes its authorization status to `status` in its version directory. The helper reads it into `Capabilities.notes`. While the notifier is not authorized, `notify` reports `delivered = false`, and both `doctor` and the first undelivered notification tell the user to turn on "mairu" in System Settings → Notifications. mairu does not route around a denial with `osascript`.
      - Bundles under temporary directories are rejected ("Failed to find or validate client"). An unsigned arm64 bundle does not launch at all.
      - **Quarantine does not propagate from a CLI (confirmed).** Files written by a quarantined, user-approved CLI, and by its child, carried no quarantine. A quarantined, unnotarized ad-hoc CLI is blocked by Gatekeeper at exec.
-     - Launching from an SSH session works: `open` hands the bundle to LaunchServices in the console session, where the notification is shown (confirmed). Not yet tested: the Developer ID flavour, which needs the identity.
+     - Launching from an SSH session works: `open` hands the bundle to LaunchServices in the console session, where the notification is shown (confirmed). The Developer ID flavour is deferred until the identity is issued.
    - **Q-M4 (confirmed): the permission survives upgrades.**
      - It is keyed by bundle id, not by cdhash. After the binary changed, both a fresh directory and an in-place rewrite stayed authorized with no user action.
      - The grant also outlives the bundle. After the bundle was deleted and unregistered, a new bundle with the same id at a new path came up authorized.
@@ -871,3 +871,4 @@ macOS (separate implementation, §11):
 - 2026-10-23: The setgid non-member case is confirmed on macOS (§11).
 - 2026-10-23: From a real SSH session: LocalAuthentication prompts on the console, `AuthorizationCopyRights` returns `-60007`, and the notifier is shown on the console; the notification grant outlives its bundle (§11).
 - 2026-10-23: The origin of a macOS platform prompt is derived from the peer's audit session and exposed as `context.console_session` (§11).
+- 2026-10-24: Q-M3's MDM question not pursued; Q-M12 and the Developer ID notifier deferred until the Developer ID is issued (§11).

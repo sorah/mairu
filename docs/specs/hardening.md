@@ -756,7 +756,7 @@ The protobuf messages and the agent's handlers are shared with Linux. Only the t
 - The agent pins the pid and pid version of the requester for grants and leases, as it does on Linux ([policy §4](policy.md)).
 
 **Installing and replacing the LaunchAgent.**
-- When the service does not answer, the client writes the plist, pointing at the binary to run (the hardened copy when there is one, §9.5). It bootstraps it into `gui/<uid>`, or, when there is no GUI login, into `user/<uid>` with `LimitLoadToSessionType` `Background` (Q-M11).
+- When the service does not answer, the client writes the plist, pointing at the binary to run (the hardened copy when there is one, §9.5). It bootstraps it into `gui/<uid>`. If that fails, for example with no GUI login, it bootstraps it into `user/<uid>` with `LimitLoadToSessionType` `Background` (Q-M11).
 - Replacing an unverified or outdated agent (§5.3) is `launchctl bootout gui/<uid>/co.0w0.mairu.agent`, then rewriting the plist and bootstrapping it again.
 - The plist lives in a user-writable directory and is not trusted. Same-user code can rewrite it, or start the genuine binary with any arguments and environment, which the adversary can do anyway (§2.1). Whatever answers the service name must still pass the client's check.
 - A job that claims the service name first only denies service, which same-user code can also do by killing the agent.
@@ -770,7 +770,7 @@ The protobuf messages and the agent's handlers are shared with Linux. Only the t
 - `launchctl bootstrap` into `gui/<uid>` and into `user/<uid>` both work as the user, without root.
 - A client running as a Background job in `user/<uid>` reaches a `gui/<uid>` Mach service while the console session exists (confirmed). A GUI client reaches a `user/<uid>` Background service too (confirmed).
 - A real SSH session (`ssh localhost`) gets its own audit session, and `launchctl managername` reports Background. From it, a client reaches the `gui/<uid>` service, and `launchctl bootstrap` into `gui/<uid>` and `user/<uid>` both succeed (confirmed).
-- With no console login, `gui/<uid>` is expected not to exist, so the client bootstraps into `user/<uid>`. This is inferred and untested.
+- With no console login, `gui/<uid>` is expected not to exist. This is untested and deferred, since no Mac is available to test it on. The client does not depend on the answer: it falls back to `user/<uid>` whenever bootstrapping into `gui/<uid>` fails.
 
 Over SSH, the ssh-agent method ([policy §6.2](policy.md)) is the one that reaches a remote user, as on headless Linux.
 
@@ -846,7 +846,9 @@ sudo mairu harden   (macOS, every tier)
 
 `harden` is the macOS counterpart of §4.4, for every tier. It provides the **protected directory**, the strong policy store that needs no app bundle ([platform-helper §7, §11](platform-helper.md)). Ad-hoc builds also get a root-owned location and the hardened runtime.
 
-- **Copies.** Mode bits are not covered by a code signature, so the setgid bit leaves a signature valid (confirmed for ad-hoc builds). Ad-hoc builds are re-signed with the runtime before the mode is set. The copy does not carry `com.apple.quarantine` over: an unnotarized, quarantined ad-hoc binary stops at a Gatekeeper dialog when executed. Whether `harden` itself is affected by a quarantined input is untested.
+- **Copies.** Mode bits are not covered by a code signature, so the setgid bit leaves a signature valid (confirmed for ad-hoc builds). Ad-hoc builds are re-signed with the runtime before the mode is set. The copy is written fresh, so it does not carry `com.apple.quarantine` over.
+  - A quarantined, unnotarized input never reaches `harden`, because Gatekeeper blocks its exec first (observed). Ad-hoc builds are built locally and are not quarantined anyway.
+  - A quarantined, notarized official binary, as a cask installs it, passes Gatekeeper's online check. Running it under `sudo` is to be checked with the first official build.
 - **The helper bundle**, when the build carries one, is copied too and its executable made setgid `mairu`. The helper then holds both the entitlement for the data-protection keychain and the marker for the protected directory, so both strong stores are written together.
 - **Protected directory.** `/private/var/db/mairu/users/<uid>/policy.record`, with the Linux rules: the helper writes it holding the marker gid, and checks the ancestors are root-owned and not group- or other-writable. `/var` is a symlink, so the canonical path is used.
 - **Upgrades.** The hardened copy must be refreshed after upgrading. Until then, other installs re-exec the older copy and warn about the version skew (§4.3).
@@ -933,7 +935,7 @@ cargo install                                ad-hoc
 Q-M1  socketpair peer info (confirmed)   Q-M2  GUI session (addressed)         Q-M3  notifier authorization (confirmed)
 Q-M4  permission kept on upgrade         Q-M5  notifier name, icon (settled)   Q-M6  ad-hoc store (decided)
 Q-M7  Homebrew (decided)                 Q-M8  LOCAL_PEERTOKEN (confirmed)     Q-M9  setgid non-member (confirmed)
-Q-M10 transport (XPC, decided)           Q-M11 SSH (no-console case open)      Q-M12 helper bundle and keychain
+Q-M10 transport (XPC, decided)           Q-M11 SSH (no-console: deferred)      Q-M12 helper bundle (deferred)
 ```
 
 - Q-M1 to Q-M5, Q-M12: [platform-helper §4, §11](platform-helper.md)
@@ -1160,6 +1162,7 @@ WSL2 (§8):
 
 macOS (separate implementation, §9):
 - [ ] Settle the open Q-M items (§9.9) and write them back here
+- [ ] With the first official build: the Developer ID notifier (Q-M3), the helper bundle (Q-M12 1–3), `sudo mairu harden` on a quarantined notarized binary (§9.5)
 - [ ] XPC transport through the `co.0w0.mairu.agent` LaunchAgent: install, replace, message mapping (§9.2); settle Q-M11
 - [ ] Code-signature peer verification for every tier, on every message (§9.1, §9.2)
 - [ ] Embedded `Info.plist` with the minimum client and agent versions (§9.3)
@@ -1203,3 +1206,4 @@ Future:
 - 2026-10-23: Decided: separate minimum client and agent versions, raised for client-side and agent-side flaws respectively, both for protocol-level ones (§9.3); Windows Hello-gated SSH agents documented for isolated WSL2 (§8.3); the Homebrew cask refreshes an existing hardened copy on upgrade (§9.5, §9.8).
 - 2026-10-23: Q-M9 confirmed: a setgid exec by a non-member makes a restricted process on macOS, so the marker group carries over; ad-hoc re-signing is deterministic (§9.5).
 - 2026-10-23: Q-M11 confirmed from a real SSH session while a console login exists; the no-console case stays open (§9.2).
+- 2026-10-24: Deferred: Q-M11 without a console login (no Mac to test on; the client falls back to `user/<uid>`), and the official-build checks until the Developer ID is issued (§9.2, §9.5, §9.9).
