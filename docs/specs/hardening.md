@@ -819,10 +819,9 @@ release   minimum-client-version   minimum-agent-version
 ```text
 signed tag vX.Y.Z on upstream
 └─ release workflow, GitHub environment "release" (Developer ID certificate, notary API key)
-   ├─ mairu-notifier → Mairu Notifier.app → codesign (Developer ID, runtime) → notarytool → stapler → archive
    ├─ mairu-platform-helper → Mairu Helper.app + embedded.provisionprofile
-   │    → codesign (Developer ID, runtime, keychain-access-groups) → notarytool → stapler → archive
-   ├─ mairu, built with MAIRU_NOTIFIER_ARCHIVE and MAIRU_HELPER_ARCHIVE (embedded, platform-helper §11)
+   │    → codesign (Developer ID, runtime, keychain-access-groups) → notarytool → stapler → tar archive
+   ├─ mairu, built with MAIRU_HELPER_ARCHIVE (embedded, platform-helper §11)
    ├─ codesign mairu (Developer ID, runtime, timestamp, identifier co.0w0.mairu) → notarytool (zip)
    └─ publish aarch64 and universal tarballs
 ```
@@ -839,7 +838,8 @@ sudo mairu harden   (macOS, every tier)
   dseditgroup -o create mairu                         refuse if the user is a member (§3.1)
   /usr/local/libexec/mairu/mairu                      copy, root:mairu, mode 2755
     ad-hoc: codesign --force --sign - --options runtime --identifier co.0w0.mairu   (before chown/chmod)
-  /usr/local/libexec/mairu/Mairu Helper.app           Developer ID builds with a helper bundle: copy, executable root:mairu 2755
+  /usr/local/libexec/mairu/Mairu Helper.app           official: from the archive; other builds: assembled and signed as root
+                                                      executable root:mairu 2755
   /private/var/db/mairu                               root:mairu 2770; the helper creates users/<uid>
   LaunchAgent plist → the hardened copy (§9.2); other installs re-exec into it (§4.3)
 ```
@@ -849,7 +849,7 @@ sudo mairu harden   (macOS, every tier)
 - **Copies.** Mode bits are not covered by a code signature, so the setgid bit leaves a signature valid (confirmed for ad-hoc builds). Ad-hoc builds are re-signed with the runtime before the mode is set. The copy is written fresh, so it does not carry `com.apple.quarantine` over.
   - A quarantined, unnotarized input never reaches `harden`, because Gatekeeper blocks its exec first (observed). Ad-hoc builds are built locally and are not quarantined anyway.
   - A quarantined, notarized official binary, as a cask installs it, passes Gatekeeper's online check. Running it under `sudo` is to be checked with the first official build.
-- **The helper bundle**, when the build carries one, is copied too and its executable made setgid `mairu`. The helper then holds both the entitlement for the data-protection keychain and the marker for the protected directory, so both strong stores are written together.
+- **The helper bundle** is written there too, with its executable setgid `mairu`. Official builds extract it from their archive. Other builds assemble and sign it as root, with `MairuAgentCDHash` set to the hardened copy's cdhash ([platform-helper §11](platform-helper.md)). On Developer ID builds the helper then holds both the entitlement for the data-protection keychain and the marker for the protected directory, so both strong stores are written together.
 - **Protected directory.** `/private/var/db/mairu/users/<uid>/policy.record`, with the Linux rules: the helper writes it holding the marker gid, and checks the ancestors are root-owned and not group- or other-writable. `/var` is a symlink, so the canonical path is used.
 - **Upgrades.** The hardened copy must be refreshed after upgrading. Until then, other installs re-exec the older copy and warn about the version skew (§4.3).
   - The Homebrew cask's `postflight` runs the new binary's `sudo mairu harden` when a hardened copy already exists (decided 2026-10-23). `harden` never re-execs (§4.3), so the new version installs itself. This asks for a password during `brew upgrade`. If it fails, for example in a non-interactive upgrade, the upgrade still succeeds and prints the command to run.
@@ -869,7 +869,7 @@ sudo mairu harden   (macOS, every tier)
 
   A tampered user-writable binary still fails cdhash verification.
 - **Q-M6 (decided 2026-10-23):** ad-hoc builds get strong policy integrity only through `harden`. Without it, they have only the weak legacy keychain, and their policy only tightens ([policy §9.8](policy.md)).
-- The notifier bundle of ad-hoc builds is assembled locally ([platform-helper §11](platform-helper.md)).
+- Everything `harden` writes is root-owned. The agent only registers the bundle with LaunchServices, as the user.
 
 ### 9.6 Process facts
 
@@ -904,9 +904,9 @@ cargo install                                ad-hoc
 ```
 
 - **aqua, mise and ubi** install the official release tarball unchanged.
-  - The binary is self-extracting: it carries the notifier bundle and writes it out on first use ([platform-helper §11](platform-helper.md)). No installer needs to know about bundles.
+  - The binary is self-extracting: it carries the helper bundle, and the agent writes it out at startup ([platform-helper §11](platform-helper.md)). No installer needs to know about bundles.
   - These tools download with their own HTTP clients, which do not set quarantine.
-  - They keep each version in its own directory, and versions can run side by side. The team-based requirement does not depend on paths (§9.1), and notifiers are kept per version.
+  - They keep each version in its own directory, and versions can run side by side. The team-based requirement does not depend on paths (§9.1), and helper bundles are kept per version.
   - Release asset names stay as they are, so the existing aqua registry entry and the mise and ubi asset matching keep working.
 - `cargo install` produces ad-hoc builds.
 - **Q-M7: Homebrew.** Research findings, as of 2026-10-23:
@@ -932,11 +932,11 @@ cargo install                                ad-hoc
 ### 9.9 Open questions (macOS)
 
 ```text
-Q-M1  socketpair peer info (confirmed)   Q-M2  GUI session (addressed)         Q-M3  notifier authorization (confirmed)
-Q-M4  permission kept on upgrade         Q-M5  notifier name, icon (settled)   Q-M6  ad-hoc store (decided)
+Q-M1  socketpair peer info (confirmed)   Q-M2  GUI session (addressed)         Q-M3  notification authorization (confirmed)
+Q-M4  permission kept on upgrade         Q-M5  bundle name, icon (settled)     Q-M6  ad-hoc store (decided)
 Q-M7  Homebrew (decided)                 Q-M8  LOCAL_PEERTOKEN (confirmed)     Q-M9  setgid non-member (confirmed)
 Q-M10 transport (XPC, decided)           Q-M11 SSH (no-console: deferred)      Q-M12 helper bundle (deferred)
-Q-M13 notifier merged into the helper bundle?
+Q-M13 one helper bundle (confirmed)
 ```
 
 - Q-M1 to Q-M5, Q-M12, Q-M13: [platform-helper §4, §11](platform-helper.md)
@@ -1079,7 +1079,7 @@ debug build (cfg(debug_assertions))  → profile "dev"        MAIRU_PROFILE=dev|
   agent socket       $XDG_RUNTIME_DIR/mairu/mairu-dev-agent.sock
   state directory    ~/.local/state/mairu-dev
   integrity records  name "policy-dev" in every store
-  notifier           co.0w0.mairu.dev.notifier
+  helper bundle      co.0w0.mairu.dev.platform-helper under ~/Library/Application Support/mairu-dev
   re-exec            off, as if MAIRU_NO_HARDENED_REEXEC=1
   configuration      shared: ~/.config/mairu (servers.d, policy files)
 ```
@@ -1115,10 +1115,10 @@ rebuild                           → new cdhash → the dev agent is replaced a
 
 - Plain `cargo build` output has no hardened-runtime flag, so it runs unhardened (§9.1).
 - `script/macos-dev-sign` re-signs a build ad-hoc with the hardened runtime. Processes from that build then verify each other by cdhash, through the same code path official builds use with a team requirement.
-- The notifier bundle is assembled from the dev binary and signed ad-hoc as `co.0w0.mairu.dev.notifier` ([platform-helper §11](platform-helper.md)). Its notification permission starts out denied and is turned on once in System Settings (Q-M3). It is keyed by bundle id, so it survives rebuilds (Q-M4).
+- The helper bundle is assembled from the dev binary and signed ad-hoc as `co.0w0.mairu.dev.platform-helper` ([platform-helper §11](platform-helper.md)). Its notification permission starts out denied and is turned on once in System Settings (Q-M3). It is keyed by bundle id, so it survives rebuilds (Q-M4).
 - Integrity stores: the weak legacy keychain store works in every build. The protected directory needs `sudo mairu harden`, best in a disposable VM as on Linux (§15.2). The data-protection keychain needs the project's provisioning profile, so only official builds have it.
 - LocalAuthentication works with ad-hoc binaries.
-- Not possible without the program: an official identity, notarization, team-requirement acceptance across versions, the minimum client and agent versions between signed versions, the embedded Developer ID notifier, and the helper bundle with its data-protection keychain. Maintainers cover these (§15.5).
+- Not possible without the program: an official identity, notarization, team-requirement acceptance across versions, the minimum client and agent versions between signed versions, and the embedded Developer ID helper bundle with its data-protection keychain. Maintainers cover these (§15.5).
 
 ### 15.4 Contributors with their own Developer ID
 
@@ -1133,14 +1133,14 @@ Their signed builds are the third-party tier (§9.1). They get full strength und
 ```text
 pull_request (forks included)    build + test on Linux and macOS, no secrets
   linux-hardened job             sudo harden in the runner; marker, re-exec, helper socketpair, polkit test rule
-  macos job                      macos-dev-sign; verification between two processes; notifier assembly (ad-hoc)
+  macos job                      macos-dev-sign; verification between two processes; helper bundle assembly (ad-hoc)
 push of a signed tag (upstream)  environment "release": Developer ID + notary key → §9.4
 release dry run (maintainers)    manual trigger on a branch: build, sign, notarize, no publish; same environment
-maintainer check (draft release) signed artifact: doctor, notifier, helper bundle store, minimum versions, upgrade keeps sessions
+maintainer check (draft release) signed artifact: doctor, helper bundle (notifications, keychain store), minimum versions, upgrade keeps sessions
 ```
 
 - Designated-requirement strings and minimum-version parsing are unit-tested, so the team-requirement logic is covered without signing.
-- Properties only an official build has are checked by a maintainer on the draft release before publishing it: acceptance of the previous release under the team requirement, the minimum versions, the embedded notifier, and the helper bundle reporting the data-protection keychain. The same step raises `minimum-client-version` for a client-side or protocol-level flaw, and `minimum-agent-version` for an agent-side or protocol-level flaw (§9.3). This is a checklist step in the `releng` skill (`.claude/skills/releng/SKILL.md`), between the release workflow and publishing.
+- Properties only an official build has are checked by a maintainer on the draft release before publishing it: acceptance of the previous release under the team requirement, the minimum versions, and the embedded helper bundle posting notifications and reporting the data-protection keychain. The same step raises `minimum-client-version` for a client-side or protocol-level flaw, and `minimum-agent-version` for an agent-side or protocol-level flaw (§9.3). This is a checklist step in the `releng` skill (`.claude/skills/releng/SKILL.md`), between the release workflow and publishing.
 - Pull requests that change the signing or notarization pipeline cannot exercise it from a fork, because forks never receive the secrets. A maintainer runs a **release dry run** on the PR's branch. It is a manually triggered workflow that builds, signs and notarizes without publishing, gated by the `release` environment's reviewers.
 
 ## Current Status
@@ -1163,11 +1163,11 @@ WSL2 (§8):
 
 macOS (separate implementation, §9):
 - [ ] Settle the open Q-M items (§9.9) and write them back here
-- [ ] With the first official build: the Developer ID notifier (Q-M3), the helper bundle (Q-M12 1–3), `sudo mairu harden` on a quarantined notarized binary (§9.5)
+- [ ] With the first official build: notifications from the Developer ID helper bundle (Q-M3), the helper bundle (Q-M12 1–3), `sudo mairu harden` on a quarantined notarized binary (§9.5)
 - [ ] XPC transport through the `co.0w0.mairu.agent` LaunchAgent: install, replace, message mapping (§9.2); settle Q-M11
 - [ ] Code-signature peer verification for every tier, on every message (§9.1, §9.2)
 - [ ] Embedded `Info.plist` with the minimum client and agent versions (§9.3)
-- [ ] Release pipeline: Developer ID signing, notarization, embedded notifier and helper bundle with its provisioning profile (§9.4)
+- [ ] Release pipeline: Developer ID signing, notarization, embedded helper bundle with its provisioning profile (§9.4)
 - [ ] `harden` on macOS for every tier: setgid copies, protected directory, LaunchAgent repointing (§9.5; Q-M9 confirmed)
 
 Development process (§15):
@@ -1208,3 +1208,4 @@ Future:
 - 2026-10-23: Q-M9 confirmed: a setgid exec by a non-member makes a restricted process on macOS, so the marker group carries over; ad-hoc re-signing is deterministic (§9.5).
 - 2026-10-23: Q-M11 confirmed from a real SSH session while a console login exists; the no-console case stays open (§9.2).
 - 2026-10-24: Deferred: Q-M11 without a console login (no Mac to test on; the client falls back to `user/<uid>`), and the official-build checks until the Developer ID is issued (§9.2, §9.5, §9.9).
+- 2026-10-24: One macOS helper bundle, which also posts notifications, replaces the separate notifier (Q-M13); `harden` writes it for every build (§9.4, §9.5, §9.8, §15).
