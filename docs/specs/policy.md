@@ -21,10 +21,18 @@ flowchart LR
   F -- "no" --> X["refuse:<br/>FORBIDDEN or NOT_PERMITTED"]
 ```
 
+Each credential request passes two gates, and each gate decides as above:
+
+```text
+gate 1  AssumeRole       before fetching   server, role (the account only when the role name has one)
+        ↓ credential server (+ sts:AssumeRole for chains) → sts:GetCallerIdentity, cached with the credentials
+gate 2  UseCredentials   before vending    the same, plus the real caller: account, ARN, …
+```
+
 The agent asks the human before vending credentials, and remembers the answer for a while. This spec defines:
 
 - when authorization applies (§2), and the session identity that answers are remembered against (§3)
-- grants per terminal session, leases per running `mairu exec`, and the decision procedure that consults the policy (§4)
+- grants per terminal session, leases per running `mairu exec`, and the decision procedure that consults the policy at both gates (§4)
 - tool detection, such as AI agents, as a guardrail (§5)
 - presence methods: the platform's own facility, and the key-based ssh-agent and Windows Hello methods (§6)
 - what the human sees (§7) and revocation (§8)
@@ -38,12 +46,13 @@ The threat model, terminology and the trust chain that bounds everything here ar
 ## 2. When authorization applies
 
 ```text
-AssumeRole       peer check → server + user config → AUTHORIZE → credential cache → vend
+AssumeRole       peer check → server + user config → GATE 1 → credential cache or server
+                 → caller identity → GATE 2 → vend
 ApprovePolicy    peer check → AUTHORIZE (always asks, never uses grants)
 ListRoles, ListSessions, GetServer, RefreshSession, login RPCs, ShutdownAgent → peer check only
 ```
 
-Authorization runs in `AssumeRole`, after the peer trust check and server/user-config loading, and **before** the credential cache lookup. `ApprovePolicy` always requires authorization (§9.9). `ListRoles`, `ListSessions`, `GetServer`, `RefreshSession`, the login RPCs and `ShutdownAgent` require only a trusted peer.
+Authorization runs twice in `AssumeRole` (§4). Gate 1 runs after the peer trust check and server/user-config loading, and **before** the credential cache lookup. Gate 2 runs once the credentials are in hand and their caller identity is known, **before** they are returned, whether they came from the cache or the server. `ApprovePolicy` always requires authorization (§9.9). `ListRoles`, `ListSessions`, `GetServer`, `RefreshSession`, the login RPCs and `ShutdownAgent` require only a trusted peer.
 
 ## 3. Session identity
 
@@ -142,6 +151,25 @@ All authorization state is in memory only. Restarting the agent forgets every gr
 **Fail closed on evaluation errors.** Cedar skips a policy whose evaluation errors, which would silently drop a `forbid`. Any candidate whose response carries errors is therefore treated as `Deny`, and the errors are logged. Strict validation (§9.9) keeps this from happening in practice.
 
 Concurrent requests with the same grant key wait on one platform prompt through the existing `crate::singleflight::Singleflight`. ssh-agent challenges are per request and are not coalesced.
+
+**Two gates.** Before fetching, the agent knows only the server and the role name. For a custom credential server, a role name can be opaque, and only the credentials themselves say which account they open. So the decision procedure runs twice:
+
+1. **Gate 1**, action `AssumeRole`: the procedure above, before the credential cache lookup. Nothing is fetched for a request it refuses, so refused requests leave no credentials, CloudTrail events or server audit entries behind.
+2. **Fetch** from the cache, or from the server, plus `sts:AssumeRole` for a chained role.
+3. **Caller identity.** `sts:GetCallerIdentity` with the final credentials, once per credential set. It needs no IAM permission and cannot be denied by policy. The result is cached with the credentials, in memory, so later vends from the cache need no network call. The endpoint is fixed by the agent (§9.5), never by the environment.
+4. **Gate 2**, action `UseCredentials`: the same procedure, with:
+   - the same principal and context, plus `context.caller` (§9.2);
+   - the same role entity, except that its `Account` parent is the caller's real account (§9.3);
+   - first, as an extra remembered candidate, the presence that gate 1 accepted for this request. A human check made at gate 1 therefore also counts at gate 2.
+
+   If gate 2 needs a fresh check, it asks exactly as gate 1 would: a challenge or a platform prompt. The prompt shows the real identity (§7). Credentials waiting on a gate-2 challenge are held with it, at most 60 s, so the retry fetches nothing again.
+5. **Vend**, or refuse with the reason from whichever gate refused. `AuthorizationError.gate` says which.
+
+Gate 2 also applies to every vend from the cache. Pre-fetches never ask at gate 2 either: they get `REASON_PRESENCE_REQUIRED`. A check at gate 2 records the lease and the grant as at gate 1, under the same keys.
+
+Two always-on built-ins apply at gate 2 whatever the policy state (§9.6): an open default, and a refusal when the role name declares an account and the credentials belong to another. If the caller identity cannot be obtained, gate 2 fails closed with `REASON_UNAVAILABLE`, and nothing is cached for it.
+
+Gate 2 is skipped only on an unhardened agent without an approved policy, where everything is permitted anyway (§9.6).
 
 ## 5. Tool detection (guardrail)
 
@@ -331,6 +359,8 @@ While waiting, the client prints context to its terminal through `crate::termina
 :: mairu :: Approve in the system dialog.             # or: enter your password below / approve on your SSH agent
 ```
 
+A prompt raised at gate 2 (§4) adds the identity the credentials really carry, for example `:: mairu ::   identity: 999999999999 assumed-role/Admin`.
+
 **macOS: requests from outside the console session.** The LocalAuthentication sheet always appears on the Mac's screen, whichever session asked ([platform-helper §11](platform-helper.md)). By default it is still offered for a requester outside the console's audit session, such as an SSH login (decided 2026-10-23):
 - The reason text names the origin, for example `requested from an SSH session: terraform apply`.
 - The client prints `Approve on the Mac's screen.`, so a remote user knows why nothing appears in the terminal.
@@ -343,6 +373,7 @@ The same keys go into polkit `details`:
 - `cwd`, `tty`
 - `requester`: peer exe path and pid
 - `intent`, `tools`
+- `caller`: the account and ARN, at gate 2 only
 
 ## 8. Revocation and marks: `mairu lock`
 
@@ -408,10 +439,11 @@ Mairu::User    "<uid>"
 Mairu::Server  "contoso"            ─┐
 Mairu::Account "123456789012"       ─┴─ parents of
 Mairu::Role    "contoso:123456789012/Admin"
-action AssumeRole
+action AssumeRole (gate 1), UseCredentials (gate 2)
   context.presence  {verified, scope: none|request|process|session, method?, age, idle}
   context.*         tools, tool_matches, session, tty?, hardened, wsl_interop?, console_session?,
-                    intent, exec_command?, exec_command_line?, cwd?, chained_role_arn?
+                    intent, exec_command?, exec_command_line?, cwd?, chained_role_arn?,
+                    caller? {account, arn, user_id, type, role_name?, session_name?}   gate 2 only
 ```
 
 ```cedarschema
@@ -454,7 +486,18 @@ namespace Mairu {
     idle: Long
   };
 
-  action AssumeRole appliesTo {
+  // The identity the credentials really carry, from sts:GetCallerIdentity (§4).
+  type Caller = {
+    account: String,
+    arn: String,
+    user_id: String,
+    // "assumed-role", "user", "federated-user", "root" or "other".
+    type: String,
+    role_name?: String,
+    session_name?: String
+  };
+  // AssumeRole is gate 1, before fetching; UseCredentials is gate 2, before vending (§4).
+  action AssumeRole, UseCredentials appliesTo {
     principal: [User],
     resource: [Role],
     context: {
@@ -476,7 +519,9 @@ namespace Mairu {
       exec_command?: String,
       exec_command_line?: String,
       cwd?: String,
-      chained_role_arn?: String
+      chained_role_arn?: String,
+      // Present exactly at gate 2.
+      caller?: Caller
     }
   };
 }
@@ -497,6 +542,7 @@ Reference for the context attributes:
 | `exec_command_line` | shell-escaped argv, truncated to 4 KiB | client, `exec` only |
 | `cwd` | absolute path | client |
 | `chained_role_arn` | ARN | client (`--assume-role`, `.mairu.json`) |
+| `caller` | from `sts:GetCallerIdentity`; `type` from the ARN; `role_name` and `session_name` for an assumed role | agent, gate 2 only (§4) |
 
 Cedar strings are UTF-8, so non-UTF-8 bytes in paths and argv are replaced with U+FFFD.
 
@@ -519,6 +565,7 @@ For each evaluation the agent builds:
   - `Mairu::Server::"<server id>"` (`url`)
   - `Mairu::Account::"<account id>"`, when the role names an account: an AWS SSO role `^\d{12}/`, or an `arn:aws:iam::\d{12}:role/` ARN.
 - **context**: as in the schema, with `presence` set per candidate (§4).
+- **At gate 2** (`UseCredentials`), the role's `Account` parent is the account in `context.caller`, the real one, while `resource.account_id` keeps the account the role name declares. So `resource in Mairu::Account::"…"` means the declared account at gate 1 and the real account at gate 2. A policy that leaves `action` unconstrained, such as `no-ai-prod` below, applies at both gates.
 
 `Request::new(…, Some(&schema))` and `Entities::from_json_value(…, Some(&schema))` check every request against the schema.
 
@@ -561,6 +608,16 @@ when {
 forbid (principal, action, resource in Mairu::Account::"999999999999")
 when { context.tools.contains("ai-agent") };
 
+// Production, whatever the role is called: credentials whose real account is production
+// need a fresh check through the SSH agent (gate 2). The opaque role names of a custom
+// server cannot say which account they open.
+@id("prod-by-real-account")
+forbid (principal, action == Mairu::Action::"UseCredentials", resource in Mairu::Account::"999999999999")
+unless {
+  context.presence.verified && context.presence.scope == "request" &&
+  context.presence has method && context.presence.method == "ssh-agent"
+};
+
 // macOS: never raise the Touch ID sheet on the console for a request from an SSH login.
 @id("no-console-sheet-from-ssh")
 forbid (principal, action == Mairu::Action::"AssumeRole", resource)
@@ -573,12 +630,12 @@ when {
 ### 9.4 Which context can be trusted
 
 ```text
-agent-determined   presence · hardened · wsl_interop · console_session · session · tty   → may grant
+agent-determined   presence · hardened · wsl_interop · console_session · session · tty · caller → may grant
 requester-chosen   intent · exec_command · cwd · chained_role_arn                         → narrow or forbid only
 guardrail          tools · tool_matches (names and marks anyone can produce or avoid)      → either, knowingly (§5)
 ```
 
-- **Determined by the agent**: `presence`, `hardened`, `wsl_interop`, `console_session`, `session` and `tty`. These cannot be influenced by the requester beyond actually being in that position.
+- **Determined by the agent**: `presence`, `hardened`, `wsl_interop`, `console_session`, `session`, `tty`, and `caller`, which comes from STS over TLS to an endpoint the agent fixes (§9.5). These cannot be influenced by the requester beyond actually being in that position.
 - **Reported by the client**: `intent`, `exec_command`, `exec_command_line`, `cwd` and `chained_role_arn`. A verified client reports them truthfully, but whoever runs `mairu` chooses them: same-user code can `cd` into any directory or exec any command. Use them to **narrow** a `permit` that also requires `context.presence.verified`, or in a `forbid`. Never rely on them alone to grant access.
 
 - **Guardrail**: `tools` and `tool_matches`. The agent collects them, but from process names, environment names and session marks that same-user code can produce or avoid (§5).
@@ -594,7 +651,8 @@ authorization.json
 ├── ssh_agent_keys     # any key type; its lock is your SSH agent's (§6.2)
 ├── windows_hello_keys
 ├── tool_detection     # labels and their process / env names (§5)
-└── grant_retention_secs
+├── grant_retention_secs
+└── sts                # how gate 2 reaches STS (§4)
 ```
 
 ```jsonc
@@ -621,7 +679,13 @@ authorization.json
     "ci": {"env_names": ["CI", "GITHUB_ACTIONS"]},
     "terraform": {"process_names": ["terraform", "tofu"]}
   },
-  "grant_retention_secs": 43200
+  "grant_retention_secs": 43200,
+  // How gate 2 reaches sts:GetCallerIdentity (§4). Default: the global endpoint, sts.amazonaws.com.
+  "sts": {
+    "region": "us-east-1",
+    "endpoint": "https://vpce-0123-abcd.sts.us-east-1.vpce.amazonaws.com",  // optional, https only
+    "servers": {"cn": {"region": "cn-north-1"}}  // per server, for other partitions
+  }
 }
 ```
 
@@ -629,6 +693,8 @@ authorization.json
 - Every field except `version` is optional.
 - Unknown fields are rejected, so a typo never silently weakens anything.
 - Tool labels are lowercase `[a-z0-9-]+`.
+- `sts` takes effect only from an approved file. An endpoint that answered `GetCallerIdentity` falsely could report any identity, so unapproved files fall back to the default.
+- For the gate-2 call, a hardened agent ignores the environment's endpoint and region overrides (`AWS_ENDPOINT_URL*`, `AWS_REGION`, `AWS_PROFILE` and the shared config files), and verifies TLS against the build's own roots. Under `AT_SECURE`, OpenSSL ignores `SSL_CERT_FILE` and `SSL_CERT_DIR` anyway.
 - Method names:
   - `"ssh-agent"` (§6.2) and `"windows-hello"` (§6.3), the key-based methods
   - `"platform"`, the platform's own facility: polkit on Linux, LocalAuthentication on macOS
@@ -646,6 +712,23 @@ no approved policy.cedar?
 ```
 
 Used when no approved `policy.cedar` exists. Ids starting with `builtin-` are reserved.
+
+**Always on**, added to every effective policy set (approved, unapproved, tampered or absent) wherever gate 2 runs (§4):
+
+```cedar
+// Gate 2 is open unless a forbid closes it. A forbid that a fresh human check would satisfy
+// makes the agent ask at gate 2.
+@id("builtin-use-credentials")
+permit (principal, action == Mairu::Action::"UseCredentials", resource);
+
+// Credentials for another account than the one the role name declares are never vended.
+@id("builtin-caller-account-mismatch")
+forbid (principal, action == Mairu::Action::"UseCredentials", resource)
+when {
+  resource has account_id && context has caller &&
+  resource.account_id != context.caller.account
+};
+```
 
 Hardened agent:
 
@@ -917,7 +1000,7 @@ message AuthorizationStatement {
   bytes agent_instance_id = 2;     // 16 random bytes chosen at agent start
   uint32 peer_pid = 3;
   uint64 peer_start_time = 4;
-  string action = 5;               // "assume-role" | "approve-policy"
+  string action = 5;               // "assume-role" | "use-credentials" | "approve-policy" | "unmark-tools"
   string server_id = 6;
   Rolespec rolespec = 7;
   bytes request_digest = 8;        // §4
@@ -952,6 +1035,8 @@ message AuthorizationError {
   AuthorizationChallenge challenge = 3;
   repeated string policy_ids = 4;        // @id of the determining forbid policies, for REASON_FORBIDDEN
   repeated string tools = 5;             // tool labels detected (§5)
+  string gate = 6;                       // "assume-role" (gate 1) or "use-credentials" (gate 2) (§4)
+  string caller_arn = 7;                 // gate 2: the identity the credentials carry
 }
 
 enum PolicyIntegrity {
@@ -1035,6 +1120,7 @@ Existing codes keep their meanings. In particular, `UNAUTHENTICATED` still means
 AI agent in your session          ! tools ∋ ai-agent → fresh check per request (built-ins)
 tool removing its own mark        ✗ unmarking always asks the human
 relaxing the policy by editing     ✗ unapproved files contribute forbids only
+a role name hiding the account     ✗ gate 2 checks the real caller identity
 downgrading approval to password   ✗ approval uses the stored anchor
 forbid skipped by an error         ✗ strict validation; errors count as Deny
 replayed or relayed signatures     ✗ single-use challenge bound to peer and request
@@ -1046,6 +1132,8 @@ replayed or relayed signatures     ✗ single-use challenge bound to peer and re
 | A marked tool removing its own mark | `UnmarkTools` always asks the human (§8) |
 | A `permit` that depends on a forgeable tool label | Documented as a guardrail (§5); `check` and `approve` list such permits (§9.4) |
 | Editing the policy to relax it | Integrity records; only `forbid` policies apply when unapproved; lockdown on tamper (§9.8) |
+| A server or role name that hides the real account | Gate 2 checks `sts:GetCallerIdentity`; built-in forbid when the declared and real accounts differ (§4, §9.6) |
+| A forged `GetCallerIdentity` answer through an endpoint override | Endpoint fixed by the agent; environment overrides ignored; `sts` taken only from approved settings; TLS (§9.5) |
 | Rolling back the policy | The protected directory keeps only the latest record (§9.8) |
 | Approval downgraded to a password by editing or tampering with `authorization.json` | Approval uses only the anchor in the last approved record (§9.7, §9.9) |
 | A `forbid` silently skipped because its evaluation errors | Strict schema validation; any evaluation error makes the candidate `Deny` (§4, §9.9) |
@@ -1079,7 +1167,7 @@ Layers of the stack in [hardening §14](hardening.md) that implement this spec:
 
 | Layer | Files |
 |---|---|
-| `hardening/authorization` | `src/authorization.rs` (grants, leases, decision procedure), `src/policy/{mod.rs,mairu.cedarschema,builtin/*.cedar}` (Cedar engine with built-in policies only), `proto/mairu.proto` (`ClientContext`, `AuthorizationError`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs` (auto-refresh marks `prefetch`), `src/ecs_server.rs`, `Cargo.toml` (`cedar-policy`), README (relaxing idle for tty-less callers) |
+| `hardening/authorization` | `src/authorization.rs` (grants, leases, decision procedure at both gates), `src/caller_identity.rs` (`GetCallerIdentity`, cached with the credentials), `src/policy/{mod.rs,mairu.cedarschema,builtin/*.cedar}` (Cedar engine with built-in policies only), `proto/mairu.proto` (`ClientContext`, `AuthorizationError`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs` (auto-refresh marks `prefetch`), `src/ecs_server.rs`, `Cargo.toml` (`cedar-policy`), README (relaxing idle for tty-less callers) |
 | `hardening/tool-detection` | `src/tool_detection.rs` (labels, signals, session marks), `src/authorization.rs`, `src/cmd/lock.rs` (`--tool`, `unlock`), `proto/mairu.proto` (`mark_tools`, `UnmarkTools`), client `env_names` |
 | `hardening/policy` | `src/policy/{files,integrity_state,settings}.rs` (user files, tighten-only and lockdown sets, approval anchor), `proto/mairu.proto` (`GetPolicy`, `ApprovePolicy`, `PingAgentResponse.policy_integrity`), `src/cmd/policy.rs` (`init`, `check`, `show`, `explain`, `schema`, `approve`) |
 | `hardening/ssh-agent` | `src/ssh_agent_presence.rs`, `proto/mairu.proto` (challenge messages), client relay, `Cargo.toml` (`ssh-key`, `ssh-encoding`) |
@@ -1093,6 +1181,7 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 
 - [ ] Cedar engine: schema, entities, built-in policies, fail-closed evaluation
 - [ ] `Authorizer`: grants, leases, singleflight, decision procedure (§4)
+- [ ] Gate 2: `GetCallerIdentity`, `UseCredentials`, always-on built-ins, `sts` settings, held credentials for gate-2 challenges
 - [ ] Agent RPCs: `ClientContext`, `AuthorizationError`, `GetPolicy`, `ApprovePolicy`, `RevokeAuthorizations`, `PingAgentResponse.policy_integrity`; `ResetPolicyRecord` with the macOS work
 - [ ] Tool detection: labels, signals, session marks; `mairu lock --tool`, `mairu unlock --tool`
 - [ ] Policy files: `policy.cedar` + `authorization.json`, integrity states, forbid-only when unapproved, lockdown
@@ -1114,3 +1203,4 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - 2026-10-23: Q-W2 confirmed: Windows Hello KeyCredential signatures are RSA-2048 PKCS #1 v1.5 with SHA-256; test vector recorded (§6.3).
 - 2026-10-23: Decided: on macOS, requests from outside the console's audit session may use the platform sheet by default, with the origin shown; `context.console_session` lets a policy forbid it (§7, §9.2–§9.4).
 - 2026-10-24: AI-agent detection generalized into labelled tool detection (`tool_detection`, `context.tools`); `ai-agent` is the built-in label; humans can mark a session with `mairu lock --tool`, and unmarking asks the human (§5, §7–§11).
+- 2026-10-24: Two gates: `AssumeRole` before fetching and `UseCredentials` before vending, with the real caller from `sts:GetCallerIdentity`; gate 2 runs the full decision procedure; always-on built-ins open gate 2 and refuse account mismatches; `sts` settings (§1, §2, §4, §7, §9.2–§9.6, §10, §11).
