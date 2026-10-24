@@ -246,6 +246,7 @@ message IntegrityRecord {
   bytes digest = 1;            // 32 bytes
   ApprovalAnchor approval = 2;
   uint64 generation = 3;       // orders the records of strong stores ([policy §9.8](policy.md))
+  map<string, bytes> server_digests = 4;  // server id → digest of its config ([policy §9.7](policy.md))
 }
 
 // Who may approve the next change: the approval_methods and their keys at the time of approval.

@@ -401,8 +401,9 @@ No authorization is required for any of these, since they only tighten. A label 
 ```text
 ~/.config/mairu/
 ├── policy.cedar          # permit / forbid                 ┐ one digest
-└── authorization.json    # methods, keys, AI names, …      ┘
-/var/lib/mairu/users/<uid>/policy.record   # digest + approval anchor (root-protected, authoritative)
+├── authorization.json    # methods, keys, tool labels, …   ┘
+└── servers.d/*.json      # credential servers               → one digest per server
+/var/lib/mairu/users/<uid>/policy.record   # digests + approval anchor (root-protected, authoritative)
 Secret Service item                         # same record (weak copy)
 ```
 
@@ -804,14 +805,17 @@ when {
 approve #1 (no record yet)   ask via platform        → record {digest₁, anchor: [ssh-agent, key A]}
 approve #2                   ask via anchor: key A   → record {digest₂, anchor from the new files}
 attacker edits files         anchor unchanged        → still needs key A
+attacker repoints a server   its digest differs      → that server is locked down
 every key lost               admin resets the record → anchor falls back to platform
 ```
 
 - **Digest**: `SHA-256("mairu.policy.v1\0" || part(policy.cedar) || part(authorization.json))`, where `part(f)` is `0x00` when the file is absent, and `0x01 || u64be(len) || bytes` otherwise.
-- **Record**: name `"policy"`, content `IntegrityRecord` ([platform-helper §3](platform-helper.md)): a **generation**, the digest, and the **approval anchor**, which holds the `approval_methods` and the corresponding registered keys from the approved `authorization.json`. Each approval writes a generation one higher than any strong store held, which orders records when strong stores disagree (§9.8). Stores serialize it as JSON:
+- **Server digest**, one per server in `servers.d`: `SHA-256("mairu.server.v1\0" || canonical JSON)` of the server config, sorted keys, no whitespace. Every field counts except `client_secret`, `client_expires_at`, `default_grant_type` and `local_port`, which are secret or operational. What counts is what decides where credentials come from: the server id, `url`, OAuth endpoints, client id and scopes, and the AWS SSO region and scopes.
+- **Record**: name `"policy"`, content `IntegrityRecord` ([platform-helper §3](platform-helper.md)): a **generation**, the digest, the **server digests**, and the **approval anchor**, which holds the `approval_methods` and the corresponding registered keys from the approved `authorization.json`. Each approval writes a generation one higher than any strong store held, which orders records when strong stores disagree (§9.8). Stores serialize it as JSON:
 
   ```json
   {"version": 1, "generation": 7, "digest": "<hex>",
+   "servers": {"contoso": "<hex>", "amc": "<hex>"},
    "approval": {"methods": ["ssh-agent"], "ssh_agent_keys": ["sk-ssh-ed25519@openssh.com AAAA..."], "windows_hello_keys": []}}
   ```
 
@@ -864,6 +868,19 @@ On Linux this means that hardened hosts are approved by the protected directory 
 
 An `APPROVED` policy that no longer validates against this binary's schema, for example after an upgrade, is treated as `UNAPPROVED`, and the user is warned to re-approve.
 
+**Servers.** Policies name servers by id, so a server's id must keep meaning the server that was approved. Otherwise same-user code could point an approved `dev` at the production credential server, and wait for the next routine `mairu login dev`. Each request's server has its own state:
+
+| Server state | When | Treated as |
+|---|---|---|
+| `APPROVED` | The record holds the server's id with a matching digest | the policy's own state |
+| `UNAPPROVED` | The record does not hold the id, for example a server just added with `setup-sso` | `UNAPPROVED` for that server's roles |
+| `CHANGED` | The record holds the id with another digest | `TAMPERED` for that server's roles: lockdown |
+
+- A request uses the stricter of the policy's state and its server's state, in the order `APPROVED` < `UNAPPROVED` < `TAMPERED`. With no record at all (`ABSENT`), the built-ins apply anyway.
+- The digest is taken from the server config captured in the session at login, which is what actually fetches credentials, not merely from the current file. After approving a change to a server, log in to it again. `mairu policy approve` warns when a session still holds a config other than the one being approved.
+- A changed server does not lock down the other servers.
+- The real account is still checked at gate 2 (§4), so rules written by account hold even for a server that was never approved.
+
 **Effective policy:**
 
 | State | Policies | Settings |
@@ -906,7 +923,7 @@ Policies without `@id` are shown as `policy.cedar#<n>`, and `check` warns about 
 
 - `mairu policy init [--force]`: writes the templates (§9.6).
 - `mairu policy check`: client-local, no agent involved. Validates both files, lists every policy (id, effect, scope), and flags any `permit` that applies without a human check (§9.4).
-- `mairu policy show`: from `GetPolicy`, prints the effective policies and settings, the integrity state, per-store statuses, and notes such as dropped policies.
+- `mairu policy show`: from `GetPolicy`, prints the effective policies and settings, the integrity state, per-store statuses, each server's state, and notes such as dropped policies.
 - `mairu policy explain <server> <role> [--assume-role ARN] [--tool LABEL]… [--intent exec|credential-process] [--cwd PATH] [--exec CMD]`:
   - Fetches the effective policy through `GetPolicy`.
   - Evaluates it locally for every candidate presence of §4: none, process lease, session grant at a given age and idle time, and fresh per method.
@@ -914,12 +931,12 @@ Policies without `@id` are shown as `policy.cedar#<n>`, and `check` warns about 
 - `mairu policy schema`: prints the schema.
 - `mairu policy reset-record` (macOS): the recovery below.
 - `mairu policy approve`:
-  1. The client runs `check`, prints both files and the summary, and computes the digest.
-  2. It sends `ApprovePolicy{expected_digest}`.
-  3. The agent re-reads both files. If the digest differs → `FAILED_PRECONDITION` ("policy changed while approving"). This binds approval to what the human saw.
+  1. The client runs `check`, prints both files, the summary and every server's counted fields, and computes the digest and the server digests.
+  2. It sends `ApprovePolicy{expected_digest, expected_server_digests}`.
+  3. The agent re-reads both files and `servers.d`. If any digest differs → `FAILED_PRECONDITION` ("policy changed while approving"). This binds approval to what the human saw.
   4. The agent validates them → `INVALID_ARGUMENT` on error.
   5. The agent asks the human with action `approve-policy`. This always asks and never uses grants. It uses only the methods and keys of the **approval anchor in force** (§9.8), never those of the files being approved or of the current effective settings. Before any approval, that anchor is `["platform"]`, which is how the first key registration is bootstrapped.
-  6. It records the new digest, with the new files' `approval_methods` and keys as the next anchor, into all available stores, and returns the per-store results.
+  6. It records the new digest and the current set of server digests, with the new files' `approval_methods` and keys as the next anchor, into all available stores, and returns the per-store results. Servers no longer in `servers.d` drop out of the record.
 
 **Recovery.** When every approval key is lost, an administrator removes the record from every strong store:
 - **Linux:** `sudo mairu harden --reset-policy-record --user <name>`.
@@ -1055,11 +1072,25 @@ message GetPolicyResponse {
   bytes digest = 4;                     // §9.7 digest of the files as read
   repeated mairu.platform.IntegrityStoreResult stores = 5;
   repeated string notes = 6;            // e.g. "dropped forbid policy.cedar#3: validation error …"
+  repeated ServerIntegrity servers = 7;
+}
+
+message ServerIntegrity {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_APPROVED = 1;
+    STATE_UNAPPROVED = 2;
+    STATE_CHANGED = 3;
+  }
+  string server_id = 1;
+  State state = 2;
+  bytes digest = 3;                     // of the config captured in the session, or of the file when not logged in
 }
 
 message ApprovePolicyRequest {
   bytes expected_digest = 1;
   ClientContext client_context = 2;     // only authorization_response and env_names are used
+  map<string, bytes> expected_server_digests = 3;   // server id → server digest (§9.7)
 }
 message ApprovePolicyResponse {
   PolicyIntegrity integrity = 1;
@@ -1121,6 +1152,7 @@ AI agent in your session          ! tools ∋ ai-agent → fresh check per reque
 tool removing its own mark        ✗ unmarking always asks the human
 relaxing the policy by editing     ✗ unapproved files contribute forbids only
 a role name hiding the account     ✗ gate 2 checks the real caller identity
+repointing a server id            ✗ per-server digests; a changed server is locked down
 downgrading approval to password   ✗ approval uses the stored anchor
 forbid skipped by an error         ✗ strict validation; errors count as Deny
 replayed or relayed signatures     ✗ single-use challenge bound to peer and request
@@ -1134,6 +1166,7 @@ replayed or relayed signatures     ✗ single-use challenge bound to peer and re
 | Editing the policy to relax it | Integrity records; only `forbid` policies apply when unapproved; lockdown on tamper (§9.8) |
 | A server or role name that hides the real account | Gate 2 checks `sts:GetCallerIdentity`; built-in forbid when the declared and real accounts differ (§4, §9.6) |
 | A forged `GetCallerIdentity` answer through an endpoint override | Endpoint fixed by the agent; environment overrides ignored; `sts` taken only from approved settings; TLS (§9.5) |
+| Pointing an approved server id at another credential server by editing `servers.d` | Per-server digests in the record; a changed server is locked down, a new one gets only built-ins and forbids; checked against the config captured at login (§9.7, §9.8) |
 | Rolling back the policy | The protected directory keeps only the latest record (§9.8) |
 | Approval downgraded to a password by editing or tampering with `authorization.json` | Approval uses only the anchor in the last approved record (§9.7, §9.9) |
 | A `forbid` silently skipped because its evaluation errors | Strict schema validation; any evaluation error makes the candidate `Deny` (§4, §9.9) |
@@ -1150,12 +1183,12 @@ Logging: authorization decisions go to the agent log at `info` (peer pid, sessio
 
 ```text
 in    decision procedure · Cedar policy · methods · integrity states · mairu policy / lock
-out   the platform facilities themselves · servers.d and trust-record integrity
+out   the platform facilities themselves · .mairu.json trust-record integrity
 ```
 
 **In scope:** §2–§10, plus the `mairu policy` and `mairu lock` commands. The Windows Hello helper needs a Windows host with WSL2 to verify; its questions are settled ([hardening §8.5](hardening.md)).
 
-**Out of scope:** the platform facilities themselves ([platform-helper.md](platform-helper.md)), and integrity for `servers.d` and `.mairu.json` trust records ([hardening §13](hardening.md)).
+**Out of scope:** the platform facilities themselves ([platform-helper.md](platform-helper.md)), and integrity for `.mairu.json` trust records ([hardening §13](hardening.md)).
 
 ## 13. Deliverables
 
@@ -1185,6 +1218,7 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - [ ] Agent RPCs: `ClientContext`, `AuthorizationError`, `GetPolicy`, `ApprovePolicy`, `RevokeAuthorizations`, `PingAgentResponse.policy_integrity`; `ResetPolicyRecord` with the macOS work
 - [ ] Tool detection: labels, signals, session marks; `mairu lock --tool`, `mairu unlock --tool`
 - [ ] Policy files: `policy.cedar` + `authorization.json`, integrity states, forbid-only when unapproved, lockdown
+- [ ] Per-server digests: server states, the stricter-state rule, approval of servers, `ServerIntegrity` in `GetPolicy`
 - [ ] Approval anchor in integrity records; recovery through `harden --reset-policy-record`
 - [ ] ssh-agent presence method
 - [ ] Windows Hello method and `mairu-windows-hello.exe` (Q-W2 and Q-W3 settled)
@@ -1204,3 +1238,4 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - 2026-10-23: Decided: on macOS, requests from outside the console's audit session may use the platform sheet by default, with the origin shown; `context.console_session` lets a policy forbid it (§7, §9.2–§9.4).
 - 2026-10-24: AI-agent detection generalized into labelled tool detection (`tool_detection`, `context.tools`); `ai-agent` is the built-in label; humans can mark a session with `mairu lock --tool`, and unmarking asks the human (§5, §7–§11).
 - 2026-10-24: Two gates: `AssumeRole` before fetching and `UseCredentials` before vending, with the real caller from `sts:GetCallerIdentity`; gate 2 runs the full decision procedure; always-on built-ins open gate 2 and refuse account mismatches; `sts` settings (§1, §2, §4, §7, §9.2–§9.6, §10, §11).
+- 2026-10-24: Per-server integrity: each server's identity fields are digested into the approved record; a new server is treated as unapproved and a changed one as tampered, for its own roles only (§9.1, §9.7–§9.9, §10, §11).

@@ -1023,7 +1023,7 @@ root via sudo / groups / WSL       ! out of scope, bounds everything; doctor war
 | Joining the marker group through a group password (`newgrp`, `sg`) | `harden` removes the password (§4.4). Peers whose real gid is the marker are rejected by the agent, clients and the platform helper (§5.1, §5.2). The password would also open the protected directory, which is why `harden` removes it rather than relying on the peer check. |
 | A binary setgid to some other group, or an inherited effective gid | The marker must come from this exec (`AT_SECURE`, `m != rgid`) and its group must be named `mairu`, and not be 0 or 65534 (§4.2) |
 | Hardlinked old hardened binaries | `fs.protected_hardlinks` warning; atomic replace (§3.1, §4.4) |
-| Environment injection into a hardened agent (`HOME`, `XDG_*`, `DBUS_*`) | Integrity keyed by uid ([policy §9.1](policy.md)); system bus pinned ([platform-helper §5](platform-helper.md)). `servers.d` is unprotected (future work, §13). |
+| Environment injection into a hardened agent (`HOME`, `XDG_*`, `DBUS_*`) | Integrity keyed by uid ([policy §9.1](policy.md)); system bus pinned ([platform-helper §5](platform-helper.md)). `servers.d` is covered by per-server digests in the integrity record ([policy §9.7, §9.8](policy.md)). |
 | Credentials after delivery to the user's command | Out of scope (§2.2) |
 
 Authorization-related threats are in [policy §11](policy.md), and helper- and backend-related ones in [platform-helper §12](platform-helper.md).
@@ -1060,7 +1060,7 @@ diagnose    mairu doctor
 
 ```text
 in    marker group · harden + re-exec · mutual verification · GetAgentStatus/doctor · WSL2 detection
-out   macOS implementation · WSL1 · BSD · TPM token wrapping · servers.d integrity · AUR/Homebrew
+out   macOS implementation · WSL1 · BSD · TPM token wrapping · .mairu.json integrity · AUR/Homebrew
 ```
 
 **In scope (Linux):** §3–§8 and §15, plus the `mairu harden` and `mairu doctor` commands. The WSL2 parts can be built on Linux; verifying §8.5 needs a Windows host with WSL2.
@@ -1070,7 +1070,7 @@ out   macOS implementation · WSL1 · BSD · TPM token wrapping · servers.d int
 - WSL1 hardening (§8)
 - BSD (§10)
 - Tokens wrapped by TPM or Secure Enclave and unwrapped only for use, plus a zeroizing global allocator (`zeroizing-alloc`) so HTTP client buffers are wiped too
-- Integrity for `servers.d` and `.mairu.json` trust records
+- Integrity for `.mairu.json` trust records
 - AUR and Homebrew packaging changes (separate repositories)
 
 ## 14. Deliverables and stack
@@ -1219,7 +1219,7 @@ BSD:
 
 Future:
 - [ ] TPM/Secure Enclave token wrapping and zeroizing allocator
-- [ ] `servers.d` and trust-record integrity
+- [ ] `.mairu.json` trust-record integrity
 - [ ] AUR and Homebrew packaging updates (Homebrew: cask `mairu` and formula `mairu-src`, §9.8)
 
 ### Updates
@@ -1250,3 +1250,4 @@ Future:
 - 2026-10-24: Marker gid taken from this exec's setgid grant (`AT_SECURE`, effective gid at startup), confirmed by reverse lookup, never 0 or 65534; group passwords removed by `harden`, and peers whose real gid is the marker rejected (§3.1, §4.2, §4.4, §5.1, §5.2, §11).
 - 2026-10-24: The harden suggestion repeats every hour by default (`harden_suggestion.interval_secs`; 0 for once per terminal session), unless disabled (§4.3).
 - 2026-10-24: The `hardening/ai-agents` layer becomes `hardening/tool-detection` (§14).
+- 2026-10-24: `servers.d` integrity moved into scope through per-server digests ([policy §9.7](policy.md)); `.mairu.json` trust records stay future work (§11, §13).
