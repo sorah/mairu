@@ -101,7 +101,7 @@ Credentials *after delivery* are also out of scope. Once `mairu exec` hands cred
 boundary   platform prompt / ssh-agent approval / Windows Hello
            + mutual verification (prompt contents are true)
            + policy integrity
-guardrail  AI-agent detection · disallow_roles · .mairu.json trust prompt
+guardrail  tool detection (AI agents …) · disallow_roles · .mairu.json trust prompt
 ```
 
 - **Boundary**:
@@ -109,7 +109,7 @@ guardrail  AI-agent detection · disallow_roles · .mairu.json trust prompt
   - The mutual verification that makes the prompt's contents truthful: a genuine client reports what it will actually do with the credentials.
   - Integrity of the policy that decides when to prompt.
 - **Guardrails**, best-effort and never relied on alone:
-  - AI-agent detection ([policy §5](policy.md))
+  - tool detection, such as AI agents ([policy §5](policy.md))
   - `disallow_roles` in `config.json`
   - the `.mairu.json` trust prompt
 
@@ -589,7 +589,8 @@ message PeerView {
   uint32 pid = 2;
   uint64 start_time = 3;
   string session = 4;                   // e.g. "tty sid=4242 /dev/pts/3", "parent pid=777", "none"
-  repeated string ai_agent_signals = 5; // e.g. "ancestor comm=claude", "env AI_AGENT"
+  repeated string tools = 5;            // tool labels, e.g. "ai-agent"
+  repeated string tool_matches = 6;     // e.g. "process:claude", "env:AI_AGENT", "mark:ai-agent"
 }
 ```
 
@@ -1076,7 +1077,7 @@ out   macOS implementation · WSL1 · BSD · TPM token wrapping · servers.d int
 
 ```text
 (main) ← spec ← marker-gid ← peer-verification ← install ← platform-helper ← authorization
-       ← headless ← ai-agents ← policy ← ssh-agent ← wsl ← notify
+       ← headless ← tool-detection ← policy ← ssh-agent ← wsl ← notify
 ```
 
 The three specs are delivered together as one `gh stack`, one PR per layer, in this order. Each layer updates `README.md`, `CHANGELOG.md` (`[not yet released]`) and the Current Status of every spec it implements. The dev profile (§15.1) lands with `hardening/peer-verification`, and the linux-hardened CI job (§15.5) with `hardening/install`. The macOS work (§9, §15.3–§15.5) plans its own layers.
@@ -1090,7 +1091,7 @@ The three specs are delivered together as one `gh stack`, one PR per layer, in t
 | `hardening/platform-helper` | platform-helper | `src/platform/helper.rs` (`HelperClient`, spawn, respawn), `src/cmd/platform_helper.rs` (hidden `mairu platform-helper --fd`), `src/platform/services/{mod,fallback}.rs`, agent startup wiring |
 | `hardening/authorization` | policy, platform-helper | `src/authorization.rs`, `src/policy/{mod.rs,mairu.cedarschema,builtin/*.cedar}`, `src/platform/services/linux/polkit.rs`, `pkg/polkit/co.0w0.mairu.policy`, `proto/mairu.proto` (`ClientContext`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs`, `src/ecs_server.rs`, `Cargo.toml` (`cedar-policy`, `zbus`, `zbus_polkit`, deb asset) |
 | `hardening/headless` | platform-helper | `src/polkit_tty_agent.rs`, client retry paths, `src/cmd/doctor.rs` |
-| `hardening/ai-agents` | policy | `src/authorization.rs` (signals), `src/platform/process/linux/procfs.rs` (ancestry), client `env_names` |
+| `hardening/tool-detection` | policy | `src/tool_detection.rs` (labels, signals, session marks), `src/platform/process/linux/procfs.rs` (ancestry, session ids), `src/cmd/lock.rs` (`--tool`, `unlock`), client `env_names` |
 | `hardening/policy` | policy, platform-helper | `src/policy/{files,integrity_state,settings}.rs`, `src/platform/services/linux/integrity.rs`, `proto/mairu.proto` (`GetPolicy`, `ApprovePolicy`), `src/cmd/policy.rs`, `Cargo.toml` (Secret Service crate) |
 | `hardening/ssh-agent` | policy | `src/ssh_agent_presence.rs`, `proto/mairu.proto` (challenge messages), client relay, `Cargo.toml` (`ssh-key`, `ssh-encoding`) |
 | `hardening/wsl` | hardening, policy, platform-helper | `src/platform/process/linux/wsl.rs` (detection, `wsl_interop`), `src/platform/services/linux/wsl.rs` (Windows-side `open_url`), `src/windows_hello.rs`, `windows-hello-helper/`, `src/cmd/policy.rs` (`enroll-windows-hello`), `proto/mairu.proto` (`windows_hello_signature`), `.github/workflows/release.yml`, README WSL2 guide |
@@ -1248,3 +1249,4 @@ Future:
 - 2026-10-24: One macOS helper bundle, which also posts notifications, replaces the separate notifier (Q-M13); `harden` writes it for every build (§9.4, §9.5, §9.8, §15).
 - 2026-10-24: Marker gid taken from this exec's setgid grant (`AT_SECURE`, effective gid at startup), confirmed by reverse lookup, never 0 or 65534; group passwords removed by `harden`, and peers whose real gid is the marker rejected (§3.1, §4.2, §4.4, §5.1, §5.2, §11).
 - 2026-10-24: The harden suggestion repeats every hour by default (`harden_suggestion.interval_secs`; 0 for once per terminal session), unless disabled (§4.3).
+- 2026-10-24: The `hardening/ai-agents` layer becomes `hardening/tool-detection` (§14).

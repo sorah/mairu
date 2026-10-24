@@ -193,7 +193,7 @@ message AuthorizeRequest {
   Process subject = 2;
   // One line, shown where the facility allows a custom reason.
   string message = 3;
-  // Keys: server, role, command, cwd, tty, requester, intent, ai_agent, policy_digest.
+  // Keys: server, role, command, cwd, tty, requester, intent, tools, policy_digest.
   map<string, string> details = 4;
 }
 
@@ -515,7 +515,7 @@ Emission always happens in a client, never on the agent's own initiative, so eve
 |---|---|---|
 | Open the authorize URL (`verification_uri_complete` for the device code grant) | `mairu login`, including the login inside `mairu exec` | once per login |
 | Login required | `mairu exec` sidecar (ECS backend and auto-refresh) when the agent returns `UNAUTHENTICATED` | once per server per 10 min |
-| AI-agent request refused | The client that receives `REASON_FORBIDDEN` or `REASON_NOT_PERMITTED` with `ai_agent = true` | once per (server, rolespec) per minute |
+| AI-agent request refused | The client that receives `REASON_FORBIDDEN` or `REASON_NOT_PERMITTED` whose `tools` include `ai-agent` | once per (server, rolespec) per minute |
 | Policy lockdown | Any client whose `PingAgent` reports `POLICY_INTEGRITY_TAMPERED` ([policy §10](policy.md)) | once per agent instance |
 
 Rate-limit state is best-effort: one file per event key under `runtime_dir()/notified/`, compared by mtime.
@@ -805,7 +805,7 @@ On macOS the platform helper always runs from an app bundle, `Mairu Helper.app` 
      - The icon is `pkg/macos/mairu.icns` (`CFBundleIconFile`). Without one, the row shows a blank icon.
      - Cleanup is as in the block above. Each bundle directory's mtime is touched on every spawn.
 4. **Open URL.** `NSWorkspace` or `/usr/bin/open`, in the user's GUI session.
-5. **AI-agent ancestry** ([policy §5](policy.md)). The same rules, using `proc_pidinfo` (process facts in [hardening §9.6](hardening.md)). This is a process primitive in the agent, not a helper service.
+5. **Tool-detection ancestry and session ids** ([policy §5](policy.md)). The same rules, using `proc_pidinfo` (process facts in [hardening §9.6](hardening.md)). This is a process primitive in the agent, not a helper service.
 
 ## 12. Security considerations
 

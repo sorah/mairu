@@ -25,7 +25,7 @@ The agent asks the human before vending credentials, and remembers the answer fo
 
 - when authorization applies (§2), and the session identity that answers are remembered against (§3)
 - grants per terminal session, leases per running `mairu exec`, and the decision procedure that consults the policy (§4)
-- AI-agent detection as a guardrail (§5)
+- tool detection, such as AI agents, as a guardrail (§5)
 - presence methods: the platform's own facility, and the key-based ssh-agent and Windows Hello methods (§6)
 - what the human sees (§7) and revocation (§8)
 - the Cedar policy, its settings, built-ins, integrity records, approval anchor and commands (§9)
@@ -72,7 +72,7 @@ SessionIdentity =
 ```text
 authorize(request)
   disallow_roles matches                                → FORBIDDEN
-  ctx = principal, resource, context(ai_agent, session, intent, cwd, …)
+  ctx = principal, resource, context(tools, session, intent, cwd, …)
   for presence in [none, lease, grant]                  # what is remembered
     cedar(ctx + presence) == Allow                      → allow (touch grant)
   for m in methods                                      # what could be asked
@@ -110,7 +110,7 @@ All authorization state is in memory only. Restarting the agent forgets every gr
 **Decision procedure** (`src/authorization.rs`, `Authorizer::authorize_assume_role`):
 
 1. `UserConfig::is_role_disallowed` (existing `disallow_roles`) → `REASON_FORBIDDEN`. This check stays outside Cedar and behaves as today.
-2. Build the Cedar request (§9.3): principal, action, resource entities, and the base context including AI signals (§5).
+2. Build the Cedar request (§9.3): principal, action, resource entities, and the base context including tool labels (§5).
 3. Evaluate the effective policy set (§9.8) with each **remembered presence** in turn. The first candidate that is `Allow` permits the request; for a grant, also touch `last_used`.
 
    | Candidate | `presence` |
@@ -137,29 +137,41 @@ All authorization state is in memory only. Restarting the agent forgets every gr
    - If any evaluation in steps 3–4 was `Deny` with a `forbid` among its determining policies → `REASON_FORBIDDEN`, listing those policy ids.
    - Otherwise → `REASON_NOT_PERMITTED`: no `permit` applies, even after a human check.
 
-   `AuthorizationError.ai_agent` is set when AI signals were present.
+   `AuthorizationError.tools` lists the tool labels detected (§5).
 
 **Fail closed on evaluation errors.** Cedar skips a policy whose evaluation errors, which would silently drop a `forbid`. Any candidate whose response carries errors is therefore treated as `Deny`, and the errors are logged. Strict validation (§9.9) keeps this from happening in practice.
 
 Concurrent requests with the same grant key wait on one platform prompt through the existing `crate::singleflight::Singleflight`. ssh-agent challenges are per request and are not coalesced.
 
-## 5. AI-agent detection (guardrail)
+## 5. Tool detection (guardrail)
 
 ```text
 peer: aws → mairu credential-process
-└── ancestors: zsh ← claude ← tmux ← …        comm / exe / argv0 / argv1 ∈ process_names → ai_agent
-client env names ∩ env_names (AI_AGENT, CLAUDECODE, …)                              → ai_agent
-signals only add caution; the prompt stays the boundary
+└── ancestors: zsh ← claude ← tmux ← …    comm / exe / argv0 / argv1 ∈ a label's process_names → label
+client env names ∩ a label's env_names                                                  → label
+an ancestor in a session marked with `mairu lock --tool <label>`                        → label
+context.tools = {"ai-agent", …}   context.tool_matches = {"process:claude", "env:CI", "mark:ai-agent", …}
 ```
 
-Signals, all positive-only (they can add caution, never remove it):
+Detection attaches **labels** to a request, each with its own signals. `ai-agent` ships with built-in signals, and the built-in policies (§9.6) use it. Other labels come from `tool_detection` in `authorization.json` (§9.5), such as `ci` or `terraform`.
 
-- **Ancestry.** Walk from the peer up through `ppid`, stopping at pid 1, at a uid change, or after 64 hops. Match each ancestor's `comm`, `exe` basename, `argv[0]` basename and `argv[1]` basename (interpreters such as `node script`) exactly against `process_names` (built-ins plus `ai_agent_detection.process_names`, §9.5). The built-in default is `["claude", "codex", "gemini", "cursor-agent", "aider", "opencode", "goose", "amp", "crush", "qwen", "copilot"]`; recheck it against current agents during implementation.
-- **Environment names.** The client sends the names (never values) of its environment variables. They are matched against `env_names`. The built-in default is `["AI_AGENT", "CLAUDECODE", "GEMINI_CLI", "CODEX_SANDBOX"]`; `AI_AGENT` and `CLAUDECODE` were observed in Claude Code's tool environment, and the rest need verifying. The agent cannot read `/proc/<pid>/environ` of a hardened (non-dumpable) peer, so the genuine client reports them. Same-user code can only *add* markers, by launching mairu with them, which only makes things stricter.
+Signals, all positive-only (they can add a label, never remove one):
 
-The result is `context.ai_agent` and `context.ai_agent_names` (§9.2). What happens to AI-agent requests is up to the policy; the built-in policy (§9.6) requires a human check for every new AI-agent request and never lets AI agents reuse session grants.
+- **Ancestry.** Walk from the peer up through `ppid`, stopping at pid 1, at a uid change, or after 64 hops. Match each ancestor's `comm`, `exe` basename, `argv[0]` basename and `argv[1]` basename (interpreters such as `node script`) exactly against each label's `process_names`. The built-in `ai-agent` list is `["claude", "codex", "gemini", "cursor-agent", "aider", "opencode", "goose", "amp", "crush", "qwen", "copilot"]`; recheck it against current agents during implementation.
+- **Environment names.** The client sends the names (never values) of its environment variables. They are matched against each label's `env_names`. The built-in `ai-agent` list is `["AI_AGENT", "CLAUDECODE", "GEMINI_CLI", "CODEX_SANDBOX"]`; `AI_AGENT` and `CLAUDECODE` were observed in Claude Code's tool environment, and the rest need verifying. The agent cannot read `/proc/<pid>/environ` of a hardened (non-dumpable) peer, so the genuine client reports them.
+- **Session marks.** A human runs `mairu lock --tool <label>` (§8) in a terminal before starting a tool there.
+  - The agent records the label against that terminal session (§3): the session id and its leader's start time.
+  - A request carries the label when any process in its ancestry belongs to a marked session. This covers commands that an AI tool runs in a fresh session with no tty, as long as their ancestry passes through the marked terminal.
+  - A mark lasts until that session ends. Removing it earlier asks the human (§8), since the marked tool could otherwise remove it itself.
 
-Evasion is possible (`setsid` + double fork, `systemd-run --user`, a renamed binary), which is why this is a guardrail: the authorization prompt remains the boundary. Detected signals appear in the prompt details (`ai_agent=…`) and in `doctor`.
+The result is `context.tools`, the set of labels, and `context.tool_matches`, what matched, prefixed `process:`, `env:` or `mark:` (§9.2). What happens to a labelled request is up to the policy. The built-in policy requires a human check for every new `ai-agent` request, and never lets such requests reuse session grants.
+
+**This is a guardrail.**
+- Labels can be evaded: `setsid` plus a double fork, `systemd-run --user`, or a renamed binary.
+- They can also be forged: any program can call itself `terraform` or set `CI=1`, and same-user code can mark a session.
+- Policies may still use labels both to restrict and to grant, knowing this. The authorization prompt remains the boundary.
+- `mairu policy check` lists every `permit` that depends on a label, next to those that need no human check (§9.4).
+- Detected labels appear in the prompt details and in `doctor`.
 
 ## 6. Presence methods
 
@@ -306,7 +318,7 @@ On WSL2 with interop enabled, the root path in [hardening §8](hardening.md) dom
 
 ```text
 ClientContext + peer facts ──► terminal lines (§7 sample)
-                           └─► polkit details: server, role, command, cwd, tty, requester, intent, ai_agent
+                           └─► polkit details: server, role, command, cwd, tty, requester, intent, tools
 ```
 
 While waiting, the client prints context to its terminal through `crate::terminal` (the existing `/dev/tty`-or-stderr writer):
@@ -315,7 +327,7 @@ While waiting, the client prints context to its terminal through `crate::termina
 :: mairu :: Authorization required: 123456789012/Admin on contoso
 :: mairu ::   command: terraform apply
 :: mairu ::   cwd:     /home/u/src/infra
-:: mairu ::   from:    /dev/pts/3 (zsh, tmux pane)   ai-agent: claude (ancestor)
+:: mairu ::   from:    /dev/pts/3 (zsh, tmux pane)   tools: ai-agent (process:claude)
 :: mairu :: Approve in the system dialog.             # or: enter your password below / approve on your SSH agent
 ```
 
@@ -330,23 +342,28 @@ The same keys go into polkit `details`:
 - `command`: shell-escaped, truncated to 512 bytes
 - `cwd`, `tty`
 - `requester`: peer exe path and pid
-- `intent`, `ai_agent`
+- `intent`, `tools`
 
-## 8. Revocation: `mairu lock`
+## 8. Revocation and marks: `mairu lock`
 
 ```text
-mairu lock              drop all grants and pending challenges
-mairu lock --session    drop grants of my terminal session only
-mairu lock --running    also drop leases: running `mairu exec` asks again on next refresh
+mairu lock                  drop all grants and pending challenges
+mairu lock --session        drop grants of my terminal session only
+mairu lock --running        also drop leases: running `mairu exec` asks again on next refresh
+mairu lock --tool <label>   drop my session's grants, and mark my session as that tool (§5)
+mairu unlock --tool <label> remove the mark from my session: asks the human
 ```
 
 `mairu lock` sends `RevokeAuthorizations{SCOPE_ALL}`.
 
 - `--session` limits it to the caller's session identity.
 - `--running` also revokes leases, so running `mairu exec` processes prompt again on their next refresh.
+- `--tool <label>` (repeatable) implies `--session`, and adds `mark_tools`. It needs a terminal session: with no tty there is nothing lasting to mark, and the command fails with guidance.
 - Outstanding ssh-agent challenges are always dropped.
 
-No authorization is required, since this only tightens.
+No authorization is required for any of these, since they only tighten. A label used to grant in a policy is the exception: marking then relaxes, which is part of why labels are a guardrail (§5).
+
+`mairu unlock --tool <label>` sends `UnmarkTools`. Removing a mark relaxes the guardrail, and the marked tool itself could run it, so the agent always asks the human, as for `ApprovePolicy`. It uses the effective `methods` (§9.5) and never a grant. The prompt names the session and the labels being removed.
 
 ## 9. Protected policy (Cedar)
 
@@ -393,7 +410,7 @@ Mairu::Account "123456789012"       ─┴─ parents of
 Mairu::Role    "contoso:123456789012/Admin"
 action AssumeRole
   context.presence  {verified, scope: none|request|process|session, method?, age, idle}
-  context.*         ai_agent, ai_agent_names, session, tty?, hardened, wsl_interop?, console_session?,
+  context.*         tools, tool_matches, session, tty?, hardened, wsl_interop?, console_session?,
                     intent, exec_command?, exec_command_line?, cwd?, chained_role_arn?
 ```
 
@@ -442,9 +459,9 @@ namespace Mairu {
     resource: [Role],
     context: {
       presence: Presence,
-      // AI-agent signals (§5).
-      ai_agent: Bool,
-      ai_agent_names: Set<String>,
+      // Tool labels, such as "ai-agent", and what matched (§5).
+      tools: Set<String>,
+      tool_matches: Set<String>,
       // "tty", "parent" or "none" (§3); tty is the device path when "tty".
       session: String,
       tty?: String,
@@ -470,7 +487,7 @@ Reference for the context attributes:
 | Attribute | Values | Source |
 |---|---|---|
 | `presence.*` | as commented | agent (§4) |
-| `ai_agent`, `ai_agent_names` | names that matched | agent ancestry + client env names |
+| `tools`, `tool_matches` | labels; matches prefixed `process:`, `env:` or `mark:` | agent (ancestry, session marks) + client (env names) |
 | `session`, `tty` | `"tty"` `"parent"` `"none"`, `/dev/pts/N` | agent, from the kernel |
 | `hardened` | | agent |
 | `wsl_interop` | present only on WSL2 | agent ([hardening §8](hardening.md)) |
@@ -533,7 +550,7 @@ permit (
 @id("contoso-session")
 permit (principal, action == Mairu::Action::"AssumeRole", resource in Mairu::Server::"contoso")
 when {
-  !context.ai_agent &&
+  !context.tools.contains("ai-agent") &&
   context.presence.verified &&
   context.presence.idle <= 900 &&
   context.presence.age <= 28800
@@ -542,7 +559,7 @@ when {
 // Never hand production to AI agents, on any server.
 @id("no-ai-prod")
 forbid (principal, action, resource in Mairu::Account::"999999999999")
-when { context.ai_agent };
+when { context.tools.contains("ai-agent") };
 
 // macOS: never raise the Touch ID sheet on the console for a request from an SSH login.
 @id("no-console-sheet-from-ssh")
@@ -556,14 +573,17 @@ when {
 ### 9.4 Which context can be trusted
 
 ```text
-agent-determined   presence · hardened · wsl_interop · console_session · session · tty · ai ancestry  → may grant
-requester-chosen   intent · exec_command · cwd · chained_role_arn · env names      → narrow or forbid only
+agent-determined   presence · hardened · wsl_interop · console_session · session · tty   → may grant
+requester-chosen   intent · exec_command · cwd · chained_role_arn                         → narrow or forbid only
+guardrail          tools · tool_matches (names and marks anyone can produce or avoid)      → either, knowingly (§5)
 ```
 
-- **Determined by the agent**: `presence`, `hardened`, `wsl_interop`, `console_session`, `session`, `tty`, and the ancestry half of `ai_agent`. These cannot be influenced by the requester beyond actually being in that position.
-- **Reported by the client**: `intent`, `exec_command`, `exec_command_line`, `cwd`, `chained_role_arn`, and the environment half of `ai_agent`. A verified client reports them truthfully, but whoever runs `mairu` chooses them: same-user code can `cd` into any directory or exec any command. Use them to **narrow** a `permit` that also requires `context.presence.verified`, or in a `forbid`. Never rely on them alone to grant access.
+- **Determined by the agent**: `presence`, `hardened`, `wsl_interop`, `console_session`, `session` and `tty`. These cannot be influenced by the requester beyond actually being in that position.
+- **Reported by the client**: `intent`, `exec_command`, `exec_command_line`, `cwd` and `chained_role_arn`. A verified client reports them truthfully, but whoever runs `mairu` chooses them: same-user code can `cd` into any directory or exec any command. Use them to **narrow** a `permit` that also requires `context.presence.verified`, or in a `forbid`. Never rely on them alone to grant access.
 
-`mairu policy check` and `mairu policy approve` list every `permit` that can apply without a human check, so these are always visible at approval time.
+- **Guardrail**: `tools` and `tool_matches`. The agent collects them, but from process names, environment names and session marks that same-user code can produce or avoid (§5).
+
+`mairu policy check` and `mairu policy approve` list every `permit` that can apply without a human check, and every `permit` that depends on a tool label, so these are always visible at approval time.
 
 ### 9.5 Settings (`authorization.json`)
 
@@ -573,7 +593,7 @@ authorization.json
 ├── approval_methods   # who may approve the next change → becomes the approval anchor
 ├── ssh_agent_keys     # any key type; its lock is your SSH agent's (§6.2)
 ├── windows_hello_keys
-├── ai_agent_detection # extra process / env names
+├── tool_detection     # labels and their process / env names (§5)
 └── grant_retention_secs
 ```
 
@@ -595,9 +615,11 @@ authorization.json
     // base64 SubjectPublicKeyInfo (§6.3)
     {"name": "desktop", "public_key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA..."}
   ],
-  "ai_agent_detection": {
-    "process_names": ["my-agent"],    // added to the built-in list (§5)
-    "env_names": ["MY_AGENT_ACTIVE"]  // added to the built-in list (§5)
+  "tool_detection": {
+    // Each key is a label in context.tools (§5). "ai-agent" extends the built-in lists.
+    "ai-agent": {"process_names": ["my-agent"], "env_names": ["MY_AGENT_ACTIVE"]},
+    "ci": {"env_names": ["CI", "GITHUB_ACTIONS"]},
+    "terraform": {"process_names": ["terraform", "tofu"]}
   },
   "grant_retention_secs": 43200
 }
@@ -606,6 +628,7 @@ authorization.json
 - The file is plain JSON; the comments are for documentation only.
 - Every field except `version` is optional.
 - Unknown fields are rejected, so a typo never silently weakens anything.
+- Tool labels are lowercase `[a-z0-9-]+`.
 - Method names:
   - `"ssh-agent"` (§6.2) and `"windows-hello"` (§6.3), the key-based methods
   - `"platform"`, the platform's own facility: polkit on Linux, LocalAuthentication on macOS
@@ -632,7 +655,7 @@ Hardened agent:
 @id("builtin-human")
 permit (principal, action == Mairu::Action::"AssumeRole", resource)
 when {
-  !context.ai_agent &&
+  !context.tools.contains("ai-agent") &&
   context.presence.verified &&
   (context.presence.scope != "session" ||
    (context.presence.idle <= 300 && context.presence.age <= 43200)) &&
@@ -644,7 +667,7 @@ when {
 @id("builtin-ai-agent-per-request")
 permit (principal, action == Mairu::Action::"AssumeRole", resource)
 when {
-  context.ai_agent &&
+  context.tools.contains("ai-agent") &&
   context.presence.verified &&
   (context.presence.scope == "request" ||
    (context.presence.scope == "process" && context.presence.idle <= 3600))
@@ -671,7 +694,7 @@ when {
 
 @id("builtin-lockdown-no-ai")
 forbid (principal, action, resource)
-when { context.ai_agent };
+when { context.tools.contains("ai-agent") };
 ```
 
 `mairu policy init` writes the hardened built-in policies, with explanatory comments, into `policy.cedar`, plus a minimal `authorization.json`. The user then edits and approves them.
@@ -683,7 +706,7 @@ Callers without a tty, such as IDEs running `credential-process`, have `session 
 @id("tty-less-callers-1h-idle")
 permit (principal, action == Mairu::Action::"AssumeRole", resource)
 when {
-  !context.ai_agent &&
+  !context.tools.contains("ai-agent") &&
   context.presence.verified &&
   context.session == "parent" &&
   context.presence.scope == "session" &&
@@ -764,7 +787,7 @@ An `APPROVED` policy that no longer validates against this binary's schema, for 
 |---|---|---|
 | `ABSENT` | Built-ins for the hardening state | Defaults |
 | `APPROVED` | `policy.cedar`, or the built-ins when only `authorization.json` exists | `authorization.json` |
-| `UNAPPROVED` | Built-ins **plus only the `forbid` policies** of `policy.cedar`. Adding a `forbid` can only remove permissions, so unapproved content can only tighten. `permit` policies are ignored. If the file does not parse it is ignored, and `forbid` policies that fail validation are dropped one by one. | Defaults, plus `ai_agent_detection` additions and a smaller `grant_retention_secs` (both tighten). `methods` and keys in the file are ignored, since registering a key relaxes. Key-based methods use only the keys of the approval anchor in force (§9.8), followed by `"platform"`. |
+| `UNAPPROVED` | Built-ins **plus only the `forbid` policies** of `policy.cedar`. Adding a `forbid` can only remove permissions, so unapproved content can only tighten. `permit` policies are ignored. If the file does not parse it is ignored, and `forbid` policies that fail validation are dropped one by one. | Defaults, plus `tool_detection` additions and a smaller `grant_retention_secs` (which tighten, or only add guardrail labels). `methods` and keys in the file are ignored, since registering a key relaxes. Key-based methods use only the keys of the approval anchor in force (§9.8), followed by `"platform"`. |
 | `TAMPERED` | **Lockdown**: lockdown built-ins plus the file's `forbid` policies (same rules as `UNAPPROVED`) | As `UNAPPROVED`: the keys in the file are not trusted, but the anchored keys are. `doctor` and every client print a warning, and clients emit the lockdown notification ([platform-helper §8.1](platform-helper.md)). |
 
 Verification runs:
@@ -801,7 +824,7 @@ Policies without `@id` are shown as `policy.cedar#<n>`, and `check` warns about 
 - `mairu policy init [--force]`: writes the templates (§9.6).
 - `mairu policy check`: client-local, no agent involved. Validates both files, lists every policy (id, effect, scope), and flags any `permit` that applies without a human check (§9.4).
 - `mairu policy show`: from `GetPolicy`, prints the effective policies and settings, the integrity state, per-store statuses, and notes such as dropped policies.
-- `mairu policy explain <server> <role> [--assume-role ARN] [--ai-agent] [--intent exec|credential-process] [--cwd PATH] [--exec CMD]`:
+- `mairu policy explain <server> <role> [--assume-role ARN] [--tool LABEL]… [--intent exec|credential-process] [--cwd PATH] [--exec CMD]`:
   - Fetches the effective policy through `GetPolicy`.
   - Evaluates it locally for every candidate presence of §4: none, process lease, session grant at a given age and idle time, and fresh per method.
   - Prints each decision with its determining policy ids. This answers "what would happen if…".
@@ -826,8 +849,8 @@ The state becomes `UNAPPROVED`, and the anchor falls back to `["platform"]`. A s
 ```text
 AssumeRoleRequest
 └── ClientContext {intent, cwd, auto_config_path, env_names, authorization_response?}
-non-OK status → details: AuthorizationError {reason, challenge?, policy_ids, ai_agent}
-GetPolicy · ApprovePolicy · ResetPolicyRecord (macOS) · RevokeAuthorizations · PingAgentResponse.policy_integrity
+non-OK status → details: AuthorizationError {reason, challenge?, policy_ids, tools}
+GetPolicy · ApprovePolicy · ResetPolicyRecord (macOS) · RevokeAuthorizations · UnmarkTools · PingAgentResponse.policy_integrity
 ```
 
 ```proto
@@ -839,6 +862,7 @@ service Agent {
   rpc ApprovePolicy(ApprovePolicyRequest) returns (ApprovePolicyResponse);
   rpc ResetPolicyRecord(ResetPolicyRecordRequest) returns (ResetPolicyRecordResponse);
   rpc RevokeAuthorizations(RevokeAuthorizationsRequest) returns (RevokeAuthorizationsResponse);
+  rpc UnmarkTools(UnmarkToolsRequest) returns (UnmarkToolsResponse);
 }
 
 message PingAgentResponse {
@@ -866,7 +890,7 @@ message ClientContext {
   }
   bytes cwd = 3;
   bytes auto_config_path = 4;      // .mairu.json path when role = auto
-  repeated string env_names = 5;   // names only, never values; used for AI-agent markers
+  repeated string env_names = 5;   // names only, never values; used for tool detection (§5)
   AuthorizationResponse authorization_response = 6;
 }
 
@@ -927,7 +951,7 @@ message AuthorizationError {
   string detail = 2;
   AuthorizationChallenge challenge = 3;
   repeated string policy_ids = 4;        // @id of the determining forbid policies, for REASON_FORBIDDEN
-  bool ai_agent = 5;                     // AI-agent signals were present (§5)
+  repeated string tools = 5;             // tool labels detected (§5)
 }
 
 enum PolicyIntegrity {
@@ -973,10 +997,20 @@ message RevokeAuthorizationsRequest {
   }
   Scope scope = 1;
   bool include_leases = 2;
+  repeated string mark_tools = 3;       // mark the caller's terminal session with these labels (§8)
 }
 message RevokeAuthorizationsResponse {
   uint32 revoked_grants = 1;
   uint32 revoked_leases = 2;
+}
+
+// Always asks the human (§8).
+message UnmarkToolsRequest {
+  repeated string tools = 1;
+  ClientContext client_context = 2;     // only authorization_response and env_names are used
+}
+message UnmarkToolsResponse {
+  repeated string remaining = 1;        // labels still marked on the caller's session
 }
 ```
 
@@ -998,7 +1032,8 @@ Existing codes keep their meanings. In particular, `UNAUTHENTICATED` still means
 ## 11. Security considerations
 
 ```text
-AI agent in your session          ! ai_agent → fresh check per request (built-ins)
+AI agent in your session          ! tools ∋ ai-agent → fresh check per request (built-ins)
+tool removing its own mark        ✗ unmarking always asks the human
 relaxing the policy by editing     ✗ unapproved files contribute forbids only
 downgrading approval to password   ✗ approval uses the stored anchor
 forbid skipped by an error         ✗ strict validation; errors count as Deny
@@ -1007,7 +1042,9 @@ replayed or relayed signatures     ✗ single-use challenge bound to peer and re
 
 | Threat | Mitigation |
 |---|---|
-| AI agent sharing the user's terminal session | Ancestry + env-name signals in `context.ai_agent`; built-in policy requires a fresh check per AI request (§5, §9.6). Guardrail only. |
+| AI agent sharing the user's terminal session | Ancestry, env-name and session-mark signals in `context.tools`; built-in policy requires a fresh check per `ai-agent` request (§5, §9.6). Guardrail only. |
+| A marked tool removing its own mark | `UnmarkTools` always asks the human (§8) |
+| A `permit` that depends on a forgeable tool label | Documented as a guardrail (§5); `check` and `approve` list such permits (§9.4) |
 | Editing the policy to relax it | Integrity records; only `forbid` policies apply when unapproved; lockdown on tamper (§9.8) |
 | Rolling back the policy | The protected directory keeps only the latest record (§9.8) |
 | Approval downgraded to a password by editing or tampering with `authorization.json` | Approval uses only the anchor in the last approved record (§9.7, §9.9) |
@@ -1019,7 +1056,7 @@ replayed or relayed signatures     ✗ single-use challenge bound to peer and re
 
 Every guarantee here is also bounded by the trust chain in [hardening §2.4](hardening.md).
 
-Logging: authorization decisions go to the agent log at `info` (peer pid, session identity, server, rolespec, method, result, AI signals), never with credentials or signatures.
+Logging: authorization decisions go to the agent log at `info` (peer pid, session identity, server, rolespec, method, result, tool labels), never with credentials or signatures.
 
 ## 12. Scope
 
@@ -1035,7 +1072,7 @@ out   the platform facilities themselves · servers.d and trust-record integrity
 ## 13. Deliverables
 
 ```text
-authorization ← ai-agents ← policy ← ssh-agent ← wsl      (layers touching this spec)
+authorization ← tool-detection ← policy ← ssh-agent ← wsl      (layers touching this spec)
 ```
 
 Layers of the stack in [hardening §14](hardening.md) that implement this spec:
@@ -1043,7 +1080,7 @@ Layers of the stack in [hardening §14](hardening.md) that implement this spec:
 | Layer | Files |
 |---|---|
 | `hardening/authorization` | `src/authorization.rs` (grants, leases, decision procedure), `src/policy/{mod.rs,mairu.cedarschema,builtin/*.cedar}` (Cedar engine with built-in policies only), `proto/mairu.proto` (`ClientContext`, `AuthorizationError`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs` (auto-refresh marks `prefetch`), `src/ecs_server.rs`, `Cargo.toml` (`cedar-policy`), README (relaxing idle for tty-less callers) |
-| `hardening/ai-agents` | `src/authorization.rs` (signals), client `env_names` |
+| `hardening/tool-detection` | `src/tool_detection.rs` (labels, signals, session marks), `src/authorization.rs`, `src/cmd/lock.rs` (`--tool`, `unlock`), `proto/mairu.proto` (`mark_tools`, `UnmarkTools`), client `env_names` |
 | `hardening/policy` | `src/policy/{files,integrity_state,settings}.rs` (user files, tighten-only and lockdown sets, approval anchor), `proto/mairu.proto` (`GetPolicy`, `ApprovePolicy`, `PingAgentResponse.policy_integrity`), `src/cmd/policy.rs` (`init`, `check`, `show`, `explain`, `schema`, `approve`) |
 | `hardening/ssh-agent` | `src/ssh_agent_presence.rs`, `proto/mairu.proto` (challenge messages), client relay, `Cargo.toml` (`ssh-key`, `ssh-encoding`) |
 | `hardening/wsl` | `src/windows_hello.rs` (agent verification, client relay), `windows-hello-helper/` (Windows binary, `windows` crate), `src/cmd/policy.rs` (`enroll-windows-hello`), `proto/mairu.proto` (`windows_hello_signature`), `.github/workflows/release.yml` (Windows helper builds) |
@@ -1057,7 +1094,7 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - [ ] Cedar engine: schema, entities, built-in policies, fail-closed evaluation
 - [ ] `Authorizer`: grants, leases, singleflight, decision procedure (§4)
 - [ ] Agent RPCs: `ClientContext`, `AuthorizationError`, `GetPolicy`, `ApprovePolicy`, `RevokeAuthorizations`, `PingAgentResponse.policy_integrity`; `ResetPolicyRecord` with the macOS work
-- [ ] AI-agent signals
+- [ ] Tool detection: labels, signals, session marks; `mairu lock --tool`, `mairu unlock --tool`
 - [ ] Policy files: `policy.cedar` + `authorization.json`, integrity states, forbid-only when unapproved, lockdown
 - [ ] Approval anchor in integrity records; recovery through `harden --reset-policy-record`
 - [ ] ssh-agent presence method
@@ -1076,3 +1113,4 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - 2026-10-23: Integrity stores classified as strong or weak, with a generation in each record to order strong stores; weak stores count as approval only on unhardened agents; macOS recovery through `mairu policy reset-record` with an administrator authorization (§9.7–§9.9, §10).
 - 2026-10-23: Q-W2 confirmed: Windows Hello KeyCredential signatures are RSA-2048 PKCS #1 v1.5 with SHA-256; test vector recorded (§6.3).
 - 2026-10-23: Decided: on macOS, requests from outside the console's audit session may use the platform sheet by default, with the origin shown; `context.console_session` lets a policy forbid it (§7, §9.2–§9.4).
+- 2026-10-24: AI-agent detection generalized into labelled tool detection (`tool_detection`, `context.tools`); `ai-agent` is the built-in label; humans can mark a session with `mairu lock --tool`, and unmarking asks the human (§5, §7–§11).
