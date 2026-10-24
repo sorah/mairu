@@ -316,7 +316,7 @@ Rules:
    3. closes its copy of the helper's end.
 
    There is no rendezvous in the filesystem, so there is nothing to squat. The helper runs from the setgid binary, so it is non-dumpable and its fd cannot be taken over through `/proc`.
-2. **The helper verifies the agent** before serving: `SO_PEERCRED` of the inherited fd must show `uid == own`, `gid == mairu` (when hardened) and **`pid == getppid()`**. On a socketpair the kernel reports the creator of the pair, which is the agent. The helper serves only that fd and exits on EOF, which is how it shares the agent's fate. `crate::ppid` remains a backstop.
+2. **The helper verifies the agent** before serving: `SO_PEERCRED` of the inherited fd must show `uid == own`, `gid == mairu` (when hardened) and **`pid == getppid()`**, and the parent's real gid (`/proc/<ppid>/status`) must not be `mairu` ([hardening §5.1](hardening.md)). On a socketpair the kernel reports the creator of the pair, which is the agent. The helper serves only that fd and exits on EOF, which is how it shares the agent's fate. `crate::ppid` remains a backstop.
 3. **The agent verifies the helper by construction:** it exec'd its own image and keeps the child's pidfd. A socketpair reports its creator to both ends, so `SO_PEERCRED` cannot identify the helper, and the agent does not need it to.
 4. Both ends reject requests whose `uid` differs from their own (§3).
 5. **Failure.** If the helper fails verification, exits or crashes, `HelperClient` returns `RESULT_UNAVAILABLE` (`helper-unavailable` or `helper-unverified`) and empty capabilities, and the agent fails closed. It respawns the helper at most once per 30 s. `GetAgentStatus` reports the helper's state ([hardening §7.1](hardening.md)).
@@ -908,3 +908,4 @@ macOS (separate implementation, §11):
 - 2026-10-24: Q-M3's MDM question not pursued; Q-M12 and the Developer ID notifier deferred until the Developer ID is issued (§11).
 - 2026-10-24: Q-M13 opened: merge the notifier into the helper bundle if a directly exec'd bundle can post notifications; ad-hoc builds would then assemble an unentitled helper bundle (§11).
 - 2026-10-24: Q-M13 confirmed: the notifier is merged into the helper bundle, which is now always a bundle on macOS, registered with `lsregister -f` before exec; extraction rules completed (directory keys, dev location, archive format, who writes it, races) (§1, §4, §8.4, §11, §12).
+- 2026-10-24: The helper also rejects a parent whose real gid is the marker (§4).

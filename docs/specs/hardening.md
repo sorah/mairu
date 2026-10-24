@@ -191,6 +191,7 @@ So each side can check the other's marker without trusting anything it says.
 Preconditions, checked at runtime (§4.2):
 
 - The user must **not** be a member of `mairu`, neither as primary nor as supplementary group. A member can obtain the marker with `sg`/`newgrp`.
+- The group must have **no password**. With one, anyone who knows it can `newgrp mairu` and get the marker as both real and effective gid. That would let them write the protected directory directly, without mairu. `harden` removes it (§4.4), and peers whose real gid is the marker are rejected (§5.1, §5.2).
 - `fs.protected_hardlinks = 1`, so users cannot hardlink old hardened binaries and keep running them after an upgrade. This is a warning only.
 
 ### 3.2 macOS: code signature
@@ -258,29 +259,37 @@ flowchart LR
 ### 4.2 Classifying the running process
 
 ```text
-detect()
-  g = getgrnam("mairu")                    none → Unhardened
-  rgid == g or g ∈ getgroups()             → Misconfigured (marker forgeable)
-  egid == g                                → Hardened; setresgid(rgid, rgid, g)
-  otherwise                                → Unhardened (try re-exec, §4.3)
+detect()                                           # first in main, before anything changes the ids
+  m = getegid()                                    # the binary's group, when this exec applied setgid
+  getgrgid(rgid) is named "mairu"                  → Misconfigured (primary group is the marker)
+  getauxval(AT_SECURE) == 0 or m == rgid           → Unhardened (try re-exec, §4.3)
+  m ∈ {0, 65534} or getgrgid(m) is not "mairu"     → Unhardened, warn (setgid to another group)
+  m ∈ getgroups() or user ∈ getgrgid(m).members    → Misconfigured (marker forgeable)
+  otherwise                                        → Hardened, marker = m; setresgid(rgid, rgid, m)
 
-with_privileged_gid(f)    egid := g; f(); egid := rgid      # connect, listen, /var/lib/mairu
+with_privileged_gid(f)    egid := m; f(); egid := rgid      # connect, listen, /var/lib/mairu
 before exec of anything   setresgid(rgid, rgid, rgid)       # marker never leaks
 ```
 
 `crate::hardening::Hardening::detect()` runs first in `main`, before argument handling has any side effects:
 
-1. Look up group `mairu` (`getgrnam_r`; static musl builds read `/etc/group` only, which is fine because `harden` creates a local system group). Read `getresgid()`.
-2. Classify:
+1. Read `getresgid()` and `getauxval(AT_SECURE)`. The candidate marker `m` is the effective gid at startup, which after a setgid exec is the binary's group as granted by the kernel.
+2. Classify, taking the first row that matches:
 
    | Condition | State |
    |---|---|
-   | Group absent | `Unhardened` |
-   | `rgid == mairu`, or `mairu` is in `getgroups()`, or the user is listed in the group's members | `Misconfigured`: the marker is forgeable. Warn, and act as `Unhardened`. |
-   | `egid == mairu` and `rgid != mairu` | `Hardened` |
-   | Otherwise | `Unhardened`. The system may be hardened but this binary is not, which triggers re-exec (§4.3). |
+   | The real gid's group is named `mairu` | `Misconfigured`: the user's primary group is the marker. Warn, and act as `Unhardened`. |
+   | `AT_SECURE` is 0, or `m == rgid` | `Unhardened`. No setgid bit applied to this exec, so an effective gid inherited from a parent is never taken as the marker. `AT_SECURE` alone is not enough, because file capabilities (`cap_ipc_lock`, §4.4) set it too. The system may still be hardened, which triggers re-exec (§4.3). |
+   | `m` is 0 or 65534, or `getgrgid_r(m)` does not name `mairu` (a failed lookup included) | `Unhardened`, with a warning: the binary is setgid to some other group. A dedicated group is what makes the marker meaningful; with any other group, that group's own setgid binaries would pass. |
+   | `m` is in `getgroups()`, or the user is listed among the group's members | `Misconfigured`: the marker is forgeable. Warn, and act as `Unhardened`. |
+   | Otherwise | `Hardened`, with marker `m` |
 
-3. When `Hardened`, immediately call `setresgid(rgid, rgid, mairu)`. The effective gid is then the real gid, and the marker stays only in the saved gid until needed.
+   - The lookup goes from the granted gid to the name (`getgrgid_r`), not from the name to a gid. A second `mairu` group in another NSS source therefore cannot shadow the gid the kernel actually granted, and the gid peers compare against is that one.
+   - Static musl builds read `/etc/group` only, which is fine because `harden` creates a local system group.
+   - A failed lookup, for example with a directory service down, fails closed as `Unhardened`.
+3. When `Hardened`, immediately call `setresgid(rgid, rgid, m)`. The effective gid is then the real gid, and the marker stays only in the saved gid until needed.
+
+Below, `mairu` as a gid means this marker `m`.
 
 Helpers:
 
@@ -333,7 +342,7 @@ The hardened copy is the single authoritative binary. Every installation execs i
 
 ```text
 sudo mairu harden
-  ensure group mairu exists and has no members
+  ensure group mairu exists, has no members and no password
   /proc/self/exe → .mairu.tmp.<pid> → fchown root:mairu → fchmod 2755 → fsync → rename
   setcap cap_ipc_lock=+ep             # after chown, which clears file caps
   write co.0w0.mairu.policy, mkdir /var/lib/mairu{,/users} 2770
@@ -342,7 +351,7 @@ sudo mairu harden
 
 Linux only (BSD later). It must run as root (`euid == 0`); otherwise it exits with the exact command to run: `sudo <canonical exe path> harden`. It is idempotent, and re-running it upgrades the binary.
 
-1. **Group.** If `mairu` is missing, run `groupadd --system mairu`, falling back to `addgroup --system mairu` (busybox). Refuse if the group has members, or if `SUDO_UID`'s primary gid is `mairu`, and print how to fix it.
+1. **Group.** If `mairu` is missing, run `groupadd --system mairu`, falling back to `addgroup --system mairu` (busybox). Refuse if the group has members, or if `SUDO_UID`'s primary gid is `mairu`, and print how to fix it. If `/etc/gshadow` gives the group a password, remove it with `gpasswd -r mairu` (after which only members could `newgrp`, and there are none) and say so (§3.1). `groupadd` leaves it locked, so this only undoes a password someone set.
 2. **Directory.** Create `/usr/local/libexec/mairu` as `root:root 0755`. Check that the ancestor chain is root-owned and not group/other-writable.
 3. **Binary.**
    1. Open `/proc/self/exe`, which is the exact image running as root.
@@ -407,7 +416,8 @@ on accept(stream)
   cred = SO_PEERCRED                       cred.uid != me → close
   pidfd = SO_PEERPIDFD ?: pidfd_open(cred.pid)
   start_time = /proc/<pid>/stat field 22; pidfd still alive?
-  trust = hardened ? (cred.gid == mairu ? Verified : Rejected) : Unverifiable
+  real_gid = /proc/<pid>/status Gid: (first field)
+  trust = hardened ? (cred.gid == mairu && real_gid != mairu ? Verified : Rejected) : Unverifiable
 on every RPC except PingAgent, GetAgentStatus
   Rejected → PERMISSION_DENIED, REASON_UNVERIFIED_PEER
 ```
@@ -418,13 +428,16 @@ The agent wraps every accepted stream in `PeerStream { inner: tokio::net::UnixSt
 2. Obtain a pidfd:
    - `SO_PEERPIDFD` on Linux 6.5+ is race-free.
    - Otherwise `pidfd_open(pid)` on Linux 5.3+. This leaves a pid-reuse window between `connect()` and accept handling that only affects attribution (session identity, ancestry), never the gid check.
-3. Read `/proc/<pid>/stat` (§6) for `start_time`, then confirm the pidfd still refers to a live process (`pidfd_send_signal(pidfd, 0)`) so the values read belong to it.
+3. Read `/proc/<pid>/stat` (§6) for `start_time`, and the real gid from the `Gid:` line of `/proc/<pid>/status`, then confirm the pidfd still refers to a live process (`pidfd_send_signal(pidfd, 0)`) so the values read belong to it.
+   - A genuine hardened client always has a real gid other than the marker (§4.2).
+   - A process that got the marker through a group password (`newgrp`, `sg`) has it as both real and effective gid, so it is rejected (§3.1).
+   - `/proc/<pid>/status` stays readable for a non-dumpable process.
 4. Compute trust:
 
    | Agent state | Peer gid | `PeerTrust` |
    |---|---|---|
-   | Hardened | `mairu` | `Verified` |
-   | Hardened | anything else | `Rejected` |
+   | Hardened | `mairu`, with a real gid other than `mairu` | `Verified` |
+   | Hardened | anything else | `Rejected`; a real gid of `mairu` is logged and shown by `doctor` |
    | Unhardened or Misconfigured | any | `Unverifiable` |
 
 Each handler calls `require_trusted(&request)`. `Rejected` peers get `PERMISSION_DENIED` with `AuthorizationError{reason: UNVERIFIED_PEER}` ([policy §10.1](policy.md)) on every RPC except `PingAgent` and `GetAgentStatus`, which stay open so unverified binaries can diagnose themselves. `Unverifiable` peers are served as they are today.
@@ -436,13 +449,14 @@ connect_to_agent(path)                     # tonic calls this on every reconnect
   with_privileged_gid { std connect(path) }
   cred = SO_PEERCRED(stream)               # the agent's credentials at listen()
   require cred.uid == me
-  hardened client: require cred.gid == mairu, else only Ping / GetAgentStatus / Shutdown
+  hardened client: require cred.gid == mairu and the agent's real gid != mairu,
+                   else only Ping / GetAgentStatus / Shutdown
 ```
 
 `connect_to_agent_with_path` connects with a blocking `std::os::unix::net::UnixStream::connect` inside `with_privileged_gid`, then converts the stream to tokio. tonic calls the connector closure again on every reconnect, so reconnects behave the same. After connecting, it reads `SO_PEERCRED` of the stream, which carries the agent's credentials at `listen()`:
 
 - `uid` must equal `geteuid()`.
-- If the client is `Hardened`, `gid` must equal `mairu`. Otherwise the agent is **unverified**: never send it anything except `PingAgent`, `GetAgentStatus` or `ShutdownAgent`.
+- If the client is `Hardened`, `gid` must equal `mairu`, and the agent's real gid (`/proc/<pid>/status`) must not. Otherwise the agent is **unverified**: never send it anything except `PingAgent`, `GetAgentStatus` or `ShutdownAgent`.
 
 The `MAIRU_AGENT_SOCK` override remains supported. A redirected socket still has to pass this check.
 
@@ -835,7 +849,7 @@ signed tag vX.Y.Z on upstream
 
 ```text
 sudo mairu harden   (macOS, every tier)
-  dseditgroup -o create mairu                         refuse if the user is a member (§3.1)
+  dseditgroup -o create mairu                         refuse if the user is a member; no group password (§3.1)
   /usr/local/libexec/mairu/mairu                      copy, root:mairu, mode 2755
     ad-hoc: codesign --force --sign - --options runtime --identifier co.0w0.mairu   (before chown/chmod)
   /usr/local/libexec/mairu/Mairu Helper.app           official: from the archive; other builds: assembled and signed as root
@@ -967,6 +981,7 @@ LD_PRELOAD / ptrace into mairu     ✗ AT_SECURE, non-dumpable, setgid dropped u
 socket squatter / rogue agent      ✗ client checks the listen-time marker; replaced
 pid reuse                          ✗ pidfd + start time
 marker leaking to children         ✗ setresgid before every exec
+group password (newgrp / sg)       ✗ harden removes it; a real gid of mairu is rejected
 root via sudo / groups / WSL       ! out of scope, bounds everything; doctor warns
 ```
 
@@ -984,6 +999,8 @@ root via sudo / groups / WSL       ! out of scope, bounds everything; doctor war
 | Root reached through `sudo`/polkit passwords, `NOPASSWD`, root-equivalent groups | Out of scope, but it bounds everything (§2.4); `doctor` warns (§12) |
 | Root reached through WSL2 interop (`wsl.exe -u root`) | Isolated profile, or `context.wsl_interop` forbids; `doctor` and `harden` warn (§8) |
 | User in the marker group | Detected → `Misconfigured`; `harden` refuses (§4.2, §4.4) |
+| Joining the marker group through a group password (`newgrp`, `sg`) | `harden` removes the password (§4.4). Peers whose real gid is the marker are rejected by the agent, clients and the platform helper (§5.1, §5.2). The password would also open the protected directory, which is why `harden` removes it rather than relying on the peer check. |
+| A binary setgid to some other group, or an inherited effective gid | The marker must come from this exec (`AT_SECURE`, `m != rgid`) and its group must be named `mairu`, and not be 0 or 65534 (§4.2) |
 | Hardlinked old hardened binaries | `fs.protected_hardlinks` warning; atomic replace (§3.1, §4.4) |
 | Environment injection into a hardened agent (`HOME`, `XDG_*`, `DBUS_*`) | Integrity keyed by uid ([policy §9.1](policy.md)); system bus pinned ([platform-helper §5](platform-helper.md)). `servers.d` is unprotected (future work, §13). |
 | Credentials after delivery to the user's command | Out of scope (§2.2) |
@@ -1209,3 +1226,4 @@ Future:
 - 2026-10-23: Q-M11 confirmed from a real SSH session while a console login exists; the no-console case stays open (§9.2).
 - 2026-10-24: Deferred: Q-M11 without a console login (no Mac to test on; the client falls back to `user/<uid>`), and the official-build checks until the Developer ID is issued (§9.2, §9.5, §9.9).
 - 2026-10-24: One macOS helper bundle, which also posts notifications, replaces the separate notifier (Q-M13); `harden` writes it for every build (§9.4, §9.5, §9.8, §15).
+- 2026-10-24: Marker gid taken from this exec's setgid grant (`AT_SECURE`, effective gid at startup), confirmed by reverse lookup, never 0 or 65534; group passwords removed by `harden`, and peers whose real gid is the marker rejected (§3.1, §4.2, §4.4, §5.1, §5.2, §11).
