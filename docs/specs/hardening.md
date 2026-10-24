@@ -211,7 +211,7 @@ Identity comes from the peer's audit token, never a pid:
 
 This means no team identifier is hardcoded:
 
-- Developer ID builds match on team and identifier `co.0w0.mairu`, so any version from the same team matches. A signed minimum client version rejects old versions (§9.3).
+- Developer ID builds match on team and identifier `co.0w0.mairu`, so any version from the same team matches. Signed minimum client and agent versions reject old versions (§9.3).
 - Ad-hoc builds (`cargo`, Homebrew from source, forks) match only a byte-identical binary, through the cdhash.
 - A binary without the hardened-runtime flag, such as plain `cargo build` output, is treated as unhardened (§9.1).
 
@@ -627,7 +627,7 @@ isolated   (interop off)   ssh -A from Windows into the distro · native-Linux s
 |---|---|---|
 | Root reachable by same-user Linux code | Yes, through `wsl.exe -u root` | Not from inside this distribution. From Windows-side processes and from other distributions with interop on: yes (§8.2) |
 | Strength | A guardrail against over-eager tools such as AI agents, and against accidents. Not a boundary against malicious code. | As native Linux (§2.4) against code inside the distribution. Code running as the Windows user, or in another distribution with interop on, is out of scope. |
-| Presence methods | `windows-hello` ([policy §6.3](policy.md)). `ssh-agent` through a relay of the Windows OpenSSH agent (npiperelay + socat, or `wsl2-ssh-agent`). `platform` through `pkttyagent`. | `ssh-agent`, by SSHing into the distribution from Windows with `ssh -A`. This is the headless reference workflow ([platform-helper §9](platform-helper.md)). The key is whatever the Windows SSH agent holds: a hardware security key works, but Windows OpenSSH cannot yet enroll a Windows Hello key (Q-W3). `platform` through `pkttyagent`. |
+| Presence methods | `windows-hello` ([policy §6.3](policy.md)). `ssh-agent` through a relay of the Windows OpenSSH agent (npiperelay + socat, or `wsl2-ssh-agent`). `platform` through `pkttyagent`. | `ssh-agent`, by SSHing into the distribution from Windows with `ssh -A`. This is the headless reference workflow ([platform-helper §9](platform-helper.md)). The key is whatever the Windows SSH agent holds: a hardware security key works, but Windows OpenSSH cannot yet enroll a Windows Hello key (Q-W3). A Windows SSH agent that asks for Windows Hello before each signature works too. mairu sees an ordinary signature and cannot verify that Windows Hello was asked; as with any registered key, that lock is the agent's ([policy §6.2](policy.md)). `platform` through `pkttyagent`. |
 | `open_url` in `auto` mode | The Windows default browser, through `rundll32.exe url.dll,FileProtocolHandler <url>` ([platform-helper §10](platform-helper.md)) | URL printed, or `command` mode |
 | `notify` in `auto` mode | None: WSLg has no notification daemon. Use `command` mode with a Windows toast helper. | None |
 | Secret Service | Usually absent | Usually absent |
@@ -698,7 +698,7 @@ peer id       SO_PEERCRED + pidfd                audit token of each XPC message
 anti-tamper   AT_SECURE, non-dumpable            hardened runtime, PT_DENY_ATTACH (both tiers)
 location      /usr/local/libexec/mairu (root)    anywhere                                  harden copy recommended
 policy store  protected directory (harden)       data-protection keychain + harden dir     protected directory (harden)
-downgrade     old copies unreachable             signed minimum client version (§9.3)      cdhash differs per version
+downgrade     old copies unreachable             signed minimum versions (§9.3)            cdhash differs per version
 top of chain  root                               administrator (sudo, /etc/authorization)
 ```
 
@@ -752,7 +752,7 @@ The protobuf messages and the agent's handlers are shared with Linux. Only the t
 
 **Verification.**
 - Both ends set `xpc_connection_set_peer_code_signing_requirement` to the requirement of §3.2, derived from their own designated requirement.
-- The hardened-runtime, get-task-allow and minimum-client-version (§9.3) checks run on the audit token of each message.
+- The hardened-runtime, get-task-allow and minimum-version (§9.3) checks run on the audit token of each message.
 - The agent pins the pid and pid version of the requester for grants and leases, as it does on Linux ([policy §4](policy.md)).
 
 **Installing and replacing the LaunchAgent.**
@@ -780,27 +780,39 @@ Over SSH, the ssh-agent method ([policy §6.2](policy.md)) is the one that reach
 
 **Compatibility.** macOS clients from before this change use the Unix socket. They start their own socket agent, which shares no sessions with the XPC agent.
 
-### 9.3 Minimum client version (downgrade protection)
+### 9.3 Minimum client and agent versions (downgrade protection)
 
 ```text
 Cargo.toml  [package.metadata.mairu] minimum-client-version = "A.B.C"
+                                     minimum-agent-version  = "D.E.F"
 build.rs    → -Wl,-sectcreate,__TEXT,__info_plist,<generated Info.plist>       # covered by the signature
-Info.plist  CFBundleIdentifier co.0w0.mairu · CFBundleShortVersionString X.Y.Z · MairuMinimumClientVersion A.B.C
-peer check  peer's signed CFBundleShortVersionString >= my MairuMinimumClientVersion
+Info.plist  CFBundleIdentifier co.0w0.mairu · CFBundleShortVersionString X.Y.Z
+            MairuMinimumClientVersion A.B.C · MairuMinimumAgentVersion D.E.F
+agent       refuses a client whose signed version < my MairuMinimumClientVersion
+client      replaces an agent whose signed version < my MairuMinimumAgentVersion
 
-release   minimum-client-version
-0.18.1    0.13.0      ← has a client-side or protocol-level flaw
-0.18.2    0.18.2      fixes it: raised in this release
-0.20.0    0.18.2      a mise-pinned 0.19.0 still works; a downloaded 0.18.1 is refused
+release   minimum-client-version   minimum-agent-version
+0.18.1    0.13.0                   0.13.0
+0.18.2    0.18.2                   0.18.2     fixes a protocol-level flaw: both raised
+0.19.0    0.18.2                   0.18.2
+0.19.1    0.18.2                   0.19.1     fixes an agent-side flaw: only the agent minimum raised
+0.20.0    0.18.2                   0.19.1     a mise-pinned 0.19.0 client still works; a 0.19.0 agent is replaced
 ```
 
 - With a team-based requirement, *every* official release ever published satisfies it, including ones with a fixed vulnerability, and they are all downloadable.
-- Every macOS build therefore embeds an `Info.plist` in the `__TEXT,__info_plist` section through a `build.rs` link argument. The code signature covers it. It carries the build's version and its `MairuMinimumClientVersion`, taken from `[package.metadata.mairu] minimum-client-version` in `Cargo.toml`.
-- Each peer reads the other's signed `Info.plist` (`SecCodeCopySigningInformation`, `kSecCodeInfoPList`) and checks its version against its own `MairuMinimumClientVersion`. The same binary is both client and agent, so one value covers both directions:
-  - the agent refuses a client older than its minimum client version
-  - a hardened client replaces an agent older than its minimum client version (§5.3)
-- **When to raise it:** only in a release that fixes a **client-side flaw** or a **protocol-level flaw**, and then to that release's version. A flaw only in the agent's own handling does not raise it: upgrading the running agent fixes that. This is a step of the `releng` skill. Versions newer than the last raise keep working side by side, such as per-directory mise versions. Raising it in every release would lock out any older install as soon as a newer agent runs.
-- Linux needs no minimum client version: every installation re-execs the single hardened copy (§4.3), and old copies are unreachable. Ad-hoc macOS builds don't need one either, because their cdhash identity already differs per version.
+- Every macOS build therefore embeds an `Info.plist` in the `__TEXT,__info_plist` section through a `build.rs` link argument. The code signature covers it. It carries the build's version, its `MairuMinimumClientVersion` and its `MairuMinimumAgentVersion`, taken from `[package.metadata.mairu]` in `Cargo.toml`.
+- Each peer reads the other's signed `Info.plist` (`SecCodeCopySigningInformation`, `kSecCodeInfoPList`):
+  - the agent refuses a client older than its minimum client version;
+  - a hardened client replaces an agent older than its minimum agent version: `launchctl bootout`, then the plist pointed at itself, then `bootstrap` (§9.2).
+- **Two values, because the roles are reached differently.** Same-user code can start any genuine binary with any arguments (§2.1), so it can run an old official agent with a known agent-side flaw. Current clients would then send it OAuth codes and requests. A minimum agent version lets clients refuse it without locking out older clients, whose own handling was never at fault.
+- **When to raise them,** to the version of the release that fixes the flaw:
+  - `minimum-client-version`: for a client-side or protocol-level flaw.
+  - `minimum-agent-version`: for an agent-side or protocol-level flaw.
+
+  This is a step of the `releng` skill.
+- **Why not every release.** Versions newer than the last raise keep working side by side, such as per-directory mise versions. A minimum client version raised in every release would lock out any older install as soon as a newer agent runs. A minimum agent version raised in every release would make alternating versions replace each other's agents, dropping sessions each time.
+- An old client knows only its own release's values, so it accepts any agent at or above them. The protection covers clients from the fixing release on.
+- Linux needs neither: every installation re-execs the single hardened copy (§4.3), and old copies are unreachable. Ad-hoc macOS builds don't need them either, because their cdhash identity already differs per version.
 
 ### 9.4 Release pipeline (official builds)
 
@@ -837,7 +849,9 @@ sudo mairu harden   (macOS, every tier)
 - **Copies.** Mode bits are not covered by a code signature, so the setgid bit leaves a Developer ID signature valid. Ad-hoc builds are re-signed with the runtime before the mode is set.
 - **The helper bundle**, when the build carries one, is copied too and its executable made setgid `mairu`. The helper then holds both the entitlement for the data-protection keychain and the marker for the protected directory, so both strong stores are written together.
 - **Protected directory.** `/private/var/db/mairu/users/<uid>/policy.record`, with the Linux rules: the helper writes it holding the marker gid, and checks the ancestors are root-owned and not group- or other-writable. `/var` is a symlink, so the canonical path is used.
-- **Upgrades.** Re-run `sudo mairu harden` after upgrading. Until then, other installs re-exec the older hardened copy and warn about the version skew (§4.3). The cask can run it in a `postflight` step with `sudo`; that is a decision for the tap.
+- **Upgrades.** The hardened copy must be refreshed after upgrading. Until then, other installs re-exec the older copy and warn about the version skew (§4.3).
+  - The Homebrew cask's `postflight` runs the new binary's `sudo mairu harden` when a hardened copy already exists (decided 2026-10-23). `harden` never re-execs (§4.3), so the new version installs itself. This asks for a password during `brew upgrade`. If it fails, for example in a non-interactive upgrade, the upgrade still succeeds and prints the command to run.
+  - Other installs re-run it by hand.
 - **Ad-hoc peers** match only byte-identical binaries. Each upgrade therefore replaces the running agent (§5.3) and drops its sessions.
 - **Q-M9:** confirm the non-member case. Does a setgid exec by a user outside the group set `P_SUGID`, making a restricted process? Neither tier depends on it: the hardened runtime, which every hardened tier has, already ignores `DYLD_*` variables and refuses task ports to same-user code. The member case was observed: the egid was granted but `P_SUGID` stayed 0 ([platform-helper §11](platform-helper.md)).
 - **Q-M6 (decided 2026-10-23):** ad-hoc builds get strong policy integrity only through `harden`. Without it, they have only the weak legacy keychain, and their policy only tightens ([policy §9.8](policy.md)).
@@ -897,6 +911,7 @@ cargo install                                ad-hoc
     - A cask `mairu` in `sorah/homebrew-sorah`: `binary "mairu"` pointing at the notarized release tarball, with Linux URLs too, and nothing that strips quarantine.
     - Migrate users from the formula with `tap_migrations.json`.
     - Keep a from-source formula under another name, such as `mairu-src`, for ad-hoc builds. When a formula and a cask share a name, `brew install` picks the formula.
+    - The cask's `postflight` refreshes an existing hardened copy, and prints the command instead of failing when `sudo` fails (§9.5).
   - **Fallback:** a formula that installs the signed artifact, as hashicorp/tap and cirruslabs/tart do. It keeps the signature and avoids quarantine, but Homebrew maintainers call the pattern unsupported.
   - The tap change is a follow-up in `sorah/homebrew-sorah`.
 
@@ -1088,7 +1103,7 @@ rebuild                           → new cdhash → the dev agent is replaced a
 - The notifier bundle is assembled from the dev binary and signed ad-hoc as `co.0w0.mairu.dev.notifier` ([platform-helper §11](platform-helper.md)). Its notification permission starts out denied and is turned on once in System Settings (Q-M3). It is keyed by bundle id, so it survives rebuilds (Q-M4).
 - Integrity stores: the weak legacy keychain store works in every build. The protected directory needs `sudo mairu harden`, best in a disposable VM as on Linux (§15.2). The data-protection keychain needs the project's provisioning profile, so only official builds have it.
 - LocalAuthentication works with ad-hoc binaries.
-- Not possible without the program: an official identity, notarization, team-requirement acceptance across versions, the minimum client version between signed versions, the embedded Developer ID notifier, and the helper bundle with its data-protection keychain. Maintainers cover these (§15.5).
+- Not possible without the program: an official identity, notarization, team-requirement acceptance across versions, the minimum client and agent versions between signed versions, the embedded Developer ID notifier, and the helper bundle with its data-protection keychain. Maintainers cover these (§15.5).
 
 ### 15.4 Contributors with their own Developer ID
 
@@ -1106,11 +1121,11 @@ pull_request (forks included)    build + test on Linux and macOS, no secrets
   macos job                      macos-dev-sign; verification between two processes; notifier assembly (ad-hoc)
 push of a signed tag (upstream)  environment "release": Developer ID + notary key → §9.4
 release dry run (maintainers)    manual trigger on a branch: build, sign, notarize, no publish; same environment
-maintainer check (draft release) signed artifact: doctor, notifier, helper bundle store, minimum client version, upgrade keeps sessions
+maintainer check (draft release) signed artifact: doctor, notifier, helper bundle store, minimum versions, upgrade keeps sessions
 ```
 
-- Designated-requirement strings and minimum-client-version parsing are unit-tested, so the team-requirement logic is covered without signing.
-- Properties only an official build has are checked by a maintainer on the draft release before publishing it: acceptance of the previous release under the team requirement, the minimum client version, the embedded notifier, and the helper bundle reporting the data-protection keychain. The same step raises `minimum-client-version` when the release fixes a client-side or protocol-level flaw (§9.3). This is a checklist step in the `releng` skill (`.claude/skills/releng/SKILL.md`), between the release workflow and publishing.
+- Designated-requirement strings and minimum-version parsing are unit-tested, so the team-requirement logic is covered without signing.
+- Properties only an official build has are checked by a maintainer on the draft release before publishing it: acceptance of the previous release under the team requirement, the minimum versions, the embedded notifier, and the helper bundle reporting the data-protection keychain. The same step raises `minimum-client-version` for a client-side or protocol-level flaw, and `minimum-agent-version` for an agent-side or protocol-level flaw (§9.3). This is a checklist step in the `releng` skill (`.claude/skills/releng/SKILL.md`), between the release workflow and publishing.
 - Pull requests that change the signing or notarization pipeline cannot exercise it from a fork, because forks never receive the secrets. A maintainer runs a **release dry run** on the PR's branch. It is a manually triggered workflow that builds, signs and notarizes without publishing, gated by the `release` environment's reviewers.
 
 ## Current Status
@@ -1135,7 +1150,7 @@ macOS (separate implementation, §9):
 - [ ] Settle the open Q-M items (§9.9) and write them back here
 - [ ] XPC transport through the `co.0w0.mairu.agent` LaunchAgent: install, replace, message mapping (§9.2); settle Q-M11
 - [ ] Code-signature peer verification for every tier, on every message (§9.1, §9.2)
-- [ ] Embedded `Info.plist` and the minimum client version (§9.3)
+- [ ] Embedded `Info.plist` with the minimum client and agent versions (§9.3)
 - [ ] Release pipeline: Developer ID signing, notarization, embedded notifier and helper bundle with its provisioning profile (§9.4)
 - [ ] `harden` on macOS for every tier: setgid copies, protected directory, LaunchAgent repointing (§9.5); settle Q-M9
 
@@ -1173,3 +1188,4 @@ Future:
 - 2026-10-23: macOS policy integrity: `harden` provides the protected directory for every tier, and Developer ID builds add a signed helper bundle with the data-protection keychain (§9.1, §9.4, §9.5, §9.7); Q-M6 decided, Q-M12 opened.
 - 2026-10-23: Q-W3 answered: Windows OpenSSH 9.5p2 reaches Windows Hello but rejects its self-attested credential, so the isolated profile has no Windows Hello (§8.3, §8.5).
 - 2026-10-23: macOS update 2: Q-M11 partly confirmed (a Background client reaches a gui/<uid> service; `user/<uid>` when there is no GUI login), session behaviour of LocalAuthentication and the administrator dialog (§9.2); Q-M3, Q-M4 confirmed and Q-M5 settled (§9.9).
+- 2026-10-23: Decided: separate minimum client and agent versions, raised for client-side and agent-side flaws respectively, both for protocol-level ones (§9.3); Windows Hello-gated SSH agents documented for isolated WSL2 (§8.3); the Homebrew cask refreshes an existing hardened copy on upgrade (§9.5, §9.8).
