@@ -334,7 +334,27 @@ main  (hardened copy)
    ```
 
    The variables only feed this message, so a forged value cannot do more than print a misleading warning.
-4. If no candidate exists, the platform is Linux, and stderr is a terminal: show a one-time suggestion (`:: mairu :: Run 'sudo <exe> harden' to protect your AWS credentials from other programs …`), then create the marker file `state_dir()/hardening-suggested`. `mairu doctor` always shows the state.
+4. If no candidate exists, suggest hardening, periodically, unless disabled:
+
+   ```text
+   show when   Linux · Unhardened · no candidate · stderr is a terminal · not disabled
+               · not yet shown in this terminal session
+               · and interval_days == 0, or interval_days have passed since it was last shown
+   state       state_dir()/harden-suggestion.json  {"last_shown": "<RFC 3339>", "session": {"sid": N, "start_time": T}}
+   disable     MAIRU_NO_HARDEN_SUGGESTION=1 · config.json "harden_suggestion": {"enabled": false}
+   ```
+
+   - The message is `:: mairu :: Run 'sudo <exe> harden' to protect your AWS credentials from other programs …`, followed by when it will be shown again and how to turn it off.
+   - The terminal session is the one of [policy §3](policy.md), computed by the client for itself: the session id of its controlling terminal and the start time of its leader. Each tmux pane is its own session.
+   - `config.json` (`UserConfig`, unprotected) sets the period:
+
+     ```jsonc
+     {"harden_suggestion": {"enabled": true, "interval_days": 7}}
+     ```
+
+     The default is 7 days. `0` shows it once per terminal session.
+   - If the state file cannot be written, the suggestion is skipped rather than repeated on every invocation.
+   - `mairu doctor` always shows the hardening state, whatever the suggestion settings.
 
 The hardened copy is the single authoritative binary. Every installation execs it, whatever version invoked it.
 
@@ -1066,7 +1086,7 @@ The three specs are delivered together as one `gh stack`, one PR per layer, in t
 | `hardening/spec` | all | `docs/specs/{hardening,policy,platform-helper}.md` |
 | `hardening/marker-gid` | hardening | `src/hardening.rs`, `src/main.rs`, `src/agent.rs` (connect), `src/cmd/agent.rs` (listen, spawn), `src/cmd/exec.rs` (executor drop), `Cargo.toml` (`nix` features `user`, `socket`) |
 | `hardening/peer-verification` | hardening, platform-helper | `src/platform/mod.rs`, `src/platform/process/{linux,fallback}.rs`, `proto/mairu_platform.proto`, `proto/mairu.proto` (`GetAgentStatus`, `AuthorizationError`), `build.rs`, `src/proto.rs`, `src/agent.rs`, `src/cmd/agent.rs` (`PeerStream`, replacement), `src/cmd/kill_agent.rs`, `src/cmd/doctor.rs`, `src/main.rs` |
-| `hardening/install` | hardening | `src/cmd/harden.rs` (including `--reset-policy-record`), `src/hardening.rs` (re-exec, validation, suggestion), `src/cmd/doctor.rs` (root-reachability warnings), `pkg/debian/postinst`, `pkg/sysusers.d/mairu.conf`, `pkg/tmpfiles.d/mairu.conf` |
+| `hardening/install` | hardening | `src/cmd/harden.rs` (including `--reset-policy-record`), `src/hardening.rs` (re-exec, validation, periodic suggestion), `src/config.rs` (`UserConfig.harden_suggestion`), `src/cmd/doctor.rs` (root-reachability warnings), `pkg/debian/postinst`, `pkg/sysusers.d/mairu.conf`, `pkg/tmpfiles.d/mairu.conf` |
 | `hardening/platform-helper` | platform-helper | `src/platform/helper.rs` (`HelperClient`, spawn, respawn), `src/cmd/platform_helper.rs` (hidden `mairu platform-helper --fd`), `src/platform/services/{mod,fallback}.rs`, agent startup wiring |
 | `hardening/authorization` | policy, platform-helper | `src/authorization.rs`, `src/policy/{mod.rs,mairu.cedarschema,builtin/*.cedar}`, `src/platform/services/linux/polkit.rs`, `pkg/polkit/co.0w0.mairu.policy`, `proto/mairu.proto` (`ClientContext`, `RevokeAuthorizations`), `src/cmd/{exec,credential_process,lock}.rs`, `src/ecs_server.rs`, `Cargo.toml` (`cedar-policy`, `zbus`, `zbus_polkit`, deb asset) |
 | `hardening/headless` | platform-helper | `src/polkit_tty_agent.rs`, client retry paths, `src/cmd/doctor.rs` |
@@ -1227,3 +1247,4 @@ Future:
 - 2026-10-24: Deferred: Q-M11 without a console login (no Mac to test on; the client falls back to `user/<uid>`), and the official-build checks until the Developer ID is issued (§9.2, §9.5, §9.9).
 - 2026-10-24: One macOS helper bundle, which also posts notifications, replaces the separate notifier (Q-M13); `harden` writes it for every build (§9.4, §9.5, §9.8, §15).
 - 2026-10-24: Marker gid taken from this exec's setgid grant (`AT_SECURE`, effective gid at startup), confirmed by reverse lookup, never 0 or 65534; group passwords removed by `harden`, and peers whose real gid is the marker rejected (§3.1, §4.2, §4.4, §5.1, §5.2, §11).
+- 2026-10-24: The harden suggestion repeats once per terminal session at most, every 7 days by default (`harden_suggestion.interval_days`, 0 for every session), unless disabled (§4.3).
