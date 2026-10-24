@@ -936,9 +936,10 @@ Q-M1  socketpair peer info (confirmed)   Q-M2  GUI session (addressed)         Q
 Q-M4  permission kept on upgrade         Q-M5  notifier name, icon (settled)   Q-M6  ad-hoc store (decided)
 Q-M7  Homebrew (decided)                 Q-M8  LOCAL_PEERTOKEN (confirmed)     Q-M9  setgid non-member (confirmed)
 Q-M10 transport (XPC, decided)           Q-M11 SSH (no-console: deferred)      Q-M12 helper bundle (deferred)
+Q-M13 notifier merged into the helper bundle?
 ```
 
-- Q-M1 to Q-M5, Q-M12: [platform-helper §4, §11](platform-helper.md)
+- Q-M1 to Q-M5, Q-M12, Q-M13: [platform-helper §4, §11](platform-helper.md)
 - Q-M7: §9.8
 - Q-M8, Q-M10, Q-M11: §9.2
 - Q-M6, Q-M9: §9.5

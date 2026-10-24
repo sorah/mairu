@@ -754,7 +754,18 @@ The platform helper is the same binary as the agent, except on Developer ID buil
      - **Quarantine.** Unsandboxed tools don't quarantine the files they create by default. A process that inherited quarantine, for example one started from a terminal inside a quarantined GUI app, may get every file it writes quarantined. mairu therefore removes `com.apple.quarantine` from the bundle it wrote, then checks the designated requirement before launching it.
      - **Launch by full path.** `open -a <name>` resolves by name or bundle id and could pick a different copy.
    - It is launched through LaunchServices so that it is registered and authorized. It is not the helper's child and doesn't need to be: it carries no security weight, so a same-user process that swaps it gains nothing.
-   - The notifier is not the helper bundle. It must be launched through LaunchServices to be authorized, and LaunchServices cannot pass the socketpair (§4). The helper bundle is exec'd directly and verified as a running child (§4).
+   - **Q-M13: merging the notifier into the helper bundle.** The notifier and the helper are separate bundles only because every Q-M3 test launched the notifier through LaunchServices, which cannot pass the socketpair (§4). The confirmed requirement is narrower: the process must be the main executable of a signed bundle. Whether a bundle executable that the agent exec'd directly can use `UNUserNotificationCenter` is untested.
+     - **Decided (2026-10-24):** if it can, the notifier is merged. The helper bundle posts notifications itself, and there is one bundle per flavour.
+       - Ad-hoc builds then assemble an unentitled helper bundle too, so the helper is always a bundle on macOS. The agent verifies the running child against the cdhash it produced, since ad-hoc signing is deterministic ([hardening §9.5](hardening.md)).
+       - A click on a notification may make LaunchServices start the bundle without `--fd`. Such an instance exits quietly.
+       - `UserNotifications` code then runs in the helper. That is the single-helper trade-off of §12, with `usernoted` rather than same-user code as the peer.
+     - If it cannot, the two bundles stay, and this item records why.
+     - To test with ad-hoc builds:
+       - from a `gui/<uid>` LaunchAgent's child, a Background job and an SSH session;
+       - with and without `lsregister` before the first run;
+       - the relaunch on click;
+       - running-child verification;
+       - cdhash determinism of assembly.
    - **Q-M3 (confirmed for ad-hoc builds).** Tested on macOS 27.2 with the screen unlocked:
      - An ad-hoc bundle with the hardened runtime, under `~/Library/Application Support` and launched by full path with `open -g -n -a … --args`, registers and appears in System Settings → Notifications.
      - It starts out denied, before any request. `requestAuthorization` returns `UNErrorDomain` 1 with no prompt, with or without the runtime flag and `LSUIElement`. Once the user turns on "Allow notifications" in System Settings, it is authorized.
@@ -872,3 +883,4 @@ macOS (separate implementation, §11):
 - 2026-10-23: From a real SSH session: LocalAuthentication prompts on the console, `AuthorizationCopyRights` returns `-60007`, and the notifier is shown on the console; the notification grant outlives its bundle (§11).
 - 2026-10-23: The origin of a macOS platform prompt is derived from the peer's audit session and exposed as `context.console_session` (§11).
 - 2026-10-24: Q-M3's MDM question not pursued; Q-M12 and the Developer ID notifier deferred until the Developer ID is issued (§11).
+- 2026-10-24: Q-M13 opened: merge the notifier into the helper bundle if a directly exec'd bundle can post notifications; ad-hoc builds would then assemble an unentitled helper bundle (§11).
