@@ -676,8 +676,11 @@ The platform helper is the same binary as the agent, except on Developer ID buil
    - Track lid/clamshell state (Touch ID unavailable) and fall back to password.
    - `LAError -4` ("system authentication is running", for example while the screen is locked) maps to `UNAVAILABLE`, which can be retried.
    - **Secure Enclave `.userPresence` keys are not used** (tested). An unentitled binary can create one as a CryptoKit `dataRepresentation` blob. But any other binary that reads the blob can sign with it after Touch ID, under its own prompt text. A signature would then prove that someone was present at this Mac, not that mairu asked. Permanent keys need an entitlement (`-34018`). The helper that reports the `LAContext` result is itself verified (§4), so a boolean result is enough.
-   - **Where the sheet appears.** coreauthd shows it on the console whenever a GUI session exists, even for a helper outside that session (confirmed for a Background job). A request from an SSH session therefore prompts on the Mac's screen, not in the terminal, and the client's waiting message says so. With no GUI session it is `UNAVAILABLE`. The ssh-agent method ([policy §6.2](policy.md)) is the one that reaches a remote user.
-   - **Q-M2 (addressed):** the agent runs as a LaunchAgent in `gui/<uid>` whenever a GUI login exists ([hardening §9.2](hardening.md)), and its helper inherits that session. LocalAuthentication works from either launchd domain while a GUI session exists (confirmed), but the administrator dialog needs `gui/<uid>`.
+   - **Where the sheet appears.** coreauthd shows it on the console whenever a GUI session exists, even for a process outside that session (confirmed for a Background job and from an SSH session). With no GUI session it is `UNAVAILABLE`.
+     - A request from an SSH session therefore prompts on the Mac's screen, not in the terminal. This is allowed by default, with the origin in the reason text, and a policy can forbid it ([policy §7](policy.md)).
+     - The agent decides the origin, not the client: it looks up the session of the peer's audit token (`audit_token_to_asid`, then `SessionGetInfo`). `context.console_session` is true when that session has graphic access and is not remote. Confirm those session attributes for SSH logins during implementation.
+     - The ssh-agent method ([policy §6.2](policy.md)) is the one that reaches a remote user.
+   - **Q-M2 (addressed):** the agent runs as a LaunchAgent in `gui/<uid>` whenever a GUI login exists ([hardening §9.2](hardening.md)), and its helper inherits that session. LocalAuthentication works from either launchd domain, and from an SSH session, while a GUI session exists (confirmed), but the administrator dialog needs `gui/<uid>`.
 2. **Integrity store.**
    - **The legacy keychain provides no integrity** (confirmed on macOS 27.2). Same-user code deleted an item with `security delete-generic-password` and no prompt. An unrelated unsigned binary then created a new item with the same service and account, whose access list trusts only mairu, holding forged content. mairu read it without a prompt, and the planted access list is indistinguishable from a genuine one. This applies to any requirement, team-based or cdhash. A MAC key kept in the keychain does not help either, because both items can be deleted and planted again. A legacy keychain item (`LEGACY_KEYCHAIN`) is therefore a **weak** store, like Secret Service on Linux: it catches careless edits only. The record is not secret, so the item's access list allows every application, which avoids prompts after ad-hoc rebuilds.
    - **Strong store for Developer ID builds: the data-protection keychain, through the helper bundle.**
@@ -702,10 +705,10 @@ The platform helper is the same binary as the agent, except on Developer ID buil
        1. a restricted entitlement with an embedded profile is honored when the bundle's executable is exec'd directly by a non-LaunchServices parent, also with the setgid bit set;
        2. the item is reachable from the helper of the LaunchAgent-run agent, and from an SSH-only login (Q-M11);
        3. the item survives an upgrade of the bundle (same team, same access group);
-       4. `AuthorizationCopyRights` for `system.privilege.admin` works from the helper, for `ResetIntegrity` ([policy §9.9](policy.md)). Confirmed for an unbundled ad-hoc binary: the dialog appears from a terminal and from a `gui/<uid>` LaunchAgent, and a Background job gets `-60007` at once.
+       4. `AuthorizationCopyRights` for `system.privilege.admin` works from the helper, for `ResetIntegrity` ([policy §9.9](policy.md)). Confirmed for an unbundled ad-hoc binary: the dialog appears from a terminal and from a `gui/<uid>` LaunchAgent, and a Background job or an SSH session gets `-60007` at once, with no dialog on the console.
    - **Strong store for every tier: the protected directory through `harden`** ([hardening §9.5](hardening.md); Q-M6, Q-M9). `LOCAL_PEERCRED` reports the effective gid as `cr_groups[0]` (confirmed), so the Linux marker group carries over.
-     - A setgid binary run by a **member** of its group got the egid, but was not a restricted process: `P_SUGID` was 0, `DYLD_INSERT_LIBRARIES` was honoured, and `task_for_pid` worked for the same user. This is consistent with the "user must not be a member" rule ([hardening §3.1](hardening.md)).
-     - The non-member case is still to be confirmed.
+     - A setgid exec by a user **outside** the group makes a restricted process: `P_SUGID` set, `DYLD_INSERT_LIBRARIES` stripped, same-user `task_for_pid` refused (confirmed, [hardening §9.5](hardening.md)).
+     - A **member** of the group gets the egid without the restriction: `P_SUGID` was 0, `DYLD_INSERT_LIBRARIES` was honoured, and `task_for_pid` worked. Hence the "user must not be a member" rule ([hardening §3.1](hardening.md)).
    - Stores by tier:
 
      | Tier | Strong | Weak |
@@ -759,9 +762,10 @@ The platform helper is the same binary as the agent, except on Developer ID buil
      - So the notifier writes its authorization status to `status` in its version directory. The helper reads it into `Capabilities.notes`. While the notifier is not authorized, `notify` reports `delivered = false`, and both `doctor` and the first undelivered notification tell the user to turn on "mairu" in System Settings → Notifications. mairu does not route around a denial with `osascript`.
      - Bundles under temporary directories are rejected ("Failed to find or validate client"). An unsigned arm64 bundle does not launch at all.
      - **Quarantine does not propagate from a CLI (confirmed).** Files written by a quarantined, user-approved CLI, and by its child, carried no quarantine. A quarantined, unnotarized ad-hoc CLI is blocked by Gatekeeper at exec.
-     - Not yet tested: the Developer ID flavour, which needs the identity, and launching the notifier from an SSH session.
+     - Launching from an SSH session works: `open` hands the bundle to LaunchServices in the console session, where the notification is shown (confirmed). Not yet tested: the Developer ID flavour, which needs the identity.
    - **Q-M4 (confirmed): the permission survives upgrades.**
      - It is keyed by bundle id, not by cdhash. After the binary changed, both a fresh directory and an in-place rewrite stayed authorized with no user action.
+     - The grant also outlives the bundle. After the bundle was deleted and unregistered, a new bundle with the same id at a new path came up authorized.
      - Any same-user bundle claiming the id inherits the permission. That is acceptable, because the notifier carries no security weight.
    - **Q-M5 (settled 2026-10-23): name, icon and cleanup.**
      - Display names (`CFBundleName`, `CFBundleDisplayName`) differ per flavour, as listed above. System Settings shows each bundle id as its own row, and rows with identical names cannot be told apart.
@@ -864,3 +868,6 @@ macOS (separate implementation, §11):
 - 2026-10-23: Q-M2 addressed by the LaunchAgent transport decided in [hardening §9.2](hardening.md) (§11, §12).
 - 2026-10-23: macOS integrity: Developer ID builds run a signed helper bundle holding the data-protection keychain (strong), every tier gets the protected directory through `harden` (strong), the legacy keychain is weak; store kinds renamed, `generation` added to `IntegrityRecord`, `ResetIntegrity` added (§1, §3, §4, §7, §11, §12).
 - 2026-10-23: macOS update 2: LocalAuthentication shows its sheet on the console from either launchd domain; Secure Enclave keys not used; `AuthorizationCopyRights` confirmed from `gui/<uid>`; Q-M3 confirmed (ad-hoc notifiers start denied), Q-M4 confirmed (permission keyed by bundle id), Q-M5 settled (§11).
+- 2026-10-23: The setgid non-member case is confirmed on macOS (§11).
+- 2026-10-23: From a real SSH session: LocalAuthentication prompts on the console, `AuthorizationCopyRights` returns `-60007`, and the notifier is shown on the console; the notification grant outlives its bundle (§11).
+- 2026-10-23: The origin of a macOS platform prompt is derived from the peer's audit session and exposed as `context.console_session` (§11).

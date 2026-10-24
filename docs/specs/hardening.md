@@ -763,13 +763,13 @@ The protobuf messages and the agent's handlers are shared with Linux. Only the t
 
 **Session.**
 - An agent in `gui/<uid>` runs in the user's GUI session. Both the LocalAuthentication sheet and the administrator dialog (`AuthorizationCopyRights`) can appear from there. This addresses Q-M2 ([platform-helper §11](platform-helper.md)).
-- An agent in `user/<uid>` still gets the LocalAuthentication sheet on the console while a GUI session exists. `AuthorizationCopyRights` fails there at once with `errAuthorizationInteractionNotAllowed` (`-60007`). Both are confirmed.
+- An agent in `user/<uid>` still gets the LocalAuthentication sheet on the console while a GUI session exists. `AuthorizationCopyRights` fails there at once with `errAuthorizationInteractionNotAllowed` (`-60007`). Both are confirmed, and the same holds for a process in an SSH session.
 - An agent started in `user/<uid>` keeps running when a GUI login appears later. `mairu kill-agent` lets the next client start it in `gui/<uid>`.
 
-**Q-M11: SSH logins (partly confirmed).** Tested on macOS 27.2 with launchd jobs standing in for SSH sessions:
+**Q-M11: SSH logins (confirmed while a console login exists).** Tested on macOS 27.2, first with launchd Background jobs, then from a real SSH session:
 - `launchctl bootstrap` into `gui/<uid>` and into `user/<uid>` both work as the user, without root.
 - A client running as a Background job in `user/<uid>` reaches a `gui/<uid>` Mach service while the console session exists (confirmed). A GUI client reaches a `user/<uid>` Background service too (confirmed).
-- A real sshd session is expected to behave like that Background job, since it also has its own audit session and resolves through the per-user bootstrap. This is inferred; it is to be tested with Remote Login on.
+- A real SSH session (`ssh localhost`) gets its own audit session, and `launchctl managername` reports Background. From it, a client reaches the `gui/<uid>` service, and `launchctl bootstrap` into `gui/<uid>` and `user/<uid>` both succeed (confirmed).
 - With no console login, `gui/<uid>` is expected not to exist, so the client bootstraps into `user/<uid>`. This is inferred and untested.
 
 Over SSH, the ssh-agent method ([policy §6.2](policy.md)) is the one that reaches a remote user, as on headless Linux.
@@ -846,14 +846,26 @@ sudo mairu harden   (macOS, every tier)
 
 `harden` is the macOS counterpart of §4.4, for every tier. It provides the **protected directory**, the strong policy store that needs no app bundle ([platform-helper §7, §11](platform-helper.md)). Ad-hoc builds also get a root-owned location and the hardened runtime.
 
-- **Copies.** Mode bits are not covered by a code signature, so the setgid bit leaves a Developer ID signature valid. Ad-hoc builds are re-signed with the runtime before the mode is set.
+- **Copies.** Mode bits are not covered by a code signature, so the setgid bit leaves a signature valid (confirmed for ad-hoc builds). Ad-hoc builds are re-signed with the runtime before the mode is set. The copy does not carry `com.apple.quarantine` over: an unnotarized, quarantined ad-hoc binary stops at a Gatekeeper dialog when executed. Whether `harden` itself is affected by a quarantined input is untested.
 - **The helper bundle**, when the build carries one, is copied too and its executable made setgid `mairu`. The helper then holds both the entitlement for the data-protection keychain and the marker for the protected directory, so both strong stores are written together.
 - **Protected directory.** `/private/var/db/mairu/users/<uid>/policy.record`, with the Linux rules: the helper writes it holding the marker gid, and checks the ancestors are root-owned and not group- or other-writable. `/var` is a symlink, so the canonical path is used.
 - **Upgrades.** The hardened copy must be refreshed after upgrading. Until then, other installs re-exec the older copy and warn about the version skew (§4.3).
   - The Homebrew cask's `postflight` runs the new binary's `sudo mairu harden` when a hardened copy already exists (decided 2026-10-23). `harden` never re-execs (§4.3), so the new version installs itself. This asks for a password during `brew upgrade`. If it fails, for example in a non-interactive upgrade, the upgrade still succeeds and prints the command to run.
   - Other installs re-run it by hand.
 - **Ad-hoc peers** match only byte-identical binaries. Each upgrade therefore replaces the running agent (§5.3) and drops its sessions.
-- **Q-M9:** confirm the non-member case. Does a setgid exec by a user outside the group set `P_SUGID`, making a restricted process? Neither tier depends on it: the hardened runtime, which every hardened tier has, already ignores `DYLD_*` variables and refuses task ports to same-user code. The member case was observed: the egid was granted but `P_SUGID` stayed 0 ([platform-helper §11](platform-helper.md)).
+- **Q-M9 (confirmed 2026-10-23): the marker group carries over.** Tested on macOS 27.2 with a group the user is not a member of, for a linker-signed build and for an ad-hoc build re-signed with the runtime. A setgid exec makes a restricted process:
+  - the egid is set, `P_SUGID` is set, and `issetugid()` returns 1;
+  - `DYLD_INSERT_LIBRARIES` is stripped;
+  - same-user `task_for_pid` is refused (`vmmap`, `lldb -p`);
+  - `LOCAL_PEERCRED` reports the egid as `cr_groups[0]`.
+
+  A **member** of the group gets the egid but none of the restriction, so membership, primary or supplementary, silently disables it. `harden` therefore refuses when the user is a member (§3.1).
+- **Ad-hoc re-signing is deterministic (confirmed).** A root-owned copy and a user-writable copy signed the same way from the same bytes have the same cdhash, and they verify each other in both directions. For ad-hoc builds, the `harden` copy therefore adds no identity of its own. What it adds:
+  - a binary that same-user code cannot rewrite;
+  - the setgid marker for the protected directory;
+  - one cdhash that every install converges on through re-exec, so different installs stop replacing each other's agent.
+
+  A tampered user-writable binary still fails cdhash verification.
 - **Q-M6 (decided 2026-10-23):** ad-hoc builds get strong policy integrity only through `harden`. Without it, they have only the weak legacy keychain, and their policy only tightens ([policy §9.8](policy.md)).
 - The notifier bundle of ad-hoc builds is assembled locally ([platform-helper §11](platform-helper.md)).
 
@@ -920,8 +932,8 @@ cargo install                                ad-hoc
 ```text
 Q-M1  socketpair peer info (confirmed)   Q-M2  GUI session (addressed)         Q-M3  notifier authorization (confirmed)
 Q-M4  permission kept on upgrade         Q-M5  notifier name, icon (settled)   Q-M6  ad-hoc store (decided)
-Q-M7  Homebrew (decided)                 Q-M8  LOCAL_PEERTOKEN (confirmed)     Q-M9  setgid non-member case
-Q-M10 transport (XPC, decided)           Q-M11 LaunchAgent over SSH (partly)   Q-M12 helper bundle and keychain
+Q-M7  Homebrew (decided)                 Q-M8  LOCAL_PEERTOKEN (confirmed)     Q-M9  setgid non-member (confirmed)
+Q-M10 transport (XPC, decided)           Q-M11 SSH (no-console case open)      Q-M12 helper bundle and keychain
 ```
 
 - Q-M1 to Q-M5, Q-M12: [platform-helper §4, §11](platform-helper.md)
@@ -1152,7 +1164,7 @@ macOS (separate implementation, §9):
 - [ ] Code-signature peer verification for every tier, on every message (§9.1, §9.2)
 - [ ] Embedded `Info.plist` with the minimum client and agent versions (§9.3)
 - [ ] Release pipeline: Developer ID signing, notarization, embedded notifier and helper bundle with its provisioning profile (§9.4)
-- [ ] `harden` on macOS for every tier: setgid copies, protected directory, LaunchAgent repointing (§9.5); settle Q-M9
+- [ ] `harden` on macOS for every tier: setgid copies, protected directory, LaunchAgent repointing (§9.5; Q-M9 confirmed)
 
 Development process (§15):
 - [ ] Dev profile (§15.1)
@@ -1189,3 +1201,5 @@ Future:
 - 2026-10-23: Q-W3 answered: Windows OpenSSH 9.5p2 reaches Windows Hello but rejects its self-attested credential, so the isolated profile has no Windows Hello (§8.3, §8.5).
 - 2026-10-23: macOS update 2: Q-M11 partly confirmed (a Background client reaches a gui/<uid> service; `user/<uid>` when there is no GUI login), session behaviour of LocalAuthentication and the administrator dialog (§9.2); Q-M3, Q-M4 confirmed and Q-M5 settled (§9.9).
 - 2026-10-23: Decided: separate minimum client and agent versions, raised for client-side and agent-side flaws respectively, both for protocol-level ones (§9.3); Windows Hello-gated SSH agents documented for isolated WSL2 (§8.3); the Homebrew cask refreshes an existing hardened copy on upgrade (§9.5, §9.8).
+- 2026-10-23: Q-M9 confirmed: a setgid exec by a non-member makes a restricted process on macOS, so the marker group carries over; ad-hoc re-signing is deterministic (§9.5).
+- 2026-10-23: Q-M11 confirmed from a real SSH session while a console login exists; the no-console case stays open (§9.2).

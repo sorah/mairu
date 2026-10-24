@@ -319,6 +319,11 @@ While waiting, the client prints context to its terminal through `crate::termina
 :: mairu :: Approve in the system dialog.             # or: enter your password below / approve on your SSH agent
 ```
 
+**macOS: requests from outside the console session.** The LocalAuthentication sheet always appears on the Mac's screen, whichever session asked ([platform-helper §11](platform-helper.md)). By default it is still offered for a requester outside the console's audit session, such as an SSH login (decided 2026-10-23):
+- The reason text names the origin, for example `requested from an SSH session: terraform apply`.
+- The client prints `Approve on the Mac's screen.`, so a remote user knows why nothing appears in the terminal.
+- `context.console_session` is `false` for such requests (§9.2), and a `forbid` like `no-console-sheet-from-ssh` (§9.3) turns the sheet off for them. Key-based methods then remain.
+
 The same keys go into polkit `details`:
 
 - `server`, `role`
@@ -388,7 +393,7 @@ Mairu::Account "123456789012"       ─┴─ parents of
 Mairu::Role    "contoso:123456789012/Admin"
 action AssumeRole
   context.presence  {verified, scope: none|request|process|session, method?, age, idle}
-  context.*         ai_agent, ai_agent_names, session, tty?, hardened, wsl_interop?,
+  context.*         ai_agent, ai_agent_names, session, tty?, hardened, wsl_interop?, console_session?,
                     intent, exec_command?, exec_command_line?, cwd?, chained_role_arn?
 ```
 
@@ -447,6 +452,8 @@ namespace Mairu {
       hardened: Bool,
       // Present only on WSL2: whether Windows interop is enabled, which makes root reachable ([hardening §8](hardening.md)).
       wsl_interop?: Bool,
+      // Present only on macOS: whether the requester is in the console's audit session; false for SSH logins (§7).
+      console_session?: Bool,
       // Reported by the client: truthful about what it will do, but chosen by whoever runs it (§9.4).
       intent: String,
       exec_command?: String,
@@ -467,6 +474,7 @@ Reference for the context attributes:
 | `session`, `tty` | `"tty"` `"parent"` `"none"`, `/dev/pts/N` | agent, from the kernel |
 | `hardened` | | agent |
 | `wsl_interop` | present only on WSL2 | agent ([hardening §8](hardening.md)) |
+| `console_session` | present only on macOS; `false` for SSH logins and other non-console audit sessions | agent, from the peer's audit token ([platform-helper §11](platform-helper.md)) |
 | `intent` | `"exec"` `"credential-process"` `"unknown"` | client |
 | `exec_command` | basename of `argv[0]` | client, `exec` only |
 | `exec_command_line` | shell-escaped argv, truncated to 4 KiB | client, `exec` only |
@@ -535,16 +543,24 @@ when {
 @id("no-ai-prod")
 forbid (principal, action, resource in Mairu::Account::"999999999999")
 when { context.ai_agent };
+
+// macOS: never raise the Touch ID sheet on the console for a request from an SSH login.
+@id("no-console-sheet-from-ssh")
+forbid (principal, action == Mairu::Action::"AssumeRole", resource)
+when {
+  context.presence has method && context.presence.method == "platform" &&
+  context has console_session && !context.console_session
+};
 ```
 
 ### 9.4 Which context can be trusted
 
 ```text
-agent-determined   presence · hardened · wsl_interop · session · tty · ai ancestry    → may grant
+agent-determined   presence · hardened · wsl_interop · console_session · session · tty · ai ancestry  → may grant
 requester-chosen   intent · exec_command · cwd · chained_role_arn · env names      → narrow or forbid only
 ```
 
-- **Determined by the agent**: `presence`, `hardened`, `wsl_interop`, `session`, `tty`, and the ancestry half of `ai_agent`. These cannot be influenced by the requester beyond actually being in that position.
+- **Determined by the agent**: `presence`, `hardened`, `wsl_interop`, `console_session`, `session`, `tty`, and the ancestry half of `ai_agent`. These cannot be influenced by the requester beyond actually being in that position.
 - **Reported by the client**: `intent`, `exec_command`, `exec_command_line`, `cwd`, `chained_role_arn`, and the environment half of `ai_agent`. A verified client reports them truthfully, but whoever runs `mairu` chooses them: same-user code can `cd` into any directory or exec any command. Use them to **narrow** a `permit` that also requires `context.presence.verified`, or in a `forbid`. Never rely on them alone to grant access.
 
 `mairu policy check` and `mairu policy approve` list every `permit` that can apply without a human check, so these are always visible at approval time.
@@ -1059,3 +1075,4 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - 2026-10-23: The ssh-agent method accepts any registered key type; the lock on a key is the SSH agent's and the user's responsibility. `sk-` keys still have their user-present flag checked (§6.2).
 - 2026-10-23: Integrity stores classified as strong or weak, with a generation in each record to order strong stores; weak stores count as approval only on unhardened agents; macOS recovery through `mairu policy reset-record` with an administrator authorization (§9.7–§9.9, §10).
 - 2026-10-23: Q-W2 confirmed: Windows Hello KeyCredential signatures are RSA-2048 PKCS #1 v1.5 with SHA-256; test vector recorded (§6.3).
+- 2026-10-23: Decided: on macOS, requests from outside the console's audit session may use the platform sheet by default, with the origin shown; `context.console_session` lets a policy forbid it (§7, §9.2–§9.4).
