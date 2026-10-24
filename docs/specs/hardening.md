@@ -338,8 +338,8 @@ main  (hardened copy)
 
    ```text
    show when   Linux · Unhardened · no candidate · stderr is a terminal · not disabled
-               · not yet shown in this terminal session
-               · and interval_days == 0, or interval_days have passed since it was last shown
+               · and interval_secs have passed since it was last shown (default 3600)
+               · or, with interval_secs == 0, it has not been shown in this terminal session yet
    state       state_dir()/harden-suggestion.json  {"last_shown": "<RFC 3339>", "session": {"sid": N, "start_time": T}}
    disable     MAIRU_NO_HARDEN_SUGGESTION=1 · config.json "harden_suggestion": {"enabled": false}
    ```
@@ -349,10 +349,10 @@ main  (hardened copy)
    - `config.json` (`UserConfig`, unprotected) sets the period:
 
      ```jsonc
-     {"harden_suggestion": {"enabled": true, "interval_days": 7}}
+     {"harden_suggestion": {"enabled": true, "interval_secs": 3600}}
      ```
 
-     The default is 7 days. `0` shows it once per terminal session.
+     The default is 1 hour, counted across all terminals. `0` switches to once per terminal session instead.
    - If the state file cannot be written, the suggestion is skipped rather than repeated on every invocation.
    - `mairu doctor` always shows the hardening state, whatever the suggestion settings.
 
@@ -1247,4 +1247,4 @@ Future:
 - 2026-10-24: Deferred: Q-M11 without a console login (no Mac to test on; the client falls back to `user/<uid>`), and the official-build checks until the Developer ID is issued (§9.2, §9.5, §9.9).
 - 2026-10-24: One macOS helper bundle, which also posts notifications, replaces the separate notifier (Q-M13); `harden` writes it for every build (§9.4, §9.5, §9.8, §15).
 - 2026-10-24: Marker gid taken from this exec's setgid grant (`AT_SECURE`, effective gid at startup), confirmed by reverse lookup, never 0 or 65534; group passwords removed by `harden`, and peers whose real gid is the marker rejected (§3.1, §4.2, §4.4, §5.1, §5.2, §11).
-- 2026-10-24: The harden suggestion repeats once per terminal session at most, every 7 days by default (`harden_suggestion.interval_days`, 0 for every session), unless disabled (§4.3).
+- 2026-10-24: The harden suggestion repeats every hour by default (`harden_suggestion.interval_secs`; 0 for once per terminal session), unless disabled (§4.3).
