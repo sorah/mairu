@@ -159,6 +159,35 @@ capabilities  peer_verification=SETGID
 - An old unhardened client talking to a hardened agent is unverified and gets `REASON_UNVERIFIED_PEER`.
 - Versions already diverge noisily (the existing `PingAgent` warning). Hardened deployments run one binary, so mixed versions are transitional.
 
+### Hardened agent environment
+
+A hardened agent trusts neither its environment nor network settings the user's processes can edit. Otherwise same-user code could send the session tokens elsewhere without any prompt: an `endpoint_url` in `~/.aws/config`, an `HTTPS_PROXY` in the environment of a client that starts the agent, or an extra CA in `SSL_CERT_FILE`.
+
+```text
+environment   cleared at start, keeping only an allowlist:
+                HOME USER LOGNAME LANG LC_* TZ XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_STATE_HOME
+                MAIRU_AGENT_SOCK MAIRU_LOG MAIRU_AGENT_LOG
+              PATH reset to /usr/local/bin:/usr/bin:/bin
+AWS clients   built from explicit configuration: the server config's region, the default endpoints;
+              never ~/.aws/config, ~/.aws/credentials or AWS_* variables
+HTTP clients  no proxy
+TLS roots     the system trust store, read from root-owned locations only
+```
+
+- The agent clears its environment as its first action when `Hardened`, whoever started it: a client, launchd, systemd, or a shell. A hardened client also spawns the agent with the allowlist only.
+- The platform helper inherits the cleared environment.
+- The allowlist keeps the paths that locate configuration, which same-user code can edit anyway; that configuration is protected by other means.
+- Unhardened agents keep today's behavior.
+
+### Minimum versions
+
+A hardened binary carries two minimum versions, from `[package.metadata.mairu]` in `Cargo.toml`: `minimum-client-version` and `minimum-agent-version`.
+
+- Every client sends its version as gRPC metadata (`mairu-version`) on every request. A verified peer reports it truthfully.
+- The agent refuses a verified client older than its minimum client version with `REASON_UNVERIFIED_PEER` and a detail naming the versions.
+- A client checks the version from `PingAgent`, and replaces a verified agent older than its minimum agent version as it replaces an unverified one ([Replacing an unverified agent](#replacing-an-unverified-agent)).
+- A release raises `minimum-client-version` when it fixes a client-side flaw, `minimum-agent-version` for an agent-side flaw, and both for a protocol-level one. Older hardened copies left on the host then stop counting as genuine for newer peers.
+
 ### Dev profile
 
 ```text
@@ -170,11 +199,11 @@ debug build (cfg(debug_assertions))  → profile "dev"        MAIRU_PROFILE=dev|
 
 A contributor's build must never touch their installed mairu. Its identity differs from the installed agent's, so without isolation it would replace that agent ([Replacing an unverified agent](#replacing-an-unverified-agent)), dropping its sessions.
 
-- Debug builds therefore default to the **dev profile**, and release builds to `default`. `MAIRU_PROFILE` overrides either way.
+- Debug builds therefore default to the **dev profile**, and release builds to `default`. `MAIRU_PROFILE` overrides either way, except in a hardened process, which ignores it and uses its build's default.
 - The dev profile changes the agent socket (`mairu-dev-agent.sock` instead of `mairu-agent.sock`, in the same runtime directory) and the state directory (`mairu-dev` instead of `mairu`). Configuration is shared.
 - An explicit `MAIRU_AGENT_SOCK` still wins over the profile's socket path.
 - The profile appears in `GetAgentStatus` (`profile`) and `doctor`.
-- Setting `MAIRU_PROFILE` on someone else's mairu gains nothing. A separate agent has no sessions.
+- Setting `MAIRU_PROFILE` on someone else's unhardened mairu gains nothing. A separate agent has no sessions.
 
 ## Drawbacks
 
@@ -206,6 +235,8 @@ rogue client                       ✗ marker gid at connect()
 socket squatter / rogue agent      ✗ client checks the listen-time marker; replaced
 pid reuse                          ✗ pidfd + start time
 group password (newgrp / sg)       ✗ a real gid of mairu is rejected
+redirected endpoints, proxy, CA   ✗ hardened agent clears its environment, ignores ~/.aws/config
+older hardened copies             ✗ minimum client and agent versions
 ```
 
 | Threat | Mitigation |
@@ -218,6 +249,10 @@ group password (newgrp / sg)       ✗ a real gid of mairu is rejected
 | A redirected `MAIRU_AGENT_SOCK` | Verified like the default path |
 | A squatter that ignores `ShutdownAgent` | Keeps running on an unlinked socket and is never reached again |
 | Contributor builds touching the installed agent | Dev profile ([Dev profile](#dev-profile)) |
+| Session tokens sent to an attacker's endpoint, proxy or CA (`~/.aws/config` `endpoint_url`, `AWS_ENDPOINT_URL_*`, `HTTPS_PROXY`, `SSL_CERT_FILE`) | The hardened agent clears its environment to an allowlist, builds AWS clients from explicit configuration, uses no proxy and the system roots ([Hardened agent environment](#hardened-agent-environment)) |
+| An older hardened copy (a stale `harden` home, an old package) started as the agent or used as a client | Minimum client and agent versions, raised by fixing releases ([Minimum versions](#minimum-versions)) |
+| `MAIRU_PROFILE` on a hardened binary, to reach records with a weaker anchor | Ignored when hardened |
+| A connected agent socket inherited by `mairu exec`'s command, which would then be a verified client | Every agent connection is opened `O_CLOEXEC`, and the executor closes it before dropping the marker and exec'ing |
 
 - `/proc/<pid>/cmdline` is read for display only. The agent logs rejected peers with their pid, uid and gids, and nothing else.
 
@@ -257,6 +292,11 @@ Stack layer: `hardening/peer-verification`.
 | `src/cmd/login.rs` | Stop before `CompleteOauthCode` if the agent is unverified |
 | `src/cmd/doctor.rs`, `src/cmd/mod.rs`, `src/main.rs` | New `mairu doctor` |
 | `src/config.rs` | Profiles: socket path and state directory per profile |
+| `src/hardening.rs` | `sanitize_environment()`: the allowlist; called first by a hardened agent and applied to every agent spawn |
+| `src/awssso_client.rs`, `src/ext_awssso.rs`, `src/agent.rs` | AWS clients built with `aws_config::defaults(…).no_credentials()` plus an explicit region, never `load_defaults`, when hardened |
+| `src/client.rs` | `reqwest` with `.no_proxy()` and the system roots when hardened |
+| `build.rs`, `Cargo.toml` | `[package.metadata.mairu]` minimum versions compiled in |
+| `src/agent.rs`, `src/cmd/agent.rs` | `mairu-version` metadata; minimum-version checks on both sides |
 
 `src/platform/` and `crate::proto::platform` are core modules, outside the `cli` gate ([002 Cargo features](002-build-layout.md#cargo-features)). `PeerStream`, the handlers and the commands are `cli` code.
 
@@ -427,7 +467,9 @@ message Capabilities {
 - Trust tables for both sides, as pure functions.
 - Accept handling on a socketpair: a peer of another uid is closed; a dead pid after the read is detected.
 - Integration (root, disposable VM): hardened client and agent verify each other; an unhardened client is refused; an unhardened agent is replaced; `kill-agent` stops an unverified agent.
-- Dev profile path selection: debug default, `MAIRU_PROFILE` overrides, `MAIRU_AGENT_SOCK` wins.
+- Dev profile path selection: debug default, `MAIRU_PROFILE` overrides, `MAIRU_AGENT_SOCK` wins; a hardened process ignores `MAIRU_PROFILE`.
+- Environment: a hardened agent started with `HTTPS_PROXY`, `SSL_CERT_FILE`, `AWS_ENDPOINT_URL` and an `endpoint_url` in `~/.aws/config` contacts the default endpoints directly.
+- Minimum versions: an older verified client is refused; an older verified agent is replaced.
 
 ### Requirements
 
@@ -446,7 +488,9 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - [ ] Unverified-agent replacement (`--replace-unverified`); `kill-agent` without verification; `login` stops on an unverified agent
 - [ ] `proto/mairu_platform.proto`; `GetAgentStatus`, `PeerView`, `AuthorizationError{REASON_UNVERIFIED_PEER}`
 - [ ] `mairu doctor`
-- [ ] Dev profile (socket path, state directory, `MAIRU_PROFILE`)
+- [ ] Dev profile (socket path, state directory, `MAIRU_PROFILE`, ignored when hardened)
+- [ ] Hardened agent environment: allowlist, explicit AWS client configuration, no proxy, system TLS roots
+- [ ] Minimum client and agent versions
 
 ### Updates
 

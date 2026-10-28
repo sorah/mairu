@@ -126,7 +126,7 @@ The protobuf messages and the agent's handlers are shared with Linux. Only the t
 **Installing and replacing the LaunchAgent.**
 - When the service does not answer, the client writes the plist, pointing at the binary to run, and bootstraps it into `gui/<uid>`. If that fails, for example with no GUI login, it bootstraps it into `user/<uid>` with `LimitLoadToSessionType` `Background` (Q-M11).
 - Replacing an unverified or outdated agent ([004 Replacing an unverified agent](004-peer-verification.md#replacing-an-unverified-agent)) is `launchctl bootout gui/<uid>/co.0w0.mairu.agent`, then rewriting the plist and bootstrapping it again.
-- The plist lives in a user-writable directory and is not trusted. Same-user code can rewrite it, or start the genuine binary with any arguments and environment, which the adversary can do anyway ([001 Adversary](001-security-model.md#adversary)). Whatever answers the service name must still pass the client's check.
+- The plist lives in a user-writable directory and is not trusted. Same-user code can rewrite it, with any arguments and `EnvironmentVariables`. Whatever answers the service name must still pass the client's check, and the agent clears its environment at start as on Linux ([004 Hardened agent environment](004-peer-verification.md#hardened-agent-environment)), so a planted proxy, CA or endpoint never reaches its connections.
 - A job that claims the service name first only denies service, which same-user code can also do by killing the agent.
 
 **Session.**
@@ -223,7 +223,7 @@ On macOS the top of the trust chain ([001 Trust chain](001-security-model.md#tru
 | Lending a connected socket to a genuine signed process, so its audit token stands in for the attacker | XPC: every message carries its sender's audit token ([XPC transport](#xpc-transport)) |
 | Rogue client | Peer code must satisfy the agent's own designated requirement, with the hardened runtime and no get-task-allow, on every message |
 | Rogue agent, or a squatted service name | Clients verify whatever answers, on every reply; squatting only denies service |
-| Rewritten LaunchAgent plist | Not trusted; clients verify whatever answers the service on every message |
+| Rewritten LaunchAgent plist | Not trusted; clients verify whatever answers the service on every message; the agent clears the environment the plist sets |
 | Injection into or debugging of the genuine binary | Hardened runtime, no `get-task-allow`, `PT_DENY_ATTACH` in the agent |
 | An old official agent or client with a known flaw | Signed minimum client and agent versions in the embedded `Info.plist` ([Minimum versions](#minimum-versions)) |
 | Pid reuse | Audit-token pid version wherever a pid is recorded |

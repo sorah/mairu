@@ -94,7 +94,7 @@ All authorization state is in memory only. Restarting the agent forgets every gr
 While waiting, the client prints context to its terminal through `crate::terminal` (the existing `/dev/tty`-or-stderr writer):
 
 ```
-:: mairu :: Authorization required: 123456789012/Admin on contoso
+:: mairu :: Authorization required: 123456789012/Admin on contoso (https://contoso.awsapps.com/start)
 :: mairu ::   command: terraform apply
 :: mairu ::   cwd:     /home/u/src/infra
 :: mairu ::   from:    /dev/pts/3 (zsh, tmux pane)
@@ -103,7 +103,7 @@ While waiting, the client prints context to its terminal through `crate::termina
 
 The same keys go into polkit `details`:
 
-- `server`, `role`
+- `server`, `role`, and `server_url`: the credential server's URL from the session's config, so a repointed server is visible
 - `command`: shell-escaped, truncated to 512 bytes
 - `cwd`, `tty`
 - `requester`: peer exe path and pid
@@ -298,7 +298,7 @@ authorize(request)
 
 **Fail closed on evaluation errors.** Any candidate whose response carries errors is treated as `Deny`, and the errors are logged.
 
-**Coalescing.** Concurrent requests with the same grant key wait on one platform prompt through the existing `crate::singleflight::Singleflight`.
+**Coalescing.** Concurrent requests share one platform prompt only when they are the same request from the same peer. The `crate::singleflight::Singleflight` key is `(peer pid, start_time, request digest)`, where the **request digest** is SHA-256 over the prost encoding of `{action, server_id, rolespec, ClientContext}`. Requests with the same grant key but another command, or from another process, get their own prompt: a policy with `scope == "request"` must permit only the request the human saw.
 
 **Clock.** `CLOCK_BOOTTIME` throughout, behind an injectable clock for tests.
 
@@ -611,7 +611,7 @@ message AuthorizationError {
   - grant idle and hard-cap expiry, lease idle from `last_demand_expiry`, pre-fetches never moving it and never prompting;
   - every platform result mapping to its reason;
   - an evaluation error turning into `Deny`;
-  - singleflight: concurrent requests with one grant key cause one prompt.
+  - singleflight: concurrent identical requests from one peer cause one prompt; another command or another peer with the same grant key gets its own.
 - The schema and built-in policies validate in strict mode, and evaluate as commented for each candidate presence.
 - polkit without a human: the hardened CI job ([005](005-install.md)) installs a test-only rules file, `/etc/polkit-1/rules.d/49-mairu-test.rules`, that returns `YES` or `NO` for `co.0w0.mairu.*`, which covers the result mapping:
 

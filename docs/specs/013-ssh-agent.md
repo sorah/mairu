@@ -146,7 +146,7 @@ A stale socket declines, and the agent moves on to the next method.
 
 - mairu cannot see the lock on a key. A registered key held unlocked in an SSH agent proves only that the agent is reachable.
 - Same-user code on the remote host can also reach the forwarded agent socket and request a signature. Only the agent's own lock stands between that code and a signature.
-- An attacker who times a request to coincide with the user's own can steal one approval: the human sees one signature request and cannot tell whose it is.
+- An attacker who times a request to coincide with the user's own can steal one approval: the human sees one signature request and cannot tell whose it is. Same-user code can also repoint the `~/.ssh/agent.sock` symlink at a proxy that swaps the next signing request for its own. For a policy approval, which would otherwise hand over the anchor, [012 Anchor changes](012-policy-approval.md#anchor-changes) bounds this: a new anchor needs a second check and waits 24 hours.
 - Agent forwarding has its own well-known risks on the host it is forwarded to. This method relies on it rather than removing them.
 - Every new request under a policy that requires `scope == "request"` needs a signature, which some agents make tedious. Policies choose the scope.
 
@@ -187,7 +187,7 @@ approval downgraded to a password  ✗ anchor holds ssh-agent + keys; check warn
 | A signature made for another purpose (git, SSH login) | SSHSIG namespace `co.0w0.mairu.authorize` is checked |
 | A client lying about which key signed | The agent verifies the SSHSIG against the registered keys only |
 
-**Residual risk.** Same-user code can also reach the agent socket and request a signature. The only thing between that code and a signature is the agent's own lock. With an unlocked key, this method proves no more than "the agent is reachable", which is why the choice of key is yours. The challenge is bound to the requesting process and request, and one approval satisfies one pending request. An attacker who times a request to coincide with the user's own can steal one approval. This is documented.
+**Residual risk.** Same-user code can also reach the agent socket and request a signature. The only thing between that code and a signature is the agent's own lock. With an unlocked key, this method proves no more than "the agent is reachable", which is why the choice of key is yours. The challenge is bound to the requesting process and request, and one approval satisfies one pending request. An attacker who times a request to coincide with the user's own, or who repoints the agent socket symlink at a substituting proxy, can steal one approval. For credentials this is documented. For a policy approval, a change of the anchor needs a second check and waits ([012 Anchor changes](012-policy-approval.md#anchor-changes)).
 
 Every guarantee here is also bounded by the trust chain ([001 Trust chain](001-security-model.md#trust-chain)). Registering a key whose use needs your approval strengthens the steps after root; it does nothing against root.
 
@@ -234,9 +234,9 @@ Step 4 of the decision procedure ([007 Decision procedure](007-authorization.md#
 
 `ssh-agent` is usable when at least one key is registered in the effective settings. A permit records the lease and the grant exactly as a platform prompt does, with `method = "ssh-agent"`.
 
-**Request digest.** SHA-256 over the prost encoding of `{action, server_id, rolespec, ClientContext without authorization_response}`. It binds ssh-agent challenges to the exact request, which the retry must repeat.
+**Request digest.** The request digest of [007 Decision procedure](007-authorization.md#decision-procedure), computed over `ClientContext` without `authorization_response`. It binds ssh-agent challenges to the exact request, which the retry must repeat.
 
-Concurrent requests with the same grant key still wait on one platform prompt through `crate::singleflight::Singleflight`. ssh-agent challenges are per request and are not coalesced.
+Platform prompts are still coalesced per peer and request ([007](007-authorization.md#decision-procedure)). ssh-agent challenges are per request and are not coalesced at all.
 
 **Gate 2** ([009 Gate 2](009-caller-identity.md#gate-2)). When gate 2 needs a fresh check, it now may issue a challenge, with the statement's `action` set to `"use-credentials"`. `REASON_CHALLENGE` is a refusal the client retries after, so the fetched credentials are held under `(peer, request digest)` for at most 60 s, as for every such refusal at gate 2, and the retry fetches nothing again.
 

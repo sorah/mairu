@@ -91,7 +91,7 @@ The identity the credentials really carry, from `sts:GetCallerIdentity`, is avai
 | `caller.session_name` | for an assumed role: the session name |
 
 - The identity is **determined by the agent**, so a policy may rely on it to grant. It comes from STS over TLS to an endpoint the agent fixes, and cannot be influenced by the requester beyond actually holding those credentials.
-- **The endpoint is fixed by the agent, never by the environment.** The default is the global endpoint, `sts.amazonaws.com`. For this call, a hardened agent ignores the environment's endpoint and region overrides (`AWS_ENDPOINT_URL*`, `AWS_REGION`, `AWS_PROFILE` and the shared config files), and verifies TLS against the build's own roots. Under `AT_SECURE`, OpenSSL ignores `SSL_CERT_FILE` and `SSL_CERT_DIR` anyway ([003 Classification](003-marker-gid.md#classification)).
+- **The endpoint is fixed by the agent, never by the environment.** The default is the global endpoint, `sts.amazonaws.com`. For this call, a hardened agent ignores the environment's endpoint and region overrides (`AWS_ENDPOINT_URL*`, `AWS_REGION`, `AWS_PROFILE` and the shared config files), and verifies TLS against the system roots. A hardened agent has already cleared its environment, so `SSL_CERT_FILE`, `SSL_CERT_DIR` and proxy variables never reach its TLS and HTTP stack ([004 Hardened agent environment](004-peer-verification.md#hardened-agent-environment)); this matters for the rustls builds, whose `rustls-native-certs` reads those variables even under `AT_SECURE`.
 - The result is cached with the credentials, in memory, so later vends from the cache need no network call.
 
 **Writing rules for the real account.** At gate 2, the role's `Account` parent is the account in `context.caller`, while `resource.account_id` keeps the account the role name declares:
@@ -175,7 +175,7 @@ a forged identity answer           ✗ endpoint fixed by the agent; environment 
 | Threat | Mitigation |
 |---|---|
 | A server or role name that hides the real account | Gate 2 checks `sts:GetCallerIdentity`; built-in forbid when the declared and real accounts differ ([Gate 2](#gate-2)) |
-| A forged `GetCallerIdentity` answer through an endpoint override | Endpoint fixed by the agent; environment overrides ignored on hardened agents; TLS against the build's own roots ([Caller identity](#caller-identity)) |
+| A forged `GetCallerIdentity` answer through an endpoint override | Endpoint fixed by the agent; environment cleared on hardened agents, so no endpoint, proxy or CA override reaches the client ([Caller identity](#caller-identity), [004 Hardened agent environment](004-peer-verification.md#hardened-agent-environment)) |
 | A cached vend skipping the check | Gate 2 applies to every vend, from the cache too, using the identity cached with the credentials |
 | A policy rule that silently stops matching for opaque role names | Rules written with `resource in Mairu::Account::"…"` follow the real account at gate 2 |
 

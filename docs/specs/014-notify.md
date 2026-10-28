@@ -161,6 +161,7 @@ marker gid leaking to helpers    ✗ hardening::command() drops it before exec
 |---|---|
 | Spoofed, redirected or suppressed notifications and URL opening | Not relied on for security; unprotected client settings by design. Helpers run with the marker dropped and receive only `http`/`https` URLs. |
 | Session-bus input (notification daemon, desktop portal) reaching the same helper that answers `Authorize` and the integrity stores | Accepted: one helper process by design. Session-bus replies are handled through typed zbus proxies and treated as untrusted. A bug there could forge helper answers, so that code is kept minimal and reviewed as security-sensitive. |
+| A hint pointing the helper at a bus that same-user code controls, to attack the process that also answers `Authorize` | The default session bus is already claimable by same-user code ([006](006-platform-helper.md)), so the hint adds no new peer. The helper treats every session-bus reply as untrusted input, and its D-Bus client runs only for `notify` and `open_url`. |
 | A hint pointing the helper at an arbitrary socket or a TCP address | `dbus_session_bus_address` is honored only as `unix:path=` under the user's `$XDG_RUNTIME_DIR` |
 | A URL reaching a custom-scheme handler or a local file | Only `http`/`https`, checked by the agent and again by the helper |
 | Oversized notification content | Title and body truncated to 256 and 1024 bytes |

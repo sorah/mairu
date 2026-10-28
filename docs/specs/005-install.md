@@ -60,7 +60,7 @@ flowchart LR
   D --> M[".harden-manifest"]
 ```
 
-Linux only (BSD later). It must run as root (`euid == 0`); otherwise it exits with the exact command to run: `sudo <canonical exe path> harden`. It is idempotent, and re-running it upgrades the binary.
+Linux only (BSD later). It must run as root (`euid == 0`); otherwise it exits with the command to run, under the rules of [Upgrading the hardened copy](#upgrading-the-hardened-copy). It is idempotent. Run as `harden --from FILE`, it installs `FILE` instead of itself, after verifying it.
 
 1. **Group.** If `mairu` is missing, run `groupadd --system mairu`, falling back to `addgroup --system mairu` (busybox). Refuse if the group has members, or if `SUDO_UID`'s primary gid is `mairu`, and print how to fix it. If `/etc/gshadow` gives the group a password, remove it with `gpasswd -r mairu` (after which only members could `newgrp`, and there are none) and say so ([003](003-marker-gid.md)). `groupadd` leaves it locked, so this only undoes a password someone set.
 2. **Directory.** Create `<harden_home>/libexec/mairu` ([Harden home](#harden-home), `/usr/local/libexec/mairu` by default) as `root:root 0755`. Check that the ancestor chain is root-owned and not group/other-writable.
@@ -72,10 +72,34 @@ Linux only (BSD later). It must run as root (`euid == 0`); otherwise it exits wi
    5. If `/usr/sbin/setcap` or `/usr/bin/setcap` exists, run `setcap cap_ipc_lock=+ep` on the final path. This must come after the `chown`, because `chown` clears file capabilities. It is needed so the agent's `mlockall` succeeds without RLIMIT_MEMLOCK headroom.
    6. Copy every helper found next to its own executable ([002 Shipped helpers](002-build-layout.md#shipped-helpers)) into the same directory, owned by root and not group- or other-writable, with the same temporary-file and rename steps. Each copy is checked as its consumer checks it before the rename, and a helper that fails is skipped with a warning.
 4. **State directory.** Create `/var/lib/mairu` and `/var/lib/mairu/users` as `root:mairu 2770`.
-5. **Manifest.** Record every file written in `.harden-manifest`.
+5. **Manifest.** Record every file written in `.harden-manifest`, and the harden home itself in `/var/lib/mairu/installs`, a root-owned list of every place a hardened copy was installed.
 6. **Next steps.** Print them: the next hardened `mairu` invocation replaces the running unhardened agent automatically ([004 Replacing an unverified agent](004-peer-verification.md#replacing-an-unverified-agent)), or the user can run `mairu kill-agent`.
 
-`mairu harden --uninstall` removes the files listed in the manifest. `--purge` also removes `/var/lib/mairu`. The group is left in place; `groupdel mairu` is documented.
+`mairu harden --uninstall` removes the files listed in the manifest. It reads the manifest only from a harden home whose directory and manifest are root-owned and not group- or other-writable, and removes only listed files inside that directory, so a harden home chosen by same-user code cannot make root delete anything else. `--purge` also removes `/var/lib/mairu`. The group is left in place; `groupdel mairu` is documented.
+
+### Upgrading the hardened copy
+
+```text
+first install   sudo <the binary you chose> harden          the human's own trust decision
+upgrade         sudo <harden_home>/libexec/mairu/mairu harden --from <new mairu>
+                  the installed hardened copy verifies the new file and copies it;
+                  the new file never runs as root
+verification    a sigstore attestation of the file (GitHub artifact attestation, build provenance)
+                  certificate identity   https://github.com/sorah/mairu/.github/workflows/release.yml@refs/tags/v<X.Y.Z>
+                  issuer                 https://token.actions.githubusercontent.com
+                  subject                the SHA-256 of the file
+                  version                X.Y.Z, not older than the installed copy's, unless --allow-downgrade
+bundle          <file>.sigstore.json next to the file, as release archives ship it,
+                otherwise fetched from GitHub's attestation API by the file's digest
+from source     --unattested installs an unattested file, after a warning naming it
+```
+
+- **The first install is the human's decision.** `harden` running from a binary the human picked trusts that binary, as `sudo` does with any program. The README recommends verifying a download first, with `gh attestation verify <file> --repo sorah/mairu`, or using a distribution package.
+- **Upgrades go through the installed copy.** The root-owned hardened copy is already trusted, so it does the verification. It opens the new file once, and hashes and copies that same open file, so the verified bytes are the installed bytes. It also copies the helpers next to the new file ([002 Shipped helpers](002-build-layout.md#shipped-helpers)), checked as in step 3.6 below.
+- **mairu never prints a `sudo` command for a binary that the user's processes can write.**
+  - The version-skew warning prints `sudo <hardened copy> harden --from <user-installed copy>`.
+  - The harden suggestion and the "must run as root" message print `sudo <exe> harden` only when `<exe>` and its ancestors pass the ownership rules of [Candidate validation](#candidate-validation). Otherwise they point to the README's first-install section.
+- **Trust root.** The sigstore public-good trust root, kept current through its TUF repository, with the initial root embedded in the binary. `harden` fetches updates as root. Verification fails closed when it cannot complete.
 
 ### Harden home
 
@@ -114,7 +138,7 @@ sequenceDiagram
 
    ```
    :: mairu :: Using hardened mairu 0.13.0 (/usr/local/libexec/mairu/mairu) instead of mairu 0.14.0 (/home/u/.local/share/mise/installs/mairu/0.14.0/mairu).
-   :: mairu :: To update the hardened copy, run: sudo /home/u/.local/share/mise/installs/mairu/0.14.0/mairu harden
+   :: mairu :: To update the hardened copy, run: sudo /usr/local/libexec/mairu/mairu harden --from /home/u/.local/share/mise/installs/mairu/0.14.0/mairu
    ```
 
    The variables only feed this message, so a forged value cannot do more than print a misleading warning.
@@ -134,7 +158,7 @@ state       state_dir()/harden-suggestion.json  {"last_shown": "<RFC 3339>", "se
 disable     MAIRU_NO_HARDEN_SUGGESTION=1 · config.json "harden_suggestion": {"enabled": false}
 ```
 
-- The message is `:: mairu :: Run 'sudo <exe> harden' to protect your AWS credentials from other programs …`, followed by when it will be shown again and how to turn it off.
+- The message is `:: mairu :: Harden mairu to protect your AWS credentials from other programs …`, with the command when `<exe>` is root-owned ([Upgrading the hardened copy](#upgrading-the-hardened-copy)) and the README link otherwise, followed by when it will be shown again and how to turn it off.
 - The terminal session is computed by the client for itself: the session id of its controlling terminal (`/proc/self/stat` field 6, [004 Process facts](004-peer-verification.md#process-facts)) and the start time of that session's leader. Each tmux pane is its own session.
 - `config.json` (`UserConfig`, unprotected) sets the period:
 
@@ -174,14 +198,14 @@ disable     MAIRU_NO_HARDEN_SUGGESTION=1 · config.json "harden_suggestion": {"e
 ### Operations
 
 ```text
-upgrade     sudo mairu harden (or the package manager) → mairu kill-agent
+upgrade     sudo <hardened copy> harden --from <new mairu> (or the package manager) → mairu kill-agent
 uninstall   sudo mairu harden --uninstall [--purge] → groupdel mairu
 diagnose    mairu doctor
 ```
 
-- **Upgrade**: re-run `sudo mairu harden`, or let the package manager upgrade it. Running agents keep the old image until restarted; the existing version-divergence warning tells the user to run `mairu kill-agent`.
+- **Upgrade**: `sudo <hardened copy> harden --from <new mairu>` ([Upgrading the hardened copy](#upgrading-the-hardened-copy)), or let the package manager upgrade it. Running agents keep the old image until restarted; the existing version-divergence warning tells the user to run `mairu kill-agent`.
 - **Uninstall**: `sudo mairu harden --uninstall [--purge]`, then optionally `groupdel mairu`.
-- **Diagnose**: `mairu doctor` ([004](004-peer-verification.md)), which this step extends with the root-reachability warnings below.
+- **Diagnose**: `mairu doctor` ([004](004-peer-verification.md)), which this step extends with the root-reachability warnings below. It also lists every hardened copy recorded in `/var/lib/mairu/installs`, plus `/usr/bin/mairu`, with versions, and warns about copies older than the minimum versions ([004 Minimum versions](004-peer-verification.md#minimum-versions)). `sudo mairu harden --uninstall --home <old home>` removes one.
 
 ### Root reachability in doctor
 
@@ -220,6 +244,7 @@ Recommendations (README):
 - **Run the user's newer copy when versions differ.** Rejected: it would be unverified. The hardened copy is the single authoritative binary; a version mismatch prints which binary ran and the exact command to update it.
 - **Trust the candidate path without validation.** Rejected: the candidate must be root-owned, setgid `mairu`, not group/other-writable, not on FUSE, with root-owned and non-writable ancestors. Otherwise same-user code could plant a "hardened" binary. The checks are pure functions so they can be unit-tested.
 - **Copy the binary from a path given on the command line.** Rejected: `harden` copies `/proc/self/exe`, the exact image already running as root, so nothing can swap the file between check and copy.
+- **Signing releases with a project key (minisign) instead of sigstore.** Rejected: a long-lived key would need storing, rotating and protecting. A sigstore attestation is signed by the release workflow's own GitHub OIDC identity, needs no key, and is logged publicly. Rejected as well: re-running the new binary as root to install itself, which is exactly the swap the attestation prevents.
 - **Refuse when the group has a password.** Rejected in favor of removing it with `gpasswd -r`: the password would let anyone who knows it hold the marker as both real and effective gid, and open `/var/lib/mairu` directly. Peer checks reject such processes ([004 Agent side](004-peer-verification.md#agent-side)), but only removing the password protects the directory.
 - **A fixed install location.** Rejected: hosts differ in where root-owned software goes. The harden home is configurable, from unprotected places, which is safe because a candidate counts only after validation.
 - **A one-time harden suggestion.** Rejected: it is easy to miss. The suggestion repeats, at most once an hour by default (`interval_secs`), or once per terminal session with `0`, and can be turned off.
@@ -236,7 +261,10 @@ Recommendations (README):
 | Same-user code changing the harden home (`MAIRU_HARDEN_HOME`, `harden_home`) | It only moves where clients look. A candidate there passes only if root-owned, setgid `mairu` and safely placed, so at most it points clients at another genuine hardened copy, perhaps an older one, which the version-skew warning shows |
 | A planted "hardened" candidate | Candidate validation: root-owned, setgid `mairu`, no group/other write, not FUSE, safe ancestors ([Candidate validation](#candidate-validation)) |
 | Forged `MAIRU_HARDENED_REEXEC_*` variables | They only feed the version message, and the hardened copy unsets them |
-| Swapping the binary while `harden` copies it | `harden` copies `/proc/self/exe`; the temporary file is created with `O_EXCL`, mode `0600`, and renamed atomically |
+| Swapping the binary while `harden` copies it | `harden` copies `/proc/self/exe`, or the one open file it verified for `--from`; the temporary file is created with `O_EXCL`, mode `0600`, and renamed atomically |
+| Swapping a user-writable binary that the user is told to run with `sudo`, to get root | mairu never prints such a command; upgrades run the root-owned hardened copy, which verifies the sigstore attestation of the new file and never executes it ([Upgrading the hardened copy](#upgrading-the-hardened-copy)) |
+| Installing an older genuine release to reintroduce a fixed flaw | The attested version must not be older than the installed one, unless `--allow-downgrade` |
+| A manifest planted in a harden home chosen by same-user code, to make `--uninstall` delete other files as root | The manifest counts only in a root-owned home, and only files inside it are removed |
 | User in the marker group | `harden` refuses and explains ([mairu harden](#mairu-harden)) |
 | Joining the marker group through a group password | `harden` removes the password. The password would also open the protected directory, which is why `harden` removes it rather than relying on peer checks. |
 | Hardlinked old hardened binaries | Atomic replace; `fs.protected_hardlinks` warning ([003](003-marker-gid.md)) |
@@ -270,7 +298,8 @@ Stack layer: `hardening/install`.
 
 | File | Change |
 |---|---|
-| `src/cmd/harden.rs`, `src/cmd/mod.rs`, `src/main.rs` | New `mairu harden [--uninstall [--purge]]` |
+| `src/cmd/harden.rs`, `src/cmd/mod.rs`, `src/main.rs` | New `mairu harden [--home PATH] [--from FILE [--unattested] [--allow-downgrade]] [--uninstall [--purge]]` |
+| `src/attestation.rs`, `Cargo.toml` | Sigstore bundle verification (the `sigstore` crate, with its TUF client and an embedded initial root); fetching a bundle from GitHub's attestation API by digest |
 | `src/hardening.rs` | `reexec_hardened_if_available()`, candidate validation, version-skew message, harden suggestion |
 | `src/config.rs` | `UserConfig.harden_suggestion`, `UserConfig.harden_home`; the dev profile disables re-exec |
 | `src/cmd/doctor.rs` | Root-reachability warnings |
@@ -320,7 +349,9 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 
 ### Checklist
 
-- [ ] `mairu harden`, `--uninstall`, `--purge`
+- [ ] `mairu harden`, `--uninstall`, `--purge`; `--uninstall` reads only a root-owned manifest
+- [ ] Upgrades: `harden --from FILE` with sigstore attestation verification, `--unattested`, `--allow-downgrade`; no `sudo` command printed for user-writable binaries
+- [ ] `/var/lib/mairu/installs`, and `doctor` listing hardened copies
 - [ ] Harden home: `--home`, `MAIRU_HARDEN_HOME`, `harden_home`
 - [ ] Re-exec with candidate validation and the version-skew warning; dev profile disables it
 - [ ] Periodic harden suggestion (`harden_suggestion`, `MAIRU_NO_HARDEN_SUGGESTION`)

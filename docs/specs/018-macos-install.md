@@ -55,13 +55,13 @@ A tampered user-writable binary still fails cdhash verification.
 **Operations on macOS:**
 
 ```text
-upgrade     sudo mairu harden (or the cask's postflight) → mairu kill-agent
+upgrade     sudo <hardened copy> harden --from <new mairu> (or the cask's postflight) → mairu kill-agent
 uninstall   sudo mairu harden --uninstall [--purge] → dseditgroup -o delete mairu
 diagnose    mairu doctor
 ```
 
 - **Upgrades.** The hardened copy must be refreshed after upgrading. Until then, other installs re-exec the older copy and warn about the version skew ([005 Re-exec](005-install.md#re-exec)).
-  - The Homebrew cask's `postflight` runs the new binary's `sudo mairu harden` when a hardened copy already exists (decided 2026-10-23). `harden` never re-execs, so the new version installs itself. This asks for a password during `brew upgrade`. If it fails, for example in a non-interactive upgrade, the upgrade still succeeds and prints the command to run.
+  - The Homebrew cask's `postflight` runs `sudo <hardened copy> harden --from <Caskroom>/mairu` when a hardened copy already exists. The installed copy verifies the new binary's attestation and Developer ID signature and copies it; the new binary never runs as root ([005 Upgrading the hardened copy](005-install.md#upgrading-the-hardened-copy)). This asks for a password during `brew upgrade`. If it fails, for example in a non-interactive upgrade, the upgrade still succeeds and prints the command to run.
   - Other installs re-run it by hand.
 - **Uninstall** works as in [005 mairu harden](005-install.md#mairu-harden). The group is removed with `dseditgroup -o delete mairu`.
 
@@ -94,7 +94,7 @@ Their signed builds are the third-party tier ([017 Build tiers](017-macos-peer-v
 
 ## Drawbacks
 
-- **A password prompt during `brew upgrade`.** The cask's `postflight` runs `sudo mairu harden` when a hardened copy exists. Non-interactive upgrades leave the copy stale until the user runs the printed command.
+- **A password prompt during `brew upgrade`.** The cask's `postflight` runs `sudo <hardened copy> harden --from …` when a hardened copy exists. Non-interactive upgrades leave the copy stale until the user runs the printed command.
 - **Stale hardened copies.** Installs that are not upgraded through the cask re-exec the older hardened copy until `harden` is re-run by hand.
 - **Ad-hoc upgrades drop sessions,** because each upgrade has a new cdhash and replaces the running agent.
 - **The first run of a downloaded official binary needs an online notarization check** when the download is quarantined. A bare Mach-O cannot carry a stapled ticket.
@@ -108,7 +108,7 @@ Their signed builds are the third-party tier ([017 Build tiers](017-macos-peer-v
   - A prebuilt-binary formula: rejected as the primary channel. homebrew/core formulae must build from source, Homebrew directs binary-only software to casks, and Homebrew maintainers call prebuilt-binary formulae unsupported. GoReleaser moved from formulae to casks for that reason.
   - **A cask `mairu`** for official builds, a from-source formula `mairu-src` for ad-hoc builds, and `tap_migrations.json` to move users: **chosen**.
   - **Fallback:** a formula that installs the signed artifact, as hashicorp/tap and cirruslabs/tart do. It keeps the signature and avoids quarantine, but Homebrew maintainers call the pattern unsupported.
-- **Refreshing the hardened copy on cask upgrades** (decided 2026-10-23): the cask's `postflight` runs `sudo mairu harden` when a copy exists, and degrades to printing the command. The alternative, leaving it to the user, keeps every install on the old copy until someone notices the skew warning.
+- **Refreshing the hardened copy on cask upgrades** (decided 2026-10-23): the cask's `postflight` runs the installed copy's `harden --from` when a copy exists, and degrades to printing the command. Running the new Caskroom binary itself as root was rejected: the Caskroom is writable by the user's processes, so swapping that binary first would give same-user code root. The alternative, leaving it to the user, keeps every install on the old copy until someone notices the skew warning.
 - **`harden` for every tier**, not only Developer ID builds (decided 2026-10-23). It is the only strong policy store an ad-hoc build can have, and it gives ad-hoc builds the hardened runtime and a root-owned location.
 - **Release builds per architecture**, not universal (decided 2026-10-29). Apple is phasing out Intel Macs, and a universal binary carries both architectures in every download ([002](002-build-layout.md)).
 - **One release run.** Every artifact of a release, macOS included, is built, signed and published from one tag in one workflow run, so all artifacts always share a version. Separate pipelines per platform were rejected: GitHub releases do not work well with several pipelines writing to one release.
@@ -170,7 +170,7 @@ Stack layer: the macOS implementer's own layers, on top of [017](017-macos-peer-
 `src/cmd/harden.rs` gains a macOS branch, root-only, following [005 mairu harden](005-install.md#mairu-harden) where the platforms agree:
 
 1. **Group.** `dseditgroup -o read mairu`; if missing, `dseditgroup -o create mairu`. Refuse if `SUDO_UID`'s user is a member, primary or supplementary, and print how to fix it. The group has no password.
-2. **Binary.** Copy its own executable (`proc_pidpath` of its own pid) to `mairu.tmp` in `<harden_home>/libexec/mairu/` ([005 Harden home](005-install.md#harden-home); `/opt/mairu` on macOS), creating missing directories as `root:wheel` mode `0755`. For an ad-hoc build, re-sign the temporary copy with `codesign --force --sign - --options runtime --identifier co.0w0.mairu` while it is still root-owned and before the mode is set. Then `fchown root:mairu`, `fchmod 02755`, `fsync`, rename into place. Official builds are copied unchanged.
+2. **Binary.** Copy its own executable, from a file descriptor opened at startup (with `--from FILE`, from that file once verified), and checks the open file before anything is re-signed: its own executable must satisfy the running code's designated requirement (`SecCodeCopySelf`); a `--from` file must carry the team's Developer ID signature and a valid attestation, or be accepted with `--unattested`. A path looked up later (`proc_pidpath`) could name a swapped file. Copy it to `mairu.tmp` in `<harden_home>/libexec/mairu/` ([005 Harden home](005-install.md#harden-home); `/opt/mairu` on macOS), creating missing directories as `root:wheel` mode `0755`. For an ad-hoc build, re-sign the temporary copy with `codesign --force --sign - --options runtime --identifier co.0w0.mairu` while it is still root-owned and before the mode is set. Then `fchown root:mairu`, `fchmod 02755`, `fsync`, rename into place. Official builds are copied unchanged.
 3. **Protected directory.** `install -d -o root -g mairu -m 2770 /private/var/db/mairu`.
 4. **LaunchAgent.** Rewrite the user's plist ([017 XPC transport](017-macos-peer-verification.md#xpc-transport)) to point at the hardened copy, `/opt/mairu/libexec/mairu/mairu` by default, as the user (`SUDO_UID`), then boot the old job out so the next client starts the hardened copy.
 5. Re-exec candidates on macOS are `<harden_home>/libexec/mairu/mairu` only ([005 Re-exec](005-install.md#re-exec)), validated with the same rules: root-owned, group `mairu`, setgid, no group or other write, root-owned ancestors.

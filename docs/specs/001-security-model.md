@@ -266,7 +266,10 @@ Privacy: to show and decide requests, the agent reads facts about its peers and 
 
 - WSL1 hardening (015)
 - BSD implementation; 003 records the design
-- Tokens wrapped by TPM or Secure Enclave and unwrapped only for use, plus a zeroizing global allocator (`zeroizing-alloc`) so HTTP client buffers are wiped too
+- Wrapping session tokens in memory with a TPM, Secure Enclave or Windows-side key. Evaluated 2026-10-29: it adds nothing against same-uid code on Linux or macOS, and is not a boundary on integrated WSL2 (015).
+- Persisting sessions across agent restarts, encrypted at rest in the protected directory or, on macOS, the data-protection keychain
+- Sender-constrained tokens (DPoP, RFC 9449) in mairu's own credential-server protocol, so that stolen tokens are useless off the device
+- A zeroizing global allocator (`zeroizing-alloc`), so HTTP client buffers are wiped too
 - Integrity for `.mairu.json` trust records
 - Packaging changes in other repositories: AUR, and Homebrew (018)
 

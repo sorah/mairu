@@ -90,7 +90,8 @@ authorization.json
 ├── methods            # order to ask for AssumeRole
 ├── tool_detection     # labels and their process / env names
 ├── grant_retention_secs
-└── sts                # how gate 2 reaches STS
+├── sts                # how gate 2 reaches STS
+└── network            # proxy and extra TLS roots for the agent's outbound connections
 ```
 
 ```jsonc
@@ -110,6 +111,11 @@ authorization.json
     "region": "us-east-1",
     "endpoint": "https://vpce-0123-abcd.sts.us-east-1.vpce.amazonaws.com",  // optional, https only
     "servers": {"cn": {"region": "cn-north-1"}}  // per server, for other partitions
+  },
+  // The hardened agent's outbound connections: no proxy and the system roots by default.
+  "network": {
+    "proxy": "http://proxy.corp.example:3128",
+    "extra_roots": ["-----BEGIN CERTIFICATE-----\n…"]   // PEM, added to the system roots
   }
 }
 ```
@@ -123,6 +129,8 @@ authorization.json
 - `sts`: the region and endpoint of the gate-2 call ([009 Caller identity](009-caller-identity.md#caller-identity)). `endpoint` is optional and must be `https`. `servers` sets the region per server id, for servers in other partitions.
   - `sts` is **never taken from an unapproved file**. An endpoint that answered `GetCallerIdentity` falsely could report any identity, so unapproved files fall back to the default.
   - A hardened agent keeps ignoring the environment's endpoint and region overrides whatever the file says.
+- `network`: for hosts that reach AWS and the credential servers only through a proxy, or through TLS inspection with their own CA ([004 Hardened agent environment](004-peer-verification.md#hardened-agent-environment)). `proxy` is an `http` or `https` URL used for every outbound connection of the agent; `extra_roots` are PEM certificates trusted in addition to the system roots.
+  - `network` is **never taken from an unapproved file**, for the same reason as `sts`: a proxy with an extra root sees every session token.
 
 ### Effective policy
 
@@ -214,7 +222,7 @@ Policies without `@id` are shown as `policy.cedar#<n>`.
 
 ## Drawbacks
 
-- Users cannot relax anything yet: their `permit` policies are written but ignored, and so are `methods` and `sts`. Only the built-ins grant.
+- Users cannot relax anything yet: their `permit` policies are written but ignored, and so are `methods`, `sts` and `network`. Only the built-ins grant.
 - A syntax error in `policy.cedar` drops the whole file, including its `forbid` policies, until it is fixed. `check`, `show` and `doctor` make that visible, but the user must look.
 - Cedar is a new language for most users. `init`, `check` and `explain` exist to soften that.
 - Requester-chosen context cannot be used to grant, which rules out conveniences such as "no check inside this directory".
@@ -245,11 +253,12 @@ forbid skipped by an error         ✗ strict validation; errors count as Deny
 
 | Threat | Mitigation |
 |---|---|
-| Editing the policy to relax it | Only `forbid` policies apply from an unapproved file; `methods` and `sts` are ignored |
+| Editing the policy to relax it | Only `forbid` policies apply from an unapproved file; `methods`, `sts` and `network` are ignored |
 | A `forbid` silently skipped because its evaluation errors | Strict schema validation at load and in `check`; any evaluation error makes the candidate `Deny` ([007](007-authorization.md#decision-procedure)) |
 | A `permit` that relies only on requester-chosen context (`cwd`, `exec_command`, …) | Documented; `check` lists every permit that needs no human check |
 | A `permit` that depends on a forgeable tool label | Documented as a guardrail; `check` lists such permits |
 | A forged `GetCallerIdentity` answer through an endpoint in the file | `sts` is never taken from an unapproved file |
+| A proxy and a CA in the file, to read session tokens | `network` is never taken from an unapproved file |
 
 - The files are read by the agent with the user's own permissions. They hold no secrets.
 - `mairu policy check` runs entirely in the client, with no agent involved.
@@ -266,7 +275,7 @@ forbid skipped by an error         ✗ strict validation; errors count as Deny
 ### Expected Outcomes
 
 - `forbid` policies in `policy.cedar` take effect at once, on hardened and unhardened agents alike.
-- `permit` policies, `methods` and `sts` from the files have no effect.
+- `permit` policies, `methods`, `sts` and `network` from the files have no effect.
 - `mairu policy init`, `check`, `show`, `explain` and `schema` work as described.
 - A broken file or a policy that fails validation is reported in `GetPolicy.notes` and by `check`, and never causes a `permit` to apply.
 
@@ -302,6 +311,7 @@ pub struct AuthorizationSettings {
     pub tool_detection: Option<std::collections::BTreeMap<String, ToolDetectionEntry>>,
     pub grant_retention_secs: Option<u64>,
     pub sts: Option<StsSettings>,
+    pub network: Option<NetworkSettings>,
 }
 
 #[derive(serde::Deserialize)]
@@ -324,9 +334,16 @@ pub struct StsSettings {
 pub struct StsServerSettings {
     pub region: Option<String>,
 }
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSettings {
+    pub proxy: Option<url::Url>,                        // http or https
+    #[serde(default)] pub extra_roots: Vec<String>,     // PEM
+}
 ```
 
-- Validation beyond `serde`: `version == 1`; method names known to this binary; labels match `^[a-z0-9-]+$`; `sts` endpoints use `https`.
+- Validation beyond `serde`: `version == 1`; method names known to this binary; labels match `^[a-z0-9-]+$`; `sts` endpoints use `https`; `network.proxy` uses `http` or `https`; every `extra_roots` entry parses as one certificate.
 - The file is parsed with `serde_json`; comments are not accepted.
 
 **Effective settings** (`settings::effective(state, file)`):
@@ -400,7 +417,7 @@ message GetPolicyResponse {
 ### Tests
 
 - Effective policy set: a `permit` in an unapproved file is ignored; a `forbid` applies; a file that does not parse contributes nothing and produces a note; a `forbid` that fails strict validation is dropped with a note; duplicate and `builtin-` ids are dropped.
-- Effective settings: `methods` and `sts` from the file are ignored; `tool_detection` additions apply; a larger `grant_retention_secs` is capped at the default.
+- Effective settings: `methods`, `sts` and `network` from the file are ignored; `tool_detection` additions apply; a larger `grant_retention_secs` is capped at the default.
 - `authorization.json` with an unknown field is rejected.
 - File cache: an edit is seen within 5 s, and immediately when `(dev, ino, mtime, size)` changes.
 - `check` flags a `permit` that needs no human check and a `permit` that depends on a label.

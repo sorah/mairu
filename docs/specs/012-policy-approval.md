@@ -6,7 +6,7 @@ The policy files of [011](011-user-policy.md) stay in the user's home directory,
 
 - `APPROVED`: the user's `policy.cedar` and `authorization.json` are in force, `permit` policies included.
 - `TAMPERED`: the files changed since approval. **Lockdown** applies: every request needs a fresh human check, AI agents are refused, and the file's `forbid` policies still apply.
-- A server whose config changed since approval is locked down on its own, and a server never approved is treated as unapproved.
+- A server whose config changed since approval is refused on its own until approved again, and a server never approved is treated as unapproved.
 
 On Linux the record lives in two stores at once: the protected directory `/var/lib/mairu/users/<uid>/` after hardening (strong), and Secret Service (weak). When every approval key is lost, root resets the record with `sudo mairu harden --reset-policy-record --user <name>`.
 
@@ -25,7 +25,7 @@ On Linux the record lives in two stores at once: the protected directory `/var/l
 | First approval (no record yet) | a check through `platform` | record {digest₁, anchor: `[platform]`} |
 | Next approval | a check through the anchored methods | record {digest₂, anchor from the new files} |
 | An attacker edits the files | the anchor is unchanged | approving still needs the anchored method |
-| An attacker repoints a server | its digest differs | that server is locked down |
+| An attacker repoints a server | its digest differs | that server is refused |
 | Every key lost | root resets the record | the anchor falls back to `platform` |
 
 ```mermaid
@@ -123,11 +123,12 @@ Policies name servers by id, so a server's id must keep meaning the server that 
 |---|---|---|
 | `APPROVED` | The record holds the server's id with a matching digest | the policy's own state |
 | `UNAPPROVED` | The record does not hold the id, for example a server just added with `setup-sso` | `UNAPPROVED` for that server's roles |
-| `CHANGED` | The record holds the id with another digest | `TAMPERED` for that server's roles: lockdown |
+| `CHANGED` | The record holds the id with another digest | **refused** for that server's roles, until the server is approved again |
 
-- A request uses the stricter of the policy's state and its server's state, in the order `APPROVED` < `UNAPPROVED` < `TAMPERED`. With no record at all (`ABSENT`), the built-ins apply anyway.
+- A request for a `CHANGED` server is refused with `REASON_FORBIDDEN` and a detail naming the server and `mairu policy approve`. Lockdown is not enough there: it still permits after a fresh check, and the human, who sees only the role, would then approve credentials issued by whatever server the id now points at.
+- Otherwise a request uses the stricter of the policy's state and its server's state, in the order `APPROVED` < `UNAPPROVED` < `TAMPERED`. With no record at all (`ABSENT`), the built-ins apply anyway.
 - The digest is taken from the server config **captured in the session at login**, which is what actually fetches credentials, not merely from the current file. After approving a change to a server, log in to it again. `mairu policy approve` warns when a session still holds a config other than the one being approved.
-- A changed server does not lock down the other servers.
+- A changed server does not affect the other servers.
 - The real account is still checked at gate 2 ([009](009-caller-identity.md#gate-2)), so rules written by account hold even for a server that was never approved.
 
 What counts in a server's digest is what decides where credentials come from: the server id, `url`, OAuth endpoints, client id and scopes, and the AWS SSO region and scopes. Secrets and operational fields (`client_secret`, `client_expires_at`, `default_grant_type`, `local_port`) do not count ([Integrity records](#integrity-records)).
@@ -139,8 +140,9 @@ sequenceDiagram
   participant U as you
   participant C as mairu policy approve
   participant A as agent
-  C->>U: print both files and the check summary
-  C->>A: ApprovePolicy {expected_digest}
+  C->>U: print both files, the check summary<br/>and the confirmation code
+  U->>C: type the code back
+  C->>A: ApprovePolicy {expected_digest, code}
   A->>A: re-read files, same digest, strict validation
   A->>U: ask via the approval anchor in force
   A->>A: write record {digest, next anchor} to every store
@@ -149,11 +151,14 @@ sequenceDiagram
 `mairu policy approve`:
 
 1. The client runs `check` ([011 Policy commands](011-user-policy.md#policy-commands)), prints both files, the summary and every server's counted fields, and computes the digest and the server digests.
-2. It sends `ApprovePolicy{expected_digest, expected_server_digests}`.
-3. The agent re-reads both files and `servers.d`. If any digest differs → `FAILED_PRECONDITION` ("policy changed while approving"). This binds approval to what the human saw.
-4. The agent validates them → `INVALID_ARGUMENT` on error.
-5. The agent asks the human with action `approve-policy`. This **always asks and never uses grants**. It uses only the methods and keys of the **approval anchor in force**, never those of the files being approved or of the current effective settings. Before any approval, that anchor is `["platform"]`, which is how the first approval is bootstrapped.
-6. It records the new digest and the current set of server digests, with the new files' `approval_methods` and keys as the next anchor, into all available stores, and returns the per-store results. Servers no longer in `servers.d` drop out of the record.
+2. It needs a controlling terminal. It prints a **confirmation code**, the first 8 characters of the base32 of SHA-256 over the digest and the sorted server digests, and the human types it back. Without a terminal, or with a wrong code, it stops.
+3. It sends `ApprovePolicy{expected_digest, expected_server_digests, confirmation_code}`.
+4. The agent re-reads both files and `servers.d`. If any digest differs, or the code does not match the digests → `FAILED_PRECONDITION` ("policy changed while approving"). This binds approval to what the human saw.
+5. The agent validates them → `INVALID_ARGUMENT` on error.
+6. The agent asks the human with action `approve-policy`. This **always asks and never uses grants**. It uses only the methods and keys of the **approval anchor in force**, never those of the files being approved or of the current effective settings. Before any approval, that anchor is `["platform"]`, which is how the first approval is bootstrapped.
+   The prompt carries the confirmation code: in the polkit details, the LocalAuthentication reason and the signed statement. The human can match the prompt to the terminal where they typed the code.
+7. When the new files change the anchor, that is the `approval_methods` or the keys registered for them, a **second check** follows ([Anchor changes](#anchor-changes)).
+8. It records the new digest and the current set of server digests into all available stores, and returns the per-store results. Servers no longer in `servers.d` drop out of the record. An unchanged anchor stays; a changed one is recorded as pending.
 
 When the platform method has no authentication agent to ask through, the client registers `pkttyagent` and retries, as for credential requests ([008 pkttyagent fallback](008-headless.md#pkttyagent-fallback)).
 
@@ -177,6 +182,25 @@ When the platform method has no authentication agent to ask through, the client 
 
 - It takes effect only through the record: the anchor written by an approval holds the `approval_methods` of the files approved then, and the corresponding registered keys.
 - Putting `"platform"` in `approval_methods` while keys are registered lets a captured password approve a policy that registers someone else's key. `check` warns about it, and `doctor` warns when the anchor in force has it ([001 Trust chain](001-security-model.md#trust-chain)).
+
+### Anchor changes
+
+One approval obtained under false pretences, for example a key touch that a substituted signing request turned into another statement, could otherwise register the attacker's key as the anchor and approve every later change silently. A change of the anchor therefore costs more than one approval, and waits:
+
+```text
+approval      as above, through the anchor in force
+second check  a separate fresh check through the anchor in force: a second prompt or challenge,
+              started only after the first succeeded, with its own statement naming the new anchor
+pending       the record keeps the anchor in force, plus the new one as pending, effective in 24 hours
+meanwhile     every client warns (PingAgent); doctor and policy show name the change and its time
+cancel        mairu policy cancel-anchor-change, through the anchor in force
+after 24 h    the pending anchor becomes the anchor in force at the next verification
+```
+
+- The rest of an approved change applies at once. Only the anchor waits.
+- The first registration of keys waits too. Until then the anchor in force, `["platform"]` before any approval, keeps approving, as it did before.
+- The delay is fixed. It cannot be shortened by the policy being approved, which is exactly what it guards against. Root bypasses it through recovery ([Recovery](#recovery)).
+- The confirmation code is a guardrail: a process with its own pseudo-terminal can type a code too. What bounds a stolen approval is the second check and the delay.
 
 **What the user sees:**
 
@@ -213,7 +237,7 @@ sudo mairu harden --reset-policy-record --user <name>
 - **Ordering strong stores by time.** A generation number, written one higher than any strong store held, orders records when strong stores disagree. Only strong stores take part, since a weak store could claim any generation.
 - **The anchor from the current files.** Approval methods taken from the files being approved, or from whatever the home directory says now, would let an edit downgrade approval to a password. The anchor lives with the digest instead.
 - **On tamper: refuse everything, or ignore the files.** Refusing everything stops the user's work; ignoring the files hides the edit. Lockdown keeps every request possible with a fresh check, refuses AI agents, and keeps the file's `forbid` policies.
-- **`servers.d` inside the one policy digest.** Any server change, even `setup-sso` adding one, would make the whole policy unapproved or tampered. Rejected for **per-server records** (decided 2026-10-24): a new server gets the built-ins and `forbid` policies for its roles, and a changed approved server is locked down on its own.
+- **`servers.d` inside the one policy digest.** Any server change, even `setup-sso` adding one, would make the whole policy unapproved or tampered. Rejected for **per-server records** (decided 2026-10-24): a new server gets the built-ins and `forbid` policies for its roles, and a changed approved server is refused on its own. Lockdown would not be enough, since it still permits after a fresh check.
 - **No server integrity, relying on gate 2.** Account-based rules hold through the real caller identity, but rules written by server id would stay forgeable. Per-server records protect both.
 - **Digesting the current server file.** The session fetches credentials with the config captured at login, so a file restored after login would hide a repointed session. The captured config is what is digested.
 - **Records keyed by path.** An agent started with another `HOME` would then find a matching record for files of the attacker's choosing. Records are keyed by uid.
@@ -222,7 +246,8 @@ sudo mairu harden --reset-policy-record --user <name>
 
 ```text
 relaxing the policy by editing     ✗ lockdown on tamper; unapproved files contribute forbids only
-repointing a server id            ✗ per-server digests; a changed server is locked down
+repointing a server id            ✗ per-server digests; a changed server is refused
+one stolen approval               ✗ anchor changes need a second check and wait 24 h
 downgrading approval to password   ✗ approval uses the stored anchor
 rolling back the policy           ✗ the protected directory keeps only the latest record
 ```
@@ -230,7 +255,9 @@ rolling back the policy           ✗ the protected directory keeps only the lat
 | Threat | Mitigation |
 |---|---|
 | Editing the policy to relax it | Integrity records; only `forbid` policies apply when unapproved; lockdown on tamper |
-| Pointing an approved server id at another credential server by editing `servers.d` | Per-server digests in the record; a changed server is locked down, a new one gets only built-ins and forbids; checked against the config captured at login |
+| One approval obtained under false pretences (a substituted ssh-agent request, a generic prompt) used to install the attacker's approval key | A change of the anchor needs a second check through the anchor in force and waits 24 hours, during which every client warns and the change can be cancelled ([Anchor changes](#anchor-changes)) |
+| An approval run by a tool without a human at the terminal | Approval needs a terminal and a typed confirmation code, also shown in the prompt (a guardrail) |
+| Pointing an approved server id at another credential server by editing `servers.d` | Per-server digests in the record; a changed server is refused until approved again, a new one gets only built-ins and forbids; checked against the config captured at login |
 | Rolling back the policy | The protected directory keeps only the latest record |
 | Approval downgraded to a password by editing or tampering with `authorization.json` | Approval uses only the anchor in the last approved record |
 | Schema drift after an upgrade | Approved policy re-validated at load; invalid → `UNAPPROVED` |
@@ -254,7 +281,7 @@ rolling back the policy           ✗ the protected directory keeps only the lat
 
 - `mairu policy approve` records the files and server configs after a human check through the anchor in force; `permit` policies then apply.
 - Editing either file after approval puts the agent in lockdown until the next approval, which is authorized only by the anchored methods.
-- A server added after approval gets the built-ins and `forbid` policies for its roles; a server whose config changed is locked down on its own.
+- A server added after approval gets the built-ins and `forbid` policies for its roles; a server whose config changed is refused on its own.
 - On a hardened Linux host the protected directory alone decides `APPROVED`; Secret Service only catches disagreement.
 - `sudo mairu harden --reset-policy-record --user <name>` returns the user to `UNAPPROVED` with a `["platform"]` anchor.
 
@@ -324,26 +351,27 @@ Stores are served by the platform helper through `RecordIntegrity` and `VerifyIn
 
 `integrity_state::verify(files, sessions, stores) -> (State, Anchor, ServerStates, Vec<IntegrityStoreResult>)`:
 
-1. Compute the digest of both files, and the server digest of each server: from the config captured in its session when logged in, otherwise from its file.
+1. Compute the digest of both files, and the server digest of each server: from the config captured in its session when logged in, otherwise from its file. Each file is read once; the digest and the parser use the same bytes.
 2. `VerifyIntegrity{name, uid, digest}`. Each store returns `MATCHED`, `MISMATCHED`, `NOT_RECORDED` or `UNAVAILABLE`, with the record it holds.
 3. **Strong record.** Among the strong stores that hold a record, the one with the highest generation is the strong record. A strong store holding a lower generation missed an approval while it was unavailable, so it is overwritten with the strong record before step 4. Only strong stores take part: a weak store could claim any generation.
 4. **State** from the table in [Integrity states](#integrity-states), evaluated after step 3.
 5. **Backfill**: when `APPROVED`, write the record to every available store that is `NOT_RECORDED`.
-6. **Anchor in force**: the strong record's anchor; else, on an unhardened agent, the weak record's; else `["platform"]`.
+6. **Anchor in force**: the strong record's anchor; else, on an unhardened agent, the weak record's; else `["platform"]`. A pending anchor whose time has come replaces the anchor in force first, and the record is rewritten.
 7. **Server states**: for each server, compare its digest with the record's `servers` entry: equal → `APPROVED`, missing → `UNAPPROVED`, different → `CHANGED`.
 8. **Schema check**: when `APPROVED`, validate `policy.cedar` strictly against the embedded schema; failure → `UNAPPROVED` plus a note and a warning.
 
-Per request, the effective policy set is the one for `max(policy state, server state)` in the order `APPROVED` < `UNAPPROVED` < `TAMPERED`, where `CHANGED` counts as `TAMPERED`. Effective sets are built once per state and reused.
+Per request, a `CHANGED` server is refused before any policy is evaluated. Otherwise the effective policy set is the one for `max(policy state, server state)` in the order `APPROVED` < `UNAPPROVED` < `TAMPERED`. Effective sets are built once per state and reused.
 
 ### Approve
 
 `Agent::approve_policy`:
 
-1. Re-read both files and `servers.d`; compare with `expected_digest` and `expected_server_digests` → `FAILED_PRECONDITION` on any difference.
+1. Re-read both files and `servers.d`; compare with `expected_digest` and `expected_server_digests`, and the confirmation code with the one computed from them → `FAILED_PRECONDITION` on any difference.
 2. Validate as `mairu policy check` does ([011](011-user-policy.md#policy-commands)) → `INVALID_ARGUMENT`.
 3. Ask the human with the first usable method of the anchor in force. The platform method calls `PlatformServices::authorize` with `ACTION_APPROVE_POLICY` and the detail `policy_digest` ([007 Polkit](007-authorization.md#polkit)). Results map as in [007 Decision procedure](007-authorization.md#decision-procedure). Grants and leases are neither used nor recorded.
 4. `generation = 1 + max(generation of every strong store's record)`.
-5. `RecordIntegrity{name, uid, record}` with the new digest, the current server digests, and the anchor built from the new `authorization.json`.
+5. When the anchor built from the new `authorization.json` differs from the anchor in force: a second check through the anchor in force, with a statement naming the new anchor. On success, the new anchor goes into `pending_anchor` with `pending_anchor_effective_at` 24 hours ahead.
+5a. `RecordIntegrity{name, uid, record}` with the new digest, the current server digests, the anchor in force, and the pending anchor if any.
 6. Fail with `FAILED_PRECONDITION` when no store is available; otherwise return the per-store results and the new state.
 
 The client side of `mairu policy approve` calls `GetPolicy` first. Each `ServerIntegrity.digest` is taken from the config captured in that server's session, so when it differs from the file digest being approved, the client warns that the session still holds another config and that the server needs a new login.
@@ -358,12 +386,19 @@ The client side of `mairu policy approve` calls `GetPolicy` first. Each `ServerI
 service Agent {
   // ... existing RPCs ...
   rpc ApprovePolicy(ApprovePolicyRequest) returns (ApprovePolicyResponse);
+  rpc CancelAnchorChange(CancelAnchorChangeRequest) returns (CancelAnchorChangeResponse);
 }
+
+// Adds to IntegrityRecord (006):
+//   ApprovalAnchor pending_anchor = 5;
+//   int64 pending_anchor_effective_at = 6;   // Unix seconds
 
 message PingAgentResponse {
   string version = 1;
   // Lets every client warn about lockdown without an extra RPC.
   PolicyIntegrity policy_integrity = 2;
+  // Set while an anchor change is pending: when it takes effect, in Unix seconds.
+  int64 anchor_change_effective_at = 3;
 }
 
 message GetAgentStatusResponse {
@@ -397,7 +432,13 @@ message ApprovePolicyRequest {
   bytes expected_digest = 1;
   ClientContext client_context = 2;     // env_names, and the presence response when a method needs one
   map<string, bytes> expected_server_digests = 3;   // server id → server digest
+  string confirmation_code = 4;         // typed back by the human
 }
+
+message CancelAnchorChangeRequest {
+  ClientContext client_context = 1;     // the presence response when a method needs one
+}
+message CancelAnchorChangeResponse {}
 message ApprovePolicyResponse {
   PolicyIntegrity integrity = 1;
   repeated mairu.platform.IntegrityStoreResult stores = 2;
@@ -415,7 +456,7 @@ message ApprovePolicyResponse {
 - Altering only the Secret Service item on a hardened host → `TAMPERED`.
 - Anchor in force: approval asks through the anchored methods, never through `methods` of the files being approved; with no record, `["platform"]`.
 - Approve race: a file edited between `check` and `ApprovePolicy` → `FAILED_PRECONDITION`.
-- Server states: `setup-sso` adds a server → `UNAPPROVED` for its roles only; editing an approved server's `url` → lockdown for that server only; a session still holding the old config keeps `CHANGED` until re-login.
+- Server states: `setup-sso` adds a server → `UNAPPROVED` for its roles only; editing an approved server's `url` → refused for that server only; a session still holding the old config keeps `CHANGED` until re-login.
 - Lockdown: a session grant no longer permits; a fresh check does; an `ai-agent` request is refused.
 - Schema drift: an approved policy using an attribute this binary's schema lacks → `UNAPPROVED` with a warning.
 - `harden --reset-policy-record`: afterwards `UNAPPROVED`, anchor `["platform"]`; with a stale Secret Service record, lockdown until the next approval.
@@ -434,7 +475,9 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - [ ] Verify: strong record by generation, state table, backfill, anchor in force, schema drift
 - [ ] `APPROVED` and `TAMPERED` effective policies; lockdown built-ins; warnings in every client
 - [ ] Per-server digests: server states, the stricter-state rule, digests of the configs captured at login, `ServerIntegrity` in `GetPolicy`
-- [ ] `ApprovePolicy` and `mairu policy approve`; `approval_methods`
+- [ ] `ApprovePolicy` and `mairu policy approve`; `approval_methods`; confirmation code
+- [ ] Anchor changes: second check, pending anchor with a 24-hour delay, `CancelAnchorChange` and `mairu policy cancel-anchor-change`, warnings
+- [ ] `CHANGED` servers refused, with the server URL in prompts
 - [ ] `PingAgentResponse.policy_integrity`
 - [ ] Recovery through `harden --reset-policy-record`
 - [ ] `doctor`: policy state, per-store statuses, the `approval_methods` warning

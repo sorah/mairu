@@ -85,6 +85,8 @@ mairu_<version>-1_{amd64,arm64}.deb         unchanged
 
 Everything is still built and uploaded by one workflow run from one `v<version>` tag, and the crate is published last, as today.
 
+Every released `mairu` binary is attested: the workflow creates a GitHub artifact attestation (SLSA build provenance, signed through sigstore with the workflow's OIDC identity) whose subject is the binary's SHA-256. The archive carries the attestation bundle as `mairu.sigstore.json` next to the binary, and GitHub's attestation API serves it by digest as well. Anyone can check a download with `gh attestation verify <file> --repo sorah/mairu`; a hardened installation verifies upgrades the same way (005).
+
 ### Shipped helpers
 
 Two helpers live outside the `mairu` binary: the macOS helper bundle (019) and, for WSL2, the Windows Hello helper (016). Release archives ship them as files next to `mairu`, and mairu finds them relative to its own canonical path. Nothing is embedded in the binary, and release builds write nothing out at run time.
@@ -92,6 +94,7 @@ Two helpers live outside the `mairu` binary: the macOS helper bundle (019) and, 
 ```text
 mairu-<target>.tar.gz
 ├── mairu
+├── mairu.sigstore.json          its attestation (Release artifacts)
 ├── Mairu Helper.app/            macOS targets (019)
 └── mairu-windows-hello.exe      Linux targets, for the matching Windows architecture (016)
 ```
@@ -231,6 +234,7 @@ Stack layer: `hardening/build-layout`.
 **Release** (`.github/workflows/release.yml`)
 
 - `upload-binaries` builds `x86_64-apple-darwin` (cross-compiled on the macOS runner) and `aarch64-apple-darwin`, and no longer builds `universal-apple-darwin`.
+- Each binary job runs `actions/attest-build-provenance` on the binary (`id-token: write`, `attestations: write`), writes the bundle as `mairu.sigstore.json`, and packs it into the archive next to the binary. The debs are attested too.
 - The rest of the workflow is unchanged: one tag, one run, crate published last.
 
 **Documentation**
@@ -257,6 +261,7 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - [ ] Shipped helpers: `crate::helpers::locate` with its tests
 - [ ] CI: size reports with ceilings
 - [ ] Release: `x86_64-apple-darwin` and `aarch64-apple-darwin`, no universal binary
+- [ ] Release: artifact attestations; `mairu.sigstore.json` in every archive
 - [ ] README, CHANGELOG and the releng skill updated
 - [ ] Follow-ups: release asset names in the Homebrew tap and the aqua registry
 

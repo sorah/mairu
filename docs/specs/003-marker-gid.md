@@ -75,6 +75,7 @@ detect()                                           # first in main, before anyth
   getauxval(AT_SECURE) == 0 or m == rgid           → Unhardened
   m ∈ {0, 65534} or getgrgid(m) is not "mairu"     → Unhardened, warn (setgid to another group)
   m ∈ getgroups() or user ∈ getgrgid(m).members    → Misconfigured (marker forgeable)
+  /proc/sys/fs/suid_dumpable == 1                  → Misconfigured (setgid processes stay traceable)
   otherwise                                        → Hardened, marker = m; setresgid(rgid, rgid, m)
 ```
 
@@ -89,6 +90,7 @@ detect()                                           # first in main, before anyth
    | `AT_SECURE` is 0, or `m == rgid` | `Unhardened`. No setgid bit applied to this exec, so an effective gid inherited from a parent is never taken as the marker. `AT_SECURE` alone is not enough, because file capabilities (`cap_ipc_lock`) set it too. |
    | `m` is 0 or 65534, or `getgrgid_r(m)` does not name `mairu` (a failed lookup included) | `Unhardened`, with a warning: the binary is setgid to some other group. A dedicated group is what makes the marker meaningful; with any other group, that group's own setgid binaries would pass. |
    | `m` is in `getgroups()`, or the user is listed among the group's members | `Misconfigured`: the marker is forgeable. Warn, and act as `Unhardened`. |
+   | `/proc/sys/fs/suid_dumpable` is `1` | `Misconfigured`: the kernel leaves setgid processes dumpable, so same-uid code could ptrace them. Warn, and act as `Unhardened`. |
    | Otherwise | `Hardened`, with marker `m` |
 
    - The lookup goes from the granted gid to the name (`getgrgid_r`), not from the name to a gid. A second `mairu` group in another NSS source therefore cannot shadow the gid the kernel actually granted, and the gid peers compare against is that one.
@@ -146,6 +148,7 @@ group password (newgrp / sg)       ! not detectable here; handled by installatio
 | Marker leaking to children | Permanent drop before every exec; `hardening::command()` ([Privileged gid](#privileged-gid)) |
 | A binary setgid to some other group, or an inherited effective gid | The marker must come from this exec (`AT_SECURE`, `m != rgid`) and its group must be named `mairu`, and not be 0 or 65534 ([Classification](#classification)) |
 | User in the marker group | Detected → `Misconfigured` ([Classification](#classification)) |
+| `fs.suid_dumpable = 1`, which leaves setgid processes, and processes after a gid change, dumpable | Detected → `Misconfigured`; `PR_SET_DUMPABLE(0)` after every `setresgid` ([Privileged gid](#privileged-gid)) |
 | Joining the marker group through a group password (`newgrp`, `sg`) | Not detectable by the process itself. Such a process has the marker as both real and effective gid, which distinguishes it from a genuine hardened process (real gid always the user's). |
 | Hardlinked old hardened binaries | `fs.protected_hardlinks` warning |
 
@@ -192,7 +195,7 @@ before exec of anything   setresgid(rgid, rgid, rgid)       # marker never leaks
 
 Helpers in `crate::hardening`:
 
-- `with_privileged_gid(f)`: under a process-wide mutex, `setresgid(-1, mairu, -1)`, run `f`, then `setresgid(-1, rgid, -1)`. glibc and musl apply set\*id calls to all threads. Used around `connect()`, `bind()`+`listen()`, and access to files that only the marker gid may open. On an unhardened process it runs `f` unchanged.
+- `with_privileged_gid(f)`: under a process-wide mutex, `setresgid(-1, mairu, -1)`, run `f`, then `setresgid(-1, rgid, -1)`. The kernel resets dumpability to `fs.suid_dumpable` on every credential change, so each `setresgid` is followed by `prctl(PR_SET_DUMPABLE, 0)`, in every hardened process, not only the agent. glibc and musl apply set\*id calls to all threads. Used around `connect()`, `bind()`+`listen()`, and access to files that only the marker gid may open. On an unhardened process it runs `f` unchanged.
 - `drop_privileged_gid_permanently()`: `setresgid(rgid, rgid, rgid)`, then assert that `getresgid()` returns `rgid` three times. On failure the caller aborts; it never execs with the marker.
 - `command(program)`: a `std::process::Command` whose `pre_exec` performs the permanent drop. Every child process mairu spawns uses it, the agent itself included, except the exec of the user's command, which calls the drop directly. Re-exec'ing the setgid binary re-acquires the marker through the setgid bit, so dropping before spawning the agent is harmless.
 
@@ -215,6 +218,7 @@ pub enum HardeningState {
 pub enum MisconfiguredReason {
     PrimaryGroupIsMarker,
     MarkerMember,
+    SuidDumpable,
 }
 ```
 
