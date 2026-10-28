@@ -32,12 +32,13 @@ Diagrams and text blocks in this spec are illustrative; the text after them is n
 ### What the kernel gives a setgid exec
 
 ```mermaid
-flowchart LR
-  X["execve(/usr/local/libexec/mairu/mairu)<br/>root:mairu 2755"] -- "untraced" --> K["kernel applies setgid"]
-  K --> E["egid := mairu<br/>the marker, reported by SO_PEERCRED"]
-  K --> S["AT_SECURE := 1<br/>loader ignores LD_PRELOAD and friends"]
-  K --> D["dumpable := 0<br/>no same-uid ptrace, /proc/#lt;pid#gt;/mem, environ, fd"]
-  X -- "traced by an unprivileged tracer" --> N["setgid not applied<br/>no marker"]
+flowchart TB
+  X["execve of the hardened binary<br/>root:mairu 2755"] --> T{"traced by an<br/>unprivileged tracer?"}
+  T -- "yes" --> N["setgid not applied:<br/>no marker"]
+  T -- "no" --> K["kernel applies setgid"]
+  K --> E["egid = mairu<br/>the marker in SO_PEERCRED"]
+  K --> S["AT_SECURE = 1<br/>loader ignores LD_PRELOAD"]
+  K --> D["dumpable = 0<br/>no same-uid ptrace or /proc access"]
 ```
 
 A hardened binary is root-owned, with group `mairu` and mode `2755` (setgid). When any user execs it, the kernel:
@@ -228,22 +229,12 @@ pub enum MisconfiguredReason {
 
 ### BSD (design only)
 
-```mermaid
-flowchart LR
-  subgraph linux["Linux"]
-    L1["SO_PEERCRED"]
-    L2["/proc/#lt;pid#gt;/stat"]
-    L3["groupadd"]
-  end
-  subgraph bsd["BSD: same marker group, same installed layout"]
-    B1["LOCAL_PEERCRED<br/>xucred: cr_groups[0] = egid, cr_pid on 13+"]
-    B2["kinfo_proc via sysctl"]
-    B3["pw groupadd"]
-  end
-  L1 --> B1
-  L2 --> B2
-  L3 --> B3
-```
+| Linux | BSD |
+|---|---|
+| `SO_PEERCRED` | `LOCAL_PEERCRED` (`xucred`: `cr_groups[0]` is the effective gid; `cr_pid` on 13+) |
+| `/proc/<pid>/stat` | `kinfo_proc` via `sysctl` |
+| `groupadd` | `pw groupadd` |
+| marker group, installed layout | the same |
 
 - FreeBSD `LOCAL_PEERCRED` (`struct xucred`, `cr_groups[0]` is the effective gid, `cr_pid` on 13+), with the setgid marker as on Linux.
 - Process facts from `kinfo_proc` via `sysctl`.

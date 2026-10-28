@@ -48,16 +48,23 @@ Because the subject is a `unix-process` and the fallback agent registers for tha
 ### pkttyagent fallback
 
 ```mermaid
-flowchart TD
-  R["AssumeRole fails with<br/>REASON_NO_AUTHENTICATION_AGENT"] --> T{"/dev/tty opens?"}
-  T -- "no" --> G["fail with guidance"]
-  T -- "yes" --> P{"/usr/bin/pkttyagent root-owned,<br/>not group/other-writable?"}
-  P -- "no" --> G
-  P -- "yes" --> S["spawn pkttyagent --process self,start_time<br/>--fallback --notify-fd 3, stdio on /dev/tty"]
-  S --> W{"fd 3 closed within 5 s?<br/>(registered)"}
-  W -- "no" --> G
-  W -- "yes" --> Y["print context, retry the RPC once"]
-  Y --> K["SIGTERM pkttyagent when it returns"]
+sequenceDiagram
+  participant C as client
+  participant T as pkttyagent
+  participant A as agent and helper
+  participant D as polkitd
+  C->>A: AssumeRole
+  A-->>C: REASON_NO_AUTHENTICATION_AGENT
+  Note over C: needs /dev/tty and a<br/>root-owned pkttyagent
+  C->>T: spawn on /dev/tty<br/>--process self --notify-fd 3
+  T-->>C: closes fd 3 within 5 s: registered
+  C->>A: AssumeRole, retried once
+  A->>D: CheckAuthorization<br/>subject: the client
+  D->>T: authenticate
+  T->>T: password prompt in the pane
+  D-->>A: authorized
+  A-->>C: credentials
+  C->>T: SIGTERM
 ```
 
 On `REASON_NO_AUTHENTICATION_AGENT` the client (`src/polkit_tty_agent.rs`) does the following:

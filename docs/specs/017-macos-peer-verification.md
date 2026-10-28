@@ -78,13 +78,11 @@ The runtime decides from **its own observed signature**, never from build flags.
 
 **Contributors on macOS:**
 
-```mermaid
-flowchart LR
-  CB["cargo build"] --> UN["unhardened<br/>no peer verification, as before"]
-  DS["script/macos-dev-sign #lt;binary#gt;"] --> CS["codesign --force --sign - --options runtime<br/>--identifier co.0w0.mairu"]
-  CS --> HA["hardened ad-hoc<br/>two processes of this build verify each other"]
-  RB["rebuild"] --> NC["new cdhash"] --> RP["the dev agent is replaced automatically"]
-```
+| Step | Result |
+|---|---|
+| `cargo build` | unhardened: no peer verification, as before |
+| `script/macos-dev-sign <binary>`, which runs `codesign --force --sign - --options runtime --identifier co.0w0.mairu` | hardened ad-hoc: two processes of this build verify each other |
+| rebuild | a new cdhash: the dev agent is replaced automatically |
 
 - Plain `cargo build` output has no hardened-runtime flag, so it runs unhardened.
 - `script/macos-dev-sign` re-signs a build ad-hoc with the hardened runtime. Processes from that build then verify each other by cdhash, through the same code path official builds use with a team requirement.
@@ -154,11 +152,9 @@ Over SSH, the ssh-agent method ([013](013-ssh-agent.md)) is the one that reaches
 
 ```mermaid
 flowchart TB
-  CT["Cargo.toml [package.metadata.mairu]<br/>minimum-client-version = #quot;A.B.C#quot;<br/>minimum-agent-version = #quot;D.E.F#quot;"]
-  CT --> BR["build.rs<br/>-Wl,-sectcreate,__TEXT,__info_plist,#lt;generated Info.plist#gt;"]
-  BR --> IP["Info.plist, covered by the signature<br/>CFBundleIdentifier co.0w0.mairu · CFBundleShortVersionString X.Y.Z<br/>MairuMinimumClientVersion A.B.C · MairuMinimumAgentVersion D.E.F"]
-  IP --> AG["agent refuses a client whose signed version #lt; my MairuMinimumClientVersion"]
-  IP --> CL["client replaces an agent whose signed version #lt; my MairuMinimumAgentVersion"]
+  CT["Cargo.toml<br/>minimum-client-version<br/>minimum-agent-version"] -- "build.rs" --> IP["Info.plist in __TEXT,__info_plist<br/>covered by the signature"]
+  IP --> AG["the agent refuses<br/>older clients"]
+  IP --> CL["clients replace<br/>older agents"]
 ```
 
 ```text
@@ -185,11 +181,6 @@ release   minimum-client-version   minimum-agent-version
 - Linux needs neither: every installation re-execs the single hardened copy ([005 Re-exec](005-install.md#re-exec)), and old copies are unreachable. Ad-hoc macOS builds don't need them either, because their cdhash identity already differs per version.
 
 ### Top of the trust chain
-
-```mermaid
-flowchart LR
-  AD["administrator<br/>(sudo, /etc/authorization)"] --> EV["everything on the host"]
-```
 
 On macOS the top of the trust chain ([001 Trust chain](001-security-model.md#trust-chain)) is the administrator account: `sudo`, and authorization rights in `/etc/authorization`.
 
@@ -262,14 +253,6 @@ On macOS the top of the trust chain ([001 Trust chain](001-security-model.md#tru
 Stack layer: the macOS implementer's own layers, on top of [006](006-platform-helper.md) and [007](007-authorization.md).
 
 ### Process primitives on macOS
-
-```mermaid
-flowchart LR
-  PI["proc_pidinfo(PROC_PIDTBSDINFO)"] --> F1["start time, ppid, tty"]
-  GS["getsid"] --> F2["session"]
-  PP["proc_pidpath"] --> F3["executable"]
-  AT["audit token"] --> F4["pid version"]
-```
 
 `MacosProcess` implements `ProcessPlatform` ([004](004-peer-verification.md)) and replaces `FallbackProcess` on macOS. It is the counterpart of [004 Process facts](004-peer-verification.md#process-facts):
 

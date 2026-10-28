@@ -24,7 +24,7 @@ Diagrams and text blocks in this spec are illustrative; the text after them is n
 ```mermaid
 flowchart LR
   pkg["deb / AUR postinst"] --> B["/usr/bin/mairu<br/>root:mairu 2755"]
-  usr["~/.cargo/bin/mairu, mise, aqua, tarball"] -- "sudo mairu harden<br/>(once)" --> H["/usr/local/libexec/mairu/mairu<br/>root:mairu 2755"]
+  usr["~/.cargo/bin/mairu, mise, aqua, tarball"] -- "sudo mairu harden<br/>(once)" --> H["#lt;harden_home#gt;/libexec/mairu/mairu<br/>root:mairu 2755"]
   usr -- "every run: re-exec" --> H
 ```
 
@@ -46,26 +46,24 @@ flowchart LR
 | `/var/lib/mairu` | `root:mairu` | `2770` | Protected state root. Users cannot traverse it, but the marker gid can. |
 | `/var/lib/mairu/users` | `root:mairu` | `2770` | Parent of the per-user protected directories |
 
+`/usr/local` is the default **harden home**. `mairu harden` writes under `<harden_home>/libexec/mairu/`, and clients look for the hardened copy there ([Harden home](#harden-home)).
+
 A per-user directory under `/var/lib/mairu/users` is owned by its user, but the user cannot reach it by path: they are neither owner nor group of `/var/lib/mairu`, and "other" has no search permission. Only a process holding the marker gid can open it, and genuine mairu only ever opens the directory for `getuid()`. User namespaces do not help, because unmapped owners keep their permission semantics. This step creates only the two root-owned directories.
 
 ### mairu harden
 
 ```mermaid
-flowchart TB
-  H["sudo mairu harden"] --> G["ensure group mairu exists,<br/>has no members and no password"]
-  subgraph bin["binary"]
-    C1["/proc/self/exe"] --> C2[".mairu.tmp.#lt;pid#gt;"] --> C3["fchown root:mairu"] --> C4["fchmod 2755"] --> C5["fsync"] --> C6["rename"]
-  end
-  G --> C1
-  C6 --> CAP["setcap cap_ipc_lock=+ep<br/>after chown, which clears file caps"]
-  CAP --> D["mkdir /var/lib/mairu{,/users} 2770"]
-  D --> M["record .harden-manifest"]
+flowchart LR
+  G["group mairu<br/>no members,<br/>no password"] --> B["binary<br/>copy /proc/self/exe,<br/>chown, chmod 2755,<br/>rename"]
+  B --> C["setcap<br/>cap_ipc_lock<br/>after chown"]
+  C --> D["/var/lib/mairu<br/>root:mairu 2770"]
+  D --> M[".harden-manifest"]
 ```
 
 Linux only (BSD later). It must run as root (`euid == 0`); otherwise it exits with the exact command to run: `sudo <canonical exe path> harden`. It is idempotent, and re-running it upgrades the binary.
 
 1. **Group.** If `mairu` is missing, run `groupadd --system mairu`, falling back to `addgroup --system mairu` (busybox). Refuse if the group has members, or if `SUDO_UID`'s primary gid is `mairu`, and print how to fix it. If `/etc/gshadow` gives the group a password, remove it with `gpasswd -r mairu` (after which only members could `newgrp`, and there are none) and say so ([003](003-marker-gid.md)). `groupadd` leaves it locked, so this only undoes a password someone set.
-2. **Directory.** Create `/usr/local/libexec/mairu` as `root:root 0755`. Check that the ancestor chain is root-owned and not group/other-writable.
+2. **Directory.** Create `<harden_home>/libexec/mairu` ([Harden home](#harden-home), `/usr/local/libexec/mairu` by default) as `root:root 0755`. Check that the ancestor chain is root-owned and not group/other-writable.
 3. **Binary.**
    1. Open `/proc/self/exe`, which is the exact image running as root.
    2. Create `.mairu.tmp.<pid>` in the target directory with `O_EXCL`, mode `0600`, and copy into it.
@@ -78,23 +76,38 @@ Linux only (BSD later). It must run as root (`euid == 0`); otherwise it exits wi
 
 `mairu harden --uninstall` removes the files listed in the manifest. `--purge` also removes `/var/lib/mairu`. The group is left in place; `groupdel mairu` is documented.
 
+### Harden home
+
+```text
+--home <path>         harden only                              ┐
+MAIRU_HARDEN_HOME     environment                              │ first one set wins
+harden_home           config.json (UserConfig, unprotected)    ┘
+default               /usr/local
+hardened copy         <harden_home>/libexec/mairu/mairu, manifest beside it
+```
+
+- The harden home is a prefix, like a package manager's. Set it when `/usr/local` is not where root-owned software goes on the host.
+- `sudo` usually drops `MAIRU_HARDEN_HOME`, so `harden` also reads `harden_home` from the config of the invoking user (`SUDO_UID`), and accepts `--home`. `--uninstall` resolves the home the same way.
+- Clients resolve it the same way, without `--home`, to find their re-exec candidate ([Re-exec](#re-exec)).
+- It must be an absolute path. Anything else is ignored with a warning, and the default applies.
+- `doctor` shows the resolved home and where it came from.
+
 ### Re-exec
 
 ```mermaid
-flowchart TB
-  subgraph user["main: ~/.cargo/bin/mairu exec …"]
-    D["Hardening::detect"] -- "Unhardened" --> R["reexec_hardened_if_available"]
-    R --> V["validate candidate<br/>root-owned, setgid mairu, no g/o write,<br/>not FUSE, safe parents"]
-  end
-  subgraph hard["main: hardened copy"]
-    U["read and unset<br/>MAIRU_HARDENED_REEXEC_*"] --> W["warn if versions differ"]
-  end
-  V -- "exec /usr/local/libexec/mairu/mairu<br/>+ MAIRU_HARDENED_REEXEC_{FROM,VERSION}" --> U
+sequenceDiagram
+  participant U as ~/.cargo/bin/mairu
+  participant H as hardened copy
+  U->>U: Hardening::detect: Unhardened
+  U->>U: validate the candidate<br/>root-owned, setgid mairu, safe parents
+  U->>H: exec, same arguments<br/>+ MAIRU_HARDENED_REEXEC_{FROM,VERSION}
+  H->>H: read and unset MAIRU_HARDENED_REEXEC_*
+  H->>H: warn if the versions differ
 ```
 
 `mise`, `cargo install`, `aqua` and tarball installs keep the binary in a user-writable location, where it cannot be setgid. `crate::hardening::reexec_hardened_if_available()` runs right after classification ([003 Classification](003-marker-gid.md#classification)) when the state is `Unhardened`. It is skipped for the `harden` subcommand and when `MAIRU_NO_HARDENED_REEXEC=1` is set; the opt-out produces an unhardened client, which a hardened agent rejects anyway, so it is safe for development.
 
-1. For each candidate in order, `/usr/local/libexec/mairu/mairu` then `/usr/bin/mairu`, validate it ([Candidate validation](#candidate-validation)).
+1. For each candidate in order, `<harden_home>/libexec/mairu/mairu` ([Harden home](#harden-home)) then `/usr/bin/mairu`, validate it ([Candidate validation](#candidate-validation)).
 2. Exec the first valid candidate with the original `argv[1..]`, setting `MAIRU_HARDENED_REEXEC_FROM=<own canonical exe path>` and `MAIRU_HARDENED_REEXEC_VERSION=<own CARGO_PKG_VERSION>`.
 3. The hardened process reads and **unsets** both variables. If the version differs from its own, it prints once to the terminal:
 
@@ -207,6 +220,7 @@ Recommendations (README):
 - **Trust the candidate path without validation.** Rejected: the candidate must be root-owned, setgid `mairu`, not group/other-writable, not on FUSE, with root-owned and non-writable ancestors. Otherwise same-user code could plant a "hardened" binary. The checks are pure functions so they can be unit-tested.
 - **Copy the binary from a path given on the command line.** Rejected: `harden` copies `/proc/self/exe`, the exact image already running as root, so nothing can swap the file between check and copy.
 - **Refuse when the group has a password.** Rejected in favor of removing it with `gpasswd -r`: the password would let anyone who knows it hold the marker as both real and effective gid, and open `/var/lib/mairu` directly. Peer checks reject such processes ([004 Agent side](004-peer-verification.md#agent-side)), but only removing the password protects the directory.
+- **A fixed install location.** Rejected: hosts differ in where root-owned software goes. The harden home is configurable, from unprotected places, which is safe because a candidate counts only after validation.
 - **A one-time harden suggestion.** Rejected: it is easy to miss. The suggestion repeats, at most once an hour by default (`interval_secs`), or once per terminal session with `0`, and can be turned off.
 
 ## Prior Art
@@ -218,6 +232,7 @@ Recommendations (README):
 
 | Threat | Mitigation |
 |---|---|
+| Same-user code changing the harden home (`MAIRU_HARDEN_HOME`, `harden_home`) | It only moves where clients look. A candidate there passes only if root-owned, setgid `mairu` and safely placed, so at most it points clients at another genuine hardened copy, perhaps an older one, which the version-skew warning shows |
 | A planted "hardened" candidate | Candidate validation: root-owned, setgid `mairu`, no group/other write, not FUSE, safe ancestors ([Candidate validation](#candidate-validation)) |
 | Forged `MAIRU_HARDENED_REEXEC_*` variables | They only feed the version message, and the hardened copy unsets them |
 | Swapping the binary while `harden` copies it | `harden` copies `/proc/self/exe`; the temporary file is created with `O_EXCL`, mode `0600`, and renamed atomically |
@@ -256,7 +271,7 @@ Stack layer: `hardening/install`.
 |---|---|
 | `src/cmd/harden.rs`, `src/cmd/mod.rs`, `src/main.rs` | New `mairu harden [--uninstall [--purge]]` |
 | `src/hardening.rs` | `reexec_hardened_if_available()`, candidate validation, version-skew message, harden suggestion |
-| `src/config.rs` | `UserConfig.harden_suggestion`; the dev profile disables re-exec |
+| `src/config.rs` | `UserConfig.harden_suggestion`, `UserConfig.harden_home`; the dev profile disables re-exec |
 | `src/cmd/doctor.rs` | Root-reachability warnings |
 | `pkg/debian/postinst` | Group, setgid, state directories |
 | `pkg/sysusers.d/mairu.conf`, `pkg/tmpfiles.d/mairu.conf` | New snippets for packagers |
@@ -278,6 +293,7 @@ These checks are pure functions over `(uid, gid, mode, fs_magic)` so they can be
 
 - `state_dir()/harden-suggestion.json` holds `last_shown` (RFC 3339) and the terminal session it was shown in (`sid`, leader `start_time`).
 - `UserConfig.harden_suggestion`: `enabled: bool` (default `true`), `interval_secs: u64` (default `3600`).
+- `UserConfig.harden_home`: an absolute path; `MAIRU_HARDEN_HOME` overrides it ([Harden home](#harden-home)).
 - The suggestion is skipped when the state file cannot be written.
 
 ### Contributors and CI
@@ -304,6 +320,7 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 ### Checklist
 
 - [ ] `mairu harden`, `--uninstall`, `--purge`
+- [ ] Harden home: `--home`, `MAIRU_HARDEN_HOME`, `harden_home`
 - [ ] Re-exec with candidate validation and the version-skew warning; dev profile disables it
 - [ ] Periodic harden suggestion (`harden_suggestion`, `MAIRU_NO_HARDEN_SUGGESTION`)
 - [ ] Debian postinst; sysusers/tmpfiles snippets

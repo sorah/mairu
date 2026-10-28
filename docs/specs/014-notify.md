@@ -19,32 +19,15 @@ D-Bus, the notification daemon and the desktop portal are session-bus services t
 
 ```mermaid
 flowchart LR
-  flag["--no-browser"] -- "unset" --> env["$MAIRU_OPEN_URL"]
-  env -- "unset" --> cfg["config.json open_url"]
-  cfg -- "unset" --> def["auto"]
-  flag & env & cfg & def --> mode{"mode"}
-  mode --> mAuto["auto"]
-  mAuto --> mAgent
-  mode --> mAgent["agent"]
-  mAgent -- "OpenUrl / Notify RPC<br/>with the client's SessionHint" --> agent["mairu agent"]
-  agent --> helper["platform helper"]
-  mode --> mCommand["command"]
-  mCommand --> prog["your helper program,<br/>run by the client"]
-  mode --> mNone["none"]
-  mNone --> term["terminal output only"]
+  C["client"] --> M{"mode"}
+  M -- "agent" --> A["agent"] -- "with the client's<br/>SessionHint" --> H["platform helper<br/>D-Bus or portal"]
+  M -- "command" --> P["your program"]
+  M -- "none" --> N["terminal output only"]
 ```
 
 These carry no security weight. Nothing relies on a notification being seen or a URL being opened, and the URLs involved are not secret (PKCE and `state` protect the code flow). They are therefore chosen **per client**, from unprotected settings, and can be redirected or switched off freely. Terminal output and printed URLs never depend on these settings.
 
 ### Who emits what
-
-```mermaid
-flowchart LR
-  login["mairu login"] --> url["open the authorize URL"]
-  sidecar["exec sidecar,<br/>UNAUTHENTICATED"] --> lr["#quot;login required#quot;<br/>once / server / 10 min"]
-  refused["refused AI-agent request"] --> ar["#quot;AI-agent request refused#quot;<br/>once / (server, rolespec) / min"]
-  ping["PingAgent says TAMPERED"] --> lock["#quot;policy lockdown#quot;<br/>once / agent instance"]
-```
 
 Emission always happens in a client, never on the agent's own initiative, so every notification follows the client's choice.
 
@@ -223,18 +206,10 @@ The helper service already carries `Notify` and `OpenUrl`, with the client's `Se
 
 ### Backends (in the platform helper)
 
-```mermaid
-flowchart LR
-  subgraph sNotify["notify"]
-    N["Notify<br/>title/body truncated"] --> bus{"session bus with a<br/>notification daemon?"}
-    bus -- "yes" --> fdn["org.freedesktop.Notifications<br/>on the session bus"]
-    bus -- "no bus or daemon" --> noop["no-op"]
-  end
-  subgraph sOpen["open_url"]
-    O["OpenUrl<br/>http/https only"] --> portal["portal OpenURI"]
-    portal -- "fails" --> xdg["xdg-open"]
-  end
-```
+| Feature | Backend | Otherwise |
+|---|---|---|
+| `notify` | `org.freedesktop.Notifications` on the session bus | a no-op without a session bus or notification daemon |
+| `open_url` (`http`/`https` only) | the desktop portal's `OpenURI` | `xdg-open` when the portal fails |
 
 - **Session hint.** The client fills `SessionHint` from its own environment, and the agent passes it through unchanged. The values are requester-chosen, which is acceptable because these features carry no security weight. The helper honors `dbus_session_bus_address` only as `unix:path=` under the user's `$XDG_RUNTIME_DIR`, so a hint cannot point it at an arbitrary socket or a TCP address.
 - **Linux notifications**:

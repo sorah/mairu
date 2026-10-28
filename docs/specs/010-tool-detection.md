@@ -22,10 +22,10 @@ Detection can fail: a renamed binary or a double fork escapes the ancestry match
 
 ```mermaid
 flowchart LR
-  A["ancestry of the peer<br/>mairu credential-process ← aws ← zsh ← claude ← tmux ← …<br/>comm / exe / argv0 / argv1"] -- "∈ a label's process_names" --> L["labels"]
-  E["client env names<br/>(names only)"] -- "∩ a label's env_names" --> L
-  M["an ancestor in a session marked<br/>with mairu lock --tool LABEL"] --> L
-  L --> C["context.tools = {ai-agent, …}<br/>context.tool_matches = {process:claude, env:CI, mark:ai-agent, …}"]
+  A["ancestry of the peer<br/>comm, exe, argv0, argv1"] -- "process_names" --> L["tool labels"]
+  E["client environment<br/>variable names only"] -- "env_names" --> L
+  M["an ancestor's session marked<br/>with mairu lock --tool"] -- "mark" --> L
+  L --> C["context.tools<br/>context.tool_matches"]
 ```
 
 ### Labels and signals

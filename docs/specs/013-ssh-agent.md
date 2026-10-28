@@ -106,12 +106,14 @@ permit (
 
 ```mermaid
 flowchart LR
-  laptop["laptop: ssh-agent<br/>(its own lock)"] -- "ssh -A" --> host["remote host"]
-  host --> pane["tmux pane<br/>(own session)"]
-  pane --> mairu["mairu exec"]
-  mairu -- "challenge" --> sock["forwarded $SSH_AUTH_SOCK"]
-  sock --> laptop
-  mairu -. "fallback" .-> pk["pkttyagent password<br/>in the pane"]
+  subgraph L["laptop"]
+    K["ssh-agent<br/>its own lock or touch"]
+  end
+  subgraph R["remote host (ssh -A)"]
+    P["tmux pane"] --> M["mairu exec"]
+    M -. "no registered key" .-> T["pkttyagent<br/>password in the pane"]
+  end
+  M -- "forwarded<br/>$SSH_AUTH_SOCK" --> K
 ```
 
 ssh-agent presence works in every column of the headless capability matrix ([008 Capability matrix](008-headless.md#capability-matrix)):

@@ -35,7 +35,7 @@ Platform-dependent code lives in four places, each with one home:
 ## Explanation
 
 ```mermaid
-flowchart LR
+flowchart TB
   C["mairu client<br/>process primitives · presence relays"] -- "one connection" --> A["mairu agent<br/>tokens · policy · process primitives"]
   A -- "inherited socketpair<br/>shared lifetime, verified both ways" --> H["mairu platform-helper<br/>authorize · integrity stores · notify · open_url"]
 ```
@@ -119,15 +119,11 @@ src/platform/
 └── services/     # backends that run only inside the helper: mod.rs, fallback.rs (Linux backends come later)
 ```
 
-```mermaid
-flowchart LR
-  A1["agent accept"] --> P1["ProcessPlatform::inspect_peer<br/>in-process (004)"]
-  C1["client connect"] --> P2["ProcessPlatform::verify_agent<br/>in-process (004)"]
-  A2["authorization prompts"] --> H["HelperClient<br/>(agent)"]
-  A3["policy integrity"] --> H
-  A4["notifications, opening URLs"] --> H
-  H -- "socketpair" --> S["PlatformServices in the helper<br/>authorize · record/verify_integrity · notify · open_url"]
-```
+| Need | Trait | Runs in |
+|---|---|---|
+| The agent accepting a connection | `ProcessPlatform::inspect_peer` | the agent itself ([004](004-peer-verification.md)) |
+| A client connecting | `ProcessPlatform::verify_agent` | the client itself ([004](004-peer-verification.md)) |
+| Authorization prompts, policy integrity, notifications, opening URLs | `PlatformServices`, through `HelperClient` | the platform helper, over the socketpair |
 
 ### PlatformServices trait
 
@@ -164,13 +160,12 @@ pub trait PlatformServices: Send + Sync + std::fmt::Debug {
 
 ### Protocol
 
-```mermaid
-flowchart LR
-  S["mairu.platform.PlatformHelper"] --> G["GetCapabilities<br/>peer_verification, authorization, integrity_stores,<br/>notifications, open_url, notes"]
-  S --> Az["Authorize<br/>ALLOWED · DENIED · CANCELLED · UNAVAILABLE(reason)"]
-  S --> N["Notify, OpenUrl<br/>carry the client's SessionHint"]
-  S --> I["RecordIntegrity, VerifyIntegrity, ResetIntegrity<br/>IntegrityRecord = generation + digest + ApprovalAnchor"]
-```
+| RPC of `mairu.platform.PlatformHelper` | Answers |
+|---|---|
+| `GetCapabilities` | peer verification, authorization facility, integrity stores, notifications, opening URLs, notes |
+| `Authorize` | `ALLOWED`, `DENIED`, `CANCELLED`, or `UNAVAILABLE` with a reason |
+| `Notify`, `OpenUrl` | whether it was delivered; both carry the client's `SessionHint` |
+| `RecordIntegrity`, `VerifyIntegrity`, `ResetIntegrity` | a result per store; an `IntegrityRecord` is a generation, a digest and an `ApprovalAnchor` |
 
 [004](004-peer-verification.md) created `proto/mairu_platform.proto` with `PeerVerification` and `Capabilities` (fields 1 and 6). This step adds the `PlatformHelper` service, the remaining enums and messages, and `Capabilities` fields 2–5. The complete file as of this step is below. The types are the contract. The helper serves them over gRPC on the inherited socketpair, and the agent is its only client. Enum values are prefixed with the enum name, because proto3 enum values share their package's scope.
 
@@ -395,12 +390,12 @@ Rules:
 #### Verifying system services
 
 ```mermaid
-flowchart LR
-  H["platform helper<br/>Linux backends"] -- "hardened: ignore DBUS_SYSTEM_BUS_ADDRESS" --> SB["/run/dbus/system_bus_socket<br/>root-owned directory"]
-  SB --> AU{"owner of the well-known name<br/>is uid 0? (GetConnectionUnixUser)"}
+flowchart TB
+  H["platform helper<br/>Linux backends"] -- "system bus" --> SB["/run/dbus/system_bus_socket<br/>DBUS_SYSTEM_BUS_ADDRESS ignored when hardened"]
+  SB --> AU{"name owned<br/>by uid 0?"}
   AU -- "yes" --> T["answer trusted"]
-  AU -- "no" --> U["UNAVAILABLE untrusted-authority"]
-  H -.-> SE["session bus: Secret Service, notifications, portal<br/>claimable by same uid, never trusted alone"]
+  AU -- "no" --> U["UNAVAILABLE<br/>untrusted-authority"]
+  H -. "session bus" .-> SE["Secret Service, notifications, portal<br/>claimable by the same uid:<br/>never trusted alone"]
 ```
 
 These rules apply to every Linux backend the helper runs, from the step that adds it:

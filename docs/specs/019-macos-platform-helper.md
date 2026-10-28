@@ -174,12 +174,11 @@ Stack layer: the macOS implementer's own layers, on top of [017](017-macos-peer-
 
 ```mermaid
 flowchart LR
-  A["mairu agent"] -- "inherited socketpair<br/>verified both ways" --> H["Mairu Helper.app<br/>embedded (official) or assembled"]
-  H --> LA["LocalAuthentication<br/>(Touch ID, password)"]
-  H --> KC["data-protection keychain<br/>(Developer ID) · legacy keychain"]
-  H --> PD["protected directory<br/>(after harden)"]
-  H --> OP["/usr/bin/open"]
-  H --> UN["UNUserNotificationCenter"]
+  A["mairu agent"] -- "socketpair,<br/>verified both ways" --> H["Mairu Helper.app<br/>embedded or assembled"]
+  H -- "authorize" --> LA["LocalAuthentication<br/>Touch ID or password"]
+  H -- "integrity" --> KC["data-protection keychain<br/>protected directory<br/>legacy keychain"]
+  H -- "notify" --> UN["UNUserNotificationCenter"]
+  H -- "open_url" --> OP["/usr/bin/open"]
 ```
 
 On macOS the platform helper always runs from an app bundle, `Mairu Helper.app` ([Helper bundle](#helper-bundle)). Official builds embed it, signed with the Developer ID. Other builds assemble it from their own binary and sign it ad-hoc. Everything below runs in the helper process, never in the agent ([006](006-platform-helper.md)). `MacosServices` implements `PlatformServices` inside the helper and replaces `FallbackServices` on macOS.
@@ -257,7 +256,7 @@ fallback (bundle unusable)
   Separate identifiers keep LaunchServices from resolving to another flavour's copy, and keep their rows in System Settings apart.
 - **Who writes it.**
   - The agent extracts or assembles the bundle at startup, before spawning the helper.
-  - `harden` writes its root-owned copy directly into `/usr/local/libexec/mairu/`, from its own archive or by assembling and signing it as root, with no user-writable intermediate ([harden additions](#harden-additions)). The agent prefers that copy and registers it as the user.
+  - `harden` writes its root-owned copy directly into `<harden_home>/libexec/mairu/` (`/opt/mairu/libexec/mairu/` by default), from its own archive or by assembling and signing it as root, with no user-writable intermediate ([harden additions](#harden-additions)). The agent prefers that copy and registers it as the user.
   - Concurrent agents or `harden` runs each write their own temporary directory. If the target appeared meanwhile, the later writer discards its copy and checks the existing one.
 - **Extraction rules:**
   - **Byte-exact, never in place.** Since macOS Ventura, Gatekeeper checks notarized apps on every launch, and any modification makes the app show as damaged. App Management may also block a process signed by another team from modifying a notarized bundle. Each version and flavour therefore gets a fresh directory.
@@ -290,13 +289,6 @@ fallback (bundle unusable)
   - Cleanup is as in the block above. Each bundle directory's mtime is touched on every spawn.
 
 ### LocalAuthentication backend
-
-```mermaid
-flowchart LR
-  subgraph H["in the helper"]
-    LA["LAContext.evaluatePolicy(.deviceOwnerAuthentication, reason)"] --> R["ALLOWED / DENIED"]
-  end
-```
 
 - `LAContext.evaluatePolicy(.deviceOwnerAuthentication, localizedReason:)`, with the reason built from the details of [007 What the human sees](007-authorization.md#what-the-human-sees) and the origin ([Origin of a prompt](#origin-of-a-prompt)). It works from a plain binary, signed ad-hoc or with a Developer ID.
 - Track lid/clamshell state (Touch ID unavailable) and fall back to password.
@@ -401,20 +393,18 @@ message ResetPolicyRecordResponse {
 
 ```mermaid
 flowchart TB
-  TAG["signed tag vX.Y.Z on upstream"] --> WF["release workflow, one run<br/>GitHub environment #quot;release#quot;<br/>(Developer ID certificate, notary API key, provisioning profile)"]
-  WF --> HB
-  subgraph T["for each target in aarch64-apple-darwin, x86_64-apple-darwin"]
-    HB["cargo build --release --target #lt;target#gt; --bin mairu-platform-helper<br/>--no-default-features --features platform-helper"]
-    HB --> APP["Mairu Helper.app + embedded.provisionprofile"]
-    APP --> HCS["codesign (Developer ID, runtime, keychain-access-groups)"]
-    HCS --> HNT["notarytool"] --> ST["stapler"] --> AR["tar archive"]
-    AR --> MB["mairu for #lt;target#gt;, built with<br/>MAIRU_HELPER_ARCHIVE = that archive (embedded)"]
-    MB --> MCS["codesign mairu<br/>(Developer ID, runtime, timestamp, identifier co.0w0.mairu)"]
-    MCS --> MNT["notarytool (zip)"]
-    MNT --> UP["upload mairu-#lt;target#gt;.tar.gz"]
+  TAG["signed tag vX.Y.Z"] --> WF["release workflow, one run<br/>Developer ID, notary key,<br/>provisioning profile"]
+  WF --> T
+  subgraph T["per macOS target"]
+    direction LR
+    HB["helper bundle<br/>build, sign, notarize,<br/>staple, tar"] --> MB["mairu<br/>embeds the tar"]
+    MB --> MS["sign, notarize"]
+    MS --> UP["upload"]
   end
 ```
 
+- Per target, the helper bundle comes first: `cargo build --release --target <target> --bin mairu-platform-helper --no-default-features --features platform-helper`, assembled into `Mairu Helper.app` with `embedded.provisionprofile`, signed with `codesign` (Developer ID, hardened runtime, `keychain-access-groups`), notarized with `notarytool`, stapled, and archived with `tar`.
+- Then `mairu` for the same target is built with `MAIRU_HELPER_ARCHIVE` set to that archive, signed (Developer ID, hardened runtime, timestamp, identifier `co.0w0.mairu`), notarized as a zip, and uploaded as `mairu-<target>.tar.gz`.
 - The helper bundle's provisioning profile is a Developer ID profile for the explicit App ID `co.0w0.mairu.platform-helper`, with the keychain access group `<TEAMID>.co.0w0.mairu`. It is created once in the developer account and kept in the `release` environment with the certificate. It is not secret, but it is bound to the team. One profile serves both architectures.
 - `build.rs` embeds `MAIRU_HELPER_ARCHIVE` with `include_bytes!` when the variable is set, and builds without an embedded bundle otherwise (every non-official build).
 - The maintainer check before publishing ([018](018-macos-install.md)) adds: the embedded helper bundle posts notifications, and `doctor` reports the data-protection keychain.
@@ -424,7 +414,7 @@ flowchart TB
 [018 harden on macOS](018-macos-install.md#harden-on-macos) also writes the helper bundle:
 
 ```text
-/usr/local/libexec/mairu/Mairu Helper.app     official: from the archive; other builds: assembled and signed as root
+<harden_home>/libexec/mairu/Mairu Helper.app  official: from the archive; other builds: assembled and signed as root
                                               executable root:mairu 2755
 ```
 
@@ -449,7 +439,7 @@ flowchart TB
 - `src/agent.rs`: `ResetPolicyRecord`; `console_session` from the peer's audit session
 - `proto/mairu.proto`: `ResetPolicyRecord`
 - `src/policy/mairu.cedarschema`: `console_session?`
-- `src/cmd/harden.rs`: the helper bundle in `/usr/local/libexec/mairu/`
+- `src/cmd/harden.rs`: the helper bundle in `<harden_home>/libexec/mairu/`
 - `build.rs`: `MAIRU_HELPER_ARCHIVE`
 - `pkg/macos/mairu.icns`
 - `.github/workflows/release.yml`: helper bundle per architecture, provisioning profile, embedding

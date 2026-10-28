@@ -57,7 +57,7 @@ sequenceDiagram
 ### Errors
 
 ```mermaid
-flowchart LR
+flowchart TB
   R["RPC"] --> Q{"PingAgent or<br/>GetAgentStatus?"}
   Q -- "yes" --> O["served, unverified peers included<br/>(self-diagnosis)"]
   Q -- "no, every other RPC" --> T{"peer Rejected?"}
@@ -118,12 +118,11 @@ message PeerView {
 
 ### mairu doctor
 
-```mermaid
-flowchart LR
-  D["mairu doctor"] --> P["PingAgent"] --> PV["agent version"]
-  D --> G["GetAgentStatus"] --> GV["agent hardening, profile,<br/>how the agent sees me, capabilities"]
-  D --> L["local checks"] --> LV["own hardening, marker membership,<br/>protected_hardlinks, SO_PEERPIDFD"]
-```
+| Source | What `doctor` learns from it |
+|---|---|
+| `PingAgent` | the agent version |
+| `GetAgentStatus` | the agent's hardening and profile, how the agent sees this client, capabilities |
+| local checks | the client's own hardening, marker membership, `fs.protected_hardlinks`, `SO_PEERPIDFD` |
 
 `mairu doctor` prints, as plain text for humans:
 
@@ -151,11 +150,10 @@ capabilities  peer_verification=SETGID
 
 ### Compatibility
 
-```mermaid
-flowchart LR
-  OC["old client"] -- "unverified when the agent is hardened,<br/>otherwise as today" --> NA["new agent"]
-  NC["new client"] -- "unknown fields ignored,<br/>existing version warning fires" --> OA["old agent"]
-```
+| Client | Agent | Result |
+|---|---|---|
+| old | new | unverified when the agent is hardened, otherwise as today |
+| new | old | unknown fields ignored; the existing version warning fires |
 
 - New fields are optional, and an old agent ignores unknown ones.
 - An old unhardened client talking to a hardened agent is unverified and gets `REASON_UNVERIFIED_PEER`.
@@ -352,7 +350,7 @@ A squatter that ignores `ShutdownAgent` keeps running on an unlinked socket and 
 flowchart LR
   L["mairu login"] --> V{"agent verified?"}
   V -- "no" --> S["stop<br/>a squatter never sees the code"]
-  V -- "yes" --> C["CompleteOauthCode{handle, code, state}"] --> A["agent"]
+  V -- "yes" --> C["send CompleteOauthCode<br/>{handle, code, state}"]
 ```
 
 `CompleteOauthCode` carries authorization codes to the agent. Client-side agent verification is what keeps these codes away from a socket squatter.

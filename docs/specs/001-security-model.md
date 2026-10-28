@@ -54,11 +54,16 @@ Without `sudo mairu harden` mairu behaves as today: no peer verification and no 
 ### Terminology
 
 ```mermaid
-flowchart LR
-  A["agent"] --> P["peers<br/>verified by the marker gid (004)"]
-  A --> G["grants<br/>(session, server, rolespec)<br/>5 min idle / 12 h max by default"]
-  A --> L["leases<br/>(running exec sidecar, server, rolespec)<br/>while it lives"]
-  A --> R["integrity record<br/>policy digest + server digests + approval anchor<br/>root-protected"]
+flowchart TB
+  C["client<br/>(the agent's peer)"] -- "verified both ways" --> A
+  subgraph A["agent"]
+    G["grants<br/>per terminal session"]
+    L["leases<br/>per running mairu exec"]
+    P["Cedar policy<br/>at gate 1 and gate 2"]
+  end
+  A -- "socketpair" --> H["platform helper"]
+  H -- "presence method" --> U(("human"))
+  H -- "stores" --> R["integrity record<br/>root-protected"]
 ```
 
 | Term | Meaning |
@@ -83,21 +88,22 @@ Each spec opens its sections with short visual summaries. They are illustrative;
 
 ### Adversary
 
-```text
-attacker = code running as your uid
-  can     read/write ~, connect to your sockets, run genuine mairu with any args,
-          use $SSH_AUTH_SOCK, read your ptys, drive your tmux server
-  cannot  ptrace a hardened mairu, forge SO_PEERCRED or a code signature,
-          become root*                     * unless the host allows it (Trust chain below)
-```
-
 ```mermaid
-flowchart LR
-  U["code running as your uid"] --> F["your files"]
-  U --> S["your sockets<br/>and processes"]
-  U --> B["Secret Service<br/>and session D-Bus"]
-  U --> K["forwarded $SSH_AUTH_SOCK"]
-  U --> T["your ptys<br/>and tmux server"]
+flowchart TB
+  X["code running<br/>as your uid"]
+  subgraph R["within its reach"]
+    R1["your files, sockets<br/>and processes"]
+    R2["Secret Service,<br/>session D-Bus"]
+    R3["forwarded SSH agent,<br/>ptys, tmux server"]
+    R4["genuine mairu,<br/>with any arguments"]
+  end
+  subgraph P["out of its reach"]
+    P1["memory of a<br/>hardened mairu"]
+    P2["peer credentials,<br/>code signatures"]
+    P3["root-owned anchors,<br/>unless it becomes root"]
+  end
+  X --> R
+  X -. "kernel-enforced" .-x P
 ```
 
 The adversary is code running **as the same Unix user** as the human, which the human did not intend to act. Examples: a compromised dependency's install script, a malicious repository script, or an AI coding agent going beyond what it was asked to do. It can:
@@ -176,28 +182,16 @@ Recommendations, in the README; `mairu doctor` warns where it can detect the con
 ### Roadmap
 
 ```mermaid
-flowchart TB
-  subgraph F["foundation"]
-    direction LR
-    main["main"] --> spec["spec"] --> bl["build-layout"] --> mg["marker-gid"] --> pv["peer-verification"] --> inst["install"] --> ph["platform-helper"]
-  end
-  subgraph Z["authorization and policy"]
-    direction LR
-    az["authorization"] --> hl["headless"] --> ci["caller-identity"] --> td["tool-detection"] --> up["user-policy"] --> pa["policy-approval"]
-  end
-  subgraph M["methods and environments"]
-    direction LR
-    sa["ssh-agent"] --> nt["notify"] --> wsl["wsl2"] --> wh["windows-hello"]
-  end
-  subgraph X["macOS, separate implementer"]
-    direction LR
-    m1["macos-peer-verification"] --> m2["macos-install"] --> m3["macos-platform-helper"]
-  end
+flowchart LR
+  F["002–006<br/>build layout<br/>marker gid<br/>peer verification<br/>install<br/>platform helper"]
+  Z["007–012<br/>authorization<br/>headless<br/>caller identity<br/>tool detection<br/>user policy<br/>policy approval"]
+  M["013–016<br/>ssh-agent<br/>notify<br/>WSL2<br/>Windows Hello"]
+  X["017–019<br/>macOS peer verification<br/>macOS install<br/>macOS platform helper"]
   F --> Z --> M
-  F -. "after platform-helper" .-> X
+  F -. "separate implementer" .-> X
 ```
 
-Each layer builds on the one before it.
+Each layer builds on the one before it, in the order of the table.
 
 Read and implement the specs in order. Each spec describes only what its step adds and refers back to earlier ones, never forward.
 

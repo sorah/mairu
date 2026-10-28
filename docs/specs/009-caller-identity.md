@@ -23,16 +23,19 @@ The credentials themselves are the only reliable source. `sts:GetCallerIdentity`
 Each credential request now passes two gates, and each gate decides with the full decision procedure of [007](007-authorization.md#decision-procedure):
 
 ```mermaid
-flowchart TB
-  R["AssumeRole"] --> P["peer check<br/>server + user config"]
-  P --> G1{"gate 1: AssumeRole<br/>server, role<br/>(the account only when the role name has one)"}
-  G1 -- "refuse" --> X1["refused<br/>nothing fetched"]
-  G1 -- "permit" --> F["credential cache or server<br/>(+ sts:AssumeRole for chains)"]
-  F --> I["sts:GetCallerIdentity<br/>cached with the credentials"]
-  I -- "unavailable" --> XU["REASON_UNAVAILABLE<br/>nothing cached"]
-  I --> G2{"gate 2: UseCredentials<br/>the same, plus the real caller:<br/>account, ARN, …"}
-  G2 -- "refuse" --> X2["refused"]
-  G2 -- "permit" --> V["vend"]
+sequenceDiagram
+  participant C as client
+  participant A as agent
+  participant S as credential server
+  participant T as AWS STS
+  C->>A: AssumeRole
+  Note over A: gate 1, AssumeRole: server and role<br/>refused: nothing is fetched
+  A->>S: credentials, on a cache miss<br/>(+ sts:AssumeRole for chains)
+  S-->>A: credentials
+  A->>T: sts:GetCallerIdentity
+  T-->>A: account, ARN, …<br/>cached with the credentials
+  Note over A: gate 2, UseCredentials: plus the real caller<br/>no identity: REASON_UNAVAILABLE, nothing cached
+  A-->>C: credentials
 ```
 
 1. **Gate 1**, action `AssumeRole`, runs after the peer trust check and server/user-config loading, and **before** the credential cache lookup ([007](007-authorization.md#decision-procedure)). Nothing is fetched for a request it refuses, so refused requests leave no credentials, CloudTrail events or server audit entries behind.

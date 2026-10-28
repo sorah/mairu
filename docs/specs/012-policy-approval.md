@@ -29,14 +29,14 @@ On Linux the record lives in two stores at once: the protected directory `/var/l
 | Every key lost | root resets the record | the anchor falls back to `platform` |
 
 ```mermaid
-flowchart LR
-  P["~/.config/mairu/policy.cedar<br/>permit / forbid"] --> D["policy digest"]
-  A["~/.config/mairu/authorization.json<br/>methods, tool labels, …"] --> D
-  S["~/.config/mairu/servers.d/*.json<br/>as captured at login"] --> SD["one digest per server"]
-  D --> R["record<br/>generation · digests · approval anchor"]
+flowchart TB
+  P["policy.cedar"] --> D["policy digest"]
+  A["authorization.json"] --> D
+  S["servers.d/*.json<br/>as captured at login"] --> SD["a digest per server"]
+  D --> R["integrity record<br/>generation, digests, approval anchor"]
   SD --> R
-  R --> PD["/var/lib/mairu/users/UID/policy.record<br/>strong, root-protected, authoritative"]
-  R --> SS["Secret Service item<br/>weak copy"]
+  R --> PD["protected directory<br/>strong, authoritative"]
+  R --> SS["Secret Service<br/>weak copy"]
 ```
 
 ### Integrity states

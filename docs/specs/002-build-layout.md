@@ -8,7 +8,7 @@ CI reports the size of the release binaries, so growth is noticed when it happen
 
 ## Motivation
 
-Official macOS builds will be self-extracting (019): the `mairu` binary embeds a signed helper app bundle and writes it out at startup. Whatever the helper links is carried in every download and every installed copy, so its size has to be controlled before it exists.
+Release builds will be self-extracting. Official macOS builds embed a signed helper app bundle and write it out at startup (019). Linux builds embed, in part, the Windows Hello helper for WSL2 and write it out to the Windows side on first use (016). Whatever an embedded helper links is carried in every download and every installed copy, so its size has to be controlled before it exists.
 
 Measured on Linux x86_64, release builds, on 2026-10-29 (mairu 0.12.0, rustc 1.96.0):
 
@@ -148,6 +148,7 @@ Tools:
 ### Out of scope
 
 - The helper binary itself and the `platform-helper` feature (006), and embedding it in macOS builds (019)
+- The Windows Hello helper and embedding it in Linux builds (016)
 - `opt-level` tuning
 - Updates in other repositories that select release assets by name: the Homebrew tap, the aqua registry, and installers such as ubi or mise. They are follow-ups once the first per-architecture release is out.
 

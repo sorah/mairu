@@ -25,7 +25,7 @@ Distribution has its own constraints. Homebrew directs binary-only software to c
 ```text
 sudo mairu harden   (macOS, every tier)
   dseditgroup -o create mairu                         refuse if the user is a member; no group password
-  /usr/local/libexec/mairu/mairu                      copy, root:mairu, mode 2755
+  /opt/mairu/libexec/mairu/mairu                      copy, root:mairu, mode 2755
     ad-hoc: codesign --force --sign - --options runtime --identifier co.0w0.mairu   (before chown/chmod)
   /private/var/db/mairu                               root:mairu 2770; the helper creates users/<uid>
   LaunchAgent plist                                   points at the hardened copy (017); other installs re-exec into it (005)
@@ -34,6 +34,7 @@ sudo mairu harden   (macOS, every tier)
 `harden` is the macOS counterpart of [005 mairu harden](005-install.md#mairu-harden), for every tier. It provides the **protected directory**, the strong policy store that needs no app bundle. Ad-hoc builds also get a root-owned location and the hardened runtime.
 
 - **Group.** The marker group `mairu`, with the preconditions of [003](003-marker-gid.md): the user must not be a member, primary or supplementary, and the group has no password.
+- **Harden home.** `/opt/mairu` by default on macOS, a prefix of mairu's own, as Homebrew uses `/opt/homebrew` on Apple silicon. It is configurable as on Linux ([005 Harden home](005-install.md#harden-home)): `--home`, `MAIRU_HARDEN_HOME`, or `harden_home` in `config.json`.
 - **Copies.** Mode bits are not covered by a code signature, so the setgid bit leaves a signature valid (confirmed for ad-hoc builds). Ad-hoc builds are re-signed with the runtime before the mode is set. The copy is written fresh, so it does not carry `com.apple.quarantine` over.
   - A quarantined, unnotarized input never reaches `harden`, because Gatekeeper blocks its exec first (observed). Ad-hoc builds are built locally and are not quarantined anyway.
   - A quarantined, notarized official binary, as a cask installs it, passes Gatekeeper's online check. Running it under `sudo` is to be checked with the first official build.
@@ -88,11 +89,6 @@ cargo install                                ad-hoc
 
 ### Contributors with their own Developer ID
 
-```mermaid
-flowchart LR
-  DI["their Developer ID"] --> TP["third-party tier (017)<br/>full strength under their team,<br/>separate from official installs"]
-```
-
 Their signed builds are the third-party tier ([017 Build tiers](017-macos-peer-verification.md#build-tiers)). They get full strength under their own team, but do not interoperate with official installs. The dev profile ([004 Dev profile](004-peer-verification.md#dev-profile)) keeps the two apart on the same machine.
 
 ## Drawbacks
@@ -106,6 +102,7 @@ Their signed builds are the third-party tier ([017 Build tiers](017-macos-peer-v
 
 ## Considered Alternatives
 
+- **`/usr/local` as on Linux.** Rejected as the macOS default: on Intel Macs Homebrew takes `/usr/local` as its prefix and makes much of it writable by the user, which breaks the root-owned-ancestors rule of [005 Re-exec](005-install.md#re-exec). A prefix of mairu's own keeps every ancestor root-owned.
 - **Homebrew packaging (Q-M7, decided 2026-10-23).**
   - A prebuilt-binary formula: rejected as the primary channel. homebrew/core formulae must build from source, Homebrew directs binary-only software to casks, and Homebrew maintainers call prebuilt-binary formulae unsupported. GoReleaser moved from formulae to casks for that reason.
   - **A cask `mairu`** for official builds, a from-source formula `mairu-src` for ad-hoc builds, and `tap_migrations.json` to move users: **chosen**.
@@ -172,10 +169,10 @@ Stack layer: the macOS implementer's own layers, on top of [017](017-macos-peer-
 `src/cmd/harden.rs` gains a macOS branch, root-only, following [005 mairu harden](005-install.md#mairu-harden) where the platforms agree:
 
 1. **Group.** `dseditgroup -o read mairu`; if missing, `dseditgroup -o create mairu`. Refuse if `SUDO_UID`'s user is a member, primary or supplementary, and print how to fix it. The group has no password.
-2. **Binary.** Copy its own executable (`proc_pidpath` of its own pid) to `/usr/local/libexec/mairu/mairu.tmp`. For an ad-hoc build, re-sign the temporary copy with `codesign --force --sign - --options runtime --identifier co.0w0.mairu` while it is still root-owned and before the mode is set. Then `fchown root:mairu`, `fchmod 02755`, `fsync`, rename into place. Official builds are copied unchanged.
+2. **Binary.** Copy its own executable (`proc_pidpath` of its own pid) to `mairu.tmp` in `<harden_home>/libexec/mairu/` ([005 Harden home](005-install.md#harden-home); `/opt/mairu` on macOS), creating missing directories as `root:wheel` mode `0755`. For an ad-hoc build, re-sign the temporary copy with `codesign --force --sign - --options runtime --identifier co.0w0.mairu` while it is still root-owned and before the mode is set. Then `fchown root:mairu`, `fchmod 02755`, `fsync`, rename into place. Official builds are copied unchanged.
 3. **Protected directory.** `install -d -o root -g mairu -m 2770 /private/var/db/mairu`.
-4. **LaunchAgent.** Rewrite the user's plist ([017 XPC transport](017-macos-peer-verification.md#xpc-transport)) to point at `/usr/local/libexec/mairu/mairu`, as the user (`SUDO_UID`), then boot the old job out so the next client starts the hardened copy.
-5. Re-exec candidates on macOS are the same root-owned location ([005 Re-exec](005-install.md#re-exec)), validated with the same rules: root-owned, group `mairu`, setgid, no group or other write, root-owned ancestors.
+4. **LaunchAgent.** Rewrite the user's plist ([017 XPC transport](017-macos-peer-verification.md#xpc-transport)) to point at the hardened copy, `/opt/mairu/libexec/mairu/mairu` by default, as the user (`SUDO_UID`), then boot the old job out so the next client starts the hardened copy.
+5. Re-exec candidates on macOS are `<harden_home>/libexec/mairu/mairu` only ([005 Re-exec](005-install.md#re-exec)), validated with the same rules: root-owned, group `mairu`, setgid, no group or other write, root-owned ancestors.
 
 `--uninstall [--purge]` removes what these steps wrote; the group is left for `dseditgroup -o delete mairu`.
 
@@ -183,18 +180,18 @@ Stack layer: the macOS implementer's own layers, on top of [017](017-macos-peer-
 
 ```mermaid
 flowchart TB
-  TAG["signed tag vX.Y.Z on upstream"] --> WF["release workflow<br/>one run for every artifact of the release"]
-  WF --> ENV["GitHub environment #quot;release#quot;<br/>(Developer ID certificate, notary API key)"]
-  ENV --> B
-  subgraph T["for each target in aarch64-apple-darwin, x86_64-apple-darwin"]
-    B["cargo build --release --target #lt;target#gt; --bin mairu<br/>(signed Info.plist, 017)"]
-    B --> CS["codesign mairu<br/>(Developer ID, runtime, timestamp, identifier co.0w0.mairu)"]
-    CS --> NT["notarytool (zip)"]
-    NT --> UP["upload mairu-#lt;target#gt;.tar.gz"]
+  TAG["signed tag vX.Y.Z"] --> WF["release workflow, one run<br/>environment release:<br/>Developer ID, notary key"]
+  WF --> T
+  subgraph T["per macOS target"]
+    direction LR
+    B["cargo build<br/>signed Info.plist"] --> CS["codesign<br/>Developer ID, runtime"]
+    CS --> NT["notarytool"]
+    NT --> UP["upload<br/>mairu-#lt;target#gt;.tar.gz"]
   end
 ```
 
-- The secrets live in a protected GitHub environment. Workflows triggered from forks never receive them.
+- Each target runs `cargo build --release --target <target> --bin mairu`, which embeds the signed `Info.plist` ([017 Minimum versions](017-macos-peer-verification.md#minimum-versions)). Then `codesign` with the Developer ID, the hardened runtime, a timestamp and identifier `co.0w0.mairu`, then `notarytool` on a zip of the binary, then the upload of `mairu-<target>.tar.gz`.
+- The secrets live in a protected GitHub environment, `release` (the Developer ID certificate and the notary API key). Workflows triggered from forks never receive them.
 - A bare Mach-O cannot carry a stapled ticket. Gatekeeper checks notarization online for quarantined downloads only. Tarballs fetched by mise, aqua or curl are usually not quarantined.
 - Both macOS targets are built on the macOS runner, `x86_64-apple-darwin` cross-compiled ([002](002-build-layout.md)).
 - The macOS jobs are part of the same run that builds the Linux binaries, the debs and the crate publish ([002](002-build-layout.md)), so a release never mixes versions.

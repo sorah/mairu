@@ -25,10 +25,9 @@ The authorization prompt is the boundary. Everything else in the request context
 
 ```mermaid
 flowchart LR
-  AR["AssumeRole"] --> PC["peer check"] --> CFG["server + user config"] --> G1{"GATE 1"}
-  G1 -- "permit" --> F["credential cache or server"] --> V["vend"]
+  AR["AssumeRole"] --> PC["peer check,<br/>server and user config"] --> G1{"gate 1"}
+  G1 -- "permit" --> F["credential cache<br/>or credential server"] --> V["vend"]
   G1 -- "refuse" --> X["AuthorizationError<br/>nothing fetched"]
-  O["ListRoles, ListSessions, GetServer,<br/>RefreshSession, login RPCs, ShutdownAgent"] --> PC2["peer check only"]
 ```
 
 - `AssumeRole` runs gate 1 after the peer trust check and server/user-config loading, and **before** the credential cache lookup. Nothing is fetched for a request it refuses, so refused requests leave no credentials, CloudTrail events or server audit entries behind.
@@ -91,12 +90,6 @@ SessionIdentity =
 All authorization state is in memory only. Restarting the agent forgets every grant and lease.
 
 ### What the human sees
-
-```mermaid
-flowchart LR
-  CC["ClientContext + peer facts"] --> TL["terminal lines"]
-  CC --> PD["polkit details<br/>server, role, command, cwd, tty, requester, intent"]
-```
 
 While waiting, the client prints context to its terminal through `crate::terminal` (the existing `/dev/tty`-or-stderr writer):
 
@@ -341,28 +334,16 @@ message PeerView {
 
 ### Platform method
 
-```mermaid
-flowchart LR
-  A["PlatformServices::authorize<br/>ACTION_ASSUME_ROLE, subject = peer, details"] --> H["platform helper"]
-  H -- "ALLOWED" --> P["permit"]
-  H -- "DENIED / CANCELLED" --> D["REASON_DENIED"]
-  H -- "UNAVAILABLE no-authentication-agent" --> N["REASON_NO_AUTHENTICATION_AGENT"]
-  H -- "UNAVAILABLE other" --> M["next method"]
-```
+| Helper answer | Result |
+|---|---|
+| `ALLOWED` | the fresh check succeeds, and the request is permitted |
+| `DENIED`, `CANCELLED` | `REASON_DENIED` |
+| `UNAVAILABLE` with `no-authentication-agent` | `REASON_NO_AUTHENTICATION_AGENT` |
+| `UNAVAILABLE` with any other reason | the next method in order |
 
 The agent calls `PlatformServices::authorize`, which the platform helper serves ([006 Helper process](006-platform-helper.md#helper-process)), with action `ACTION_ASSUME_ROLE`, the peer as the subject (for `mairu exec`, the sidecar), a one-line `message`, and the details of [What the human sees](#what-the-human-sees). A policy can require it through `context.presence.method == "platform"`.
 
 ### Polkit
-
-```mermaid
-flowchart LR
-  C["CheckAuthorization<br/>unix-process: pid, start-time, uid<br/>action, details, AllowUserInteraction"]
-  C -- "authorized" --> A["ALLOWED"]
-  C -- "dismissed" --> X["CANCELLED"]
-  C -- "challenge, no agent for the subject" --> N["UNAVAILABLE no-authentication-agent"]
-  C -- "action not registered" --> R["UNAVAILABLE polkit-action-not-installed"]
-  C -- "bus unreachable / owner uid ≠ 0" --> U["UNAVAILABLE polkit-unavailable /<br/>untrusted-authority"]
-```
 
 This step adds `LinuxServices` to the helper, with the polkit backend in `src/platform/services/linux/polkit.rs`. Its other services stay as in `FallbackServices`. It reports `Capabilities.authorization = AUTHORIZATION_FACILITY_POLKIT` when the authority is reachable and trusted, and `NONE` with a note otherwise. The connection follows [006](006-platform-helper.md#helper-process)'s rules for system services: the pinned system bus when hardened, and an owner of `org.freedesktop.PolicyKit1` with uid 0.
 
@@ -423,11 +404,13 @@ This step adds `LinuxServices` to the helper, with the polkit backend in `src/pl
 ### Cedar schema
 
 ```mermaid
-flowchart LR
-  U["principal<br/>Mairu::User (uid)"] --> Act["action<br/>Mairu::Action AssumeRole"] --> R["resource<br/>Mairu::Role contoso:123456789012/Admin"]
-  R -- "parent" --> S["Mairu::Server contoso"]
-  R -- "parent" --> A["Mairu::Account 123456789012"]
-  C["context<br/>presence: verified, scope (none · request · process · session), method?, age, idle<br/>session, tty?, hardened, intent, exec_command?,<br/>exec_command_line?, cwd?, chained_role_arn?"] --> Act
+flowchart TB
+  Q["Cedar request"] --> U["principal<br/>Mairu::User 1000"]
+  Q --> A["action<br/>Mairu::Action AssumeRole"]
+  Q --> R["resource<br/>Mairu::Role contoso:123456789012/Admin"]
+  Q --> C["context<br/>presence, session, tty,<br/>hardened, intent, …"]
+  R -- "in" --> S["Mairu::Server contoso"]
+  R -- "in" --> AC["Mairu::Account 123456789012"]
 ```
 
 `src/policy/mairu.cedarschema`, as of this step (later steps show their additions):
@@ -534,23 +517,10 @@ For each evaluation the agent builds:
 
 ### Which context can be trusted
 
-```mermaid
-flowchart LR
-  AD["agent-determined<br/>presence · hardened · session · tty"] --> G["may grant"]
-  RC["requester-chosen<br/>intent · exec_command · cwd · chained_role_arn"] --> NF["narrow or forbid only"]
-```
-
 - **Determined by the agent**: `presence`, `hardened`, `session` and `tty`. These cannot be influenced by the requester beyond actually being in that position.
 - **Reported by the client**: `intent`, `exec_command`, `exec_command_line`, `cwd` and `chained_role_arn`. A verified client reports them truthfully, but whoever runs `mairu` chooses them: same-user code can `cd` into any directory or exec any command. Use them to **narrow** a `permit` that also requires `context.presence.verified`, or in a `forbid`. Never rely on them alone to grant access.
 
 ### Agent protocol
-
-```mermaid
-flowchart LR
-  AR["AssumeRoleRequest"] --> CC["ClientContext<br/>intent, cwd, auto_config_path"]
-  ERR["non-OK status"] -- "details" --> AE["AuthorizationError<br/>reason, detail, policy_ids"]
-  RA["RevokeAuthorizations<br/>scope, include_leases"]
-```
 
 `proto/mairu.proto` additions. Field numbers and enum values skipped here are assigned by later steps ([001 Roadmap](001-security-model.md#roadmap)); never reuse them.
 
