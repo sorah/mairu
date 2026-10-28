@@ -4,7 +4,7 @@
 
 This step adds `windows-hello`, a key-based presence method for WSL2 distributions with Windows interop enabled. A TPM-backed Windows Hello key credential signs the agent's challenge on the Windows side, and the agent verifies the signature against a public key registered in `authorization.json`. The flow is the one ssh-agent uses ([013 Challenge and statement](013-ssh-agent.md#challenge-and-statement)), with a different signer.
 
-The signer is `mairu-windows-hello.exe`, a small Windows binary built from the mairu package. Linux release builds of mairu carry it for the matching Windows architecture and write it out to the Windows side on first use, so it always has mairu's own version. The client runs it through WSL interop. Its output is never trusted on its own: only a signature that verifies against a registered key counts.
+The signer is `mairu-windows-hello.exe`, a small Windows binary built from the mairu package. Linux release archives ship it next to `mairu`, for the matching Windows architecture, so it always has mairu's own version. The client runs it through WSL interop. Its output is never trusted on its own: only a signature that verifies against a registered key counts.
 
 ## Motivation
 
@@ -40,24 +40,25 @@ sequenceDiagram
 
 ### Installing the helper
 
-Nothing to install with a release build. Linux release binaries embed the helper for the matching Windows architecture: `x86_64` carries `x86_64-pc-windows-msvc`, and `aarch64` carries `aarch64-pc-windows-msvc`. The client writes it out on first use:
+Nothing to install with a release archive. Linux archives ship the helper for the matching Windows architecture next to `mairu`, `x86_64-pc-windows-msvc` with `x86_64` and `aarch64-pc-windows-msvc` with `aarch64`, and distribution packages install it in `/usr/lib/mairu/`. The client finds it as in [002 Shipped helpers](002-build-layout.md#shipped-helpers):
 
 ```text
-%LOCALAPPDATA%\mairu\windows-hello-<version>\mairu-windows-hello.exe
-  found through   $(wslpath "$(cmd.exe /c echo %LOCALAPPDATA%)"), so it needs interop
-  before each run compared with the embedded bytes; rewritten when they differ
-  cleanup         other windows-hello-* directories unused for 30 days are removed
+<directory of mairu>/mairu-windows-hello.exe     or /usr/lib/mairu/mairu-windows-hello.exe
+  check   its SHA-256 against the pinned one, right before each run
+  run     through WSL interop, from where it is (Q-W6)
 ```
 
-Builds without an embedded helper, such as `cargo install` or distribution packages built from source, take the helper from the release's `mairu-windows-hello-<target>.zip`, at the path set in the unprotected configuration:
+Builds that ship no helper, such as `cargo install` or packages built from source, use the helper from the release's `mairu-windows-hello-<target>.zip`, at a path set in the unprotected configuration:
 
 ```jsonc
 // ~/.config/mairu/config.json (UserConfig)
 {
-  // Overrides the extracted copy; required when the binary embeds no helper.
+  // Overrides the shipped helper; required when the build ships none.
   "windows_hello_helper": "/mnt/c/Users/me/AppData/Local/mairu/mairu-windows-hello.exe"
 }
 ```
+
+The pinned SHA-256 comes from the build, since release builds record the SHA-256 of the helper they ship. For a build without one, it comes from `windows_hello_helper_sha256` in the approved `authorization.json`. A hardened client refuses to run a helper that matches neither, because a replaced helper could have the human's gesture sign another statement, such as a pending policy approval.
 
 A replaced helper can trigger prompts, but cannot forge a signature.
 
@@ -108,8 +109,8 @@ The integrated profile ([015 Profiles](015-wsl2.md#profiles)) gains `windows-hel
 
 - Interop must be enabled, which is the profile where same-user Linux code can become root. The method strengthens a guardrail, not a boundary.
 - Same-user code on either side can run its own program against the same key credential and cause a Windows Hello dialog. The human still has to pass it, but may not tell whose request it is.
-- Linux release binaries grow by the size of the embedded helper, on every host, whether it runs under WSL2 or not.
-- Builds from source embed no helper. Their users fetch it from the release and configure its path.
+- Linux release archives grow by the size of the helper, on every host, whether it runs under WSL2 or not.
+- Builds from source ship no helper. Their users fetch it from the release, configure its path, and pin its SHA-256 in `authorization.json` when hardened.
 - A console process owns no foreground window, so the helper needs extra work to bring the dialog to the front.
 
 ## Considered Alternatives
@@ -120,7 +121,9 @@ The integrated profile ([015 Profiles](015-wsl2.md#profiles)) gains `windows-hel
 - **RSA-PSS, as Microsoft's documentation says.** Every PSS salt length fails. The signatures are PKCS #1 v1.5 with SHA-256 (Q-W2, confirmed), and the verifier is pinned by a recorded test vector.
 - **Passing a digest to the helper.** Rejected. Windows hashes the data itself, so the helper passes the statement bytes, never a digest.
 - **A separate Cargo package under `windows-hello-helper/`.** Rejected. mairu stays one package and one crate, released from one tag in one workflow run ([002 Cargo features](002-build-layout.md#cargo-features)). The helper is a feature-gated `[[bin]]` of that package, like the platform helper ([006 Helper binary](006-platform-helper.md#helper-binary)).
-- **The helper as a separate download only,** installed by the user at a known path. Rejected as the default: it is a manual step on every upgrade, and the helper's version drifts from mairu's. Embedding it in the Linux release binary keeps both at one version from one release. The release asset remains for builds that embed nothing.
+- **The helper as a separate download only,** installed by the user at a known path. Rejected as the default: it is a manual step on every upgrade, and the helper's version drifts from mairu's. Shipping it in the Linux release archive keeps both at one version from one release. The separate asset remains for builds that ship none.
+- **Embedding the helper in mairu and writing it out to `%LOCALAPPDATA%`.** Rejected with self-extraction as a whole ([002 Considered Alternatives](002-build-layout.md#considered-alternatives)).
+- **Trusting whatever helper is configured.** Rejected for hardened clients: a replaced helper cannot forge a signature, but it can have the human's gesture sign another statement. The helper's SHA-256 is pinned by the build or by the approved settings.
 - **Falling back to another method when the user cancels the dialog.** Rejected. A cancelled or timed-out Windows Hello dialog is a denial, so cancelling never leads to a second prompt by another method.
 
 ## Prior Art
@@ -133,7 +136,7 @@ The integrated profile ([015 Profiles](015-wsl2.md#profiles)) gains `windows-hel
 | Threat | Mitigation |
 |---|---|
 | Abuse of the Windows Hello credential | Windows Hello requires the PIN or biometric for every signature. Challenge bound to peer + request; single use; 60 s ([013 Challenge and statement](013-ssh-agent.md#challenge-and-statement)). |
-| A replaced or malicious helper | It can trigger prompts but cannot forge a signature: only a signature verifying against a registered key counts. The extracted copy is writable by the user's processes on both sides, so the client compares it with the embedded bytes before each run; a swap between the check and the run still only causes a prompt. |
+| A replaced or malicious helper | It cannot forge a signature, but could have the human's gesture sign another statement. A hardened client runs only a helper matching the pinned SHA-256, checked right before each run. A swap between the check and the run remains possible where the file is writable by the user's processes; the copy next to the hardened binary is root-owned on the Linux side, which is why running it from there is preferred (Q-W6). Within the integrated profile, root is reachable anyway ([015](015-wsl2.md)). |
 | Replayed or relayed signatures | Same single-use, peer- and request-bound challenge as ssh-agent |
 | Approval downgraded to a password | The anchor holds `windows-hello` and its keys after the first approval |
 
@@ -161,7 +164,7 @@ Logging: signatures, statements and public keys are never logged; the method nam
 - A cancelled dialog denies the request without a second prompt.
 - A forged or replayed signature is refused with `REASON_INVALID_RESPONSE`.
 - `doctor` reports the helper's reachability and enrollment.
-- Every Linux release binary, tarballs and debs alike, embeds the helper for its Windows architecture, and the client writes it out on first use without any setup.
+- Every Linux release archive and deb ships the helper for its Windows architecture, and the client finds, checks and runs it without any setup.
 - Every release also carries `mairu-windows-hello-<target>.zip` for `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`, built in the same workflow run as the other artifacts.
 
 ## Implementation Plan
@@ -172,16 +175,16 @@ Stack layer: `hardening/windows-hello`.
 |---|---|
 | `src/bin/mairu-windows-hello.rs` | New. The Windows helper, `[[bin]] mairu-windows-hello` |
 | `Cargo.toml` | `[[bin]] mairu-windows-hello` with `required-features = ["windows-hello-helper"]`; the `windows` crate as an optional `cfg(windows)` dependency enabled by that feature |
-| `src/windows_hello.rs` | New. Agent verification; client relay (extract or locate, run, decline) |
-| `build.rs` | Embeds the file named by `MAIRU_WINDOWS_HELLO_HELPER` in Linux builds, when set |
+| `src/windows_hello.rs` | New. Agent verification; client relay (locate, check, run, decline) |
+| `build.rs` | Records `MAIRU_WINDOWS_HELLO_HELPER_SHA256`, the SHA-256 of the shipped helper, in Linux release builds |
 | `src/authorization.rs` | `windows-hello` in the key-based branch of step 4 |
 | `src/policy/settings.rs` | `windows_hello_keys`, the `windows-hello` method name, default orders |
 | `src/config.rs` | `UserConfig.windows_hello_helper` |
 | `src/cmd/policy.rs` | `enroll-windows-hello` |
 | `src/cmd/doctor.rs` | Helper reachability and enrollment |
 | `proto/mairu.proto` | `AuthorizationResponse.windows_hello_signature`; `windows-hello` values in `AuthorizationChallenge` |
-| `.github/workflows/release.yml` | Windows helper builds first in the same run; Linux tarballs and debs embed them |
-| `README.md` | WSL2 guide: the embedded helper and its path for builds from source, enrolling, approving |
+| `.github/workflows/release.yml` | Windows helper builds first in the same run; Linux tarballs and debs ship them and record their SHA-256 |
+| `README.md` | WSL2 guide: the shipped helper, its path and pin for builds from source, enrolling, approving |
 
 ### Windows Hello helper
 
@@ -194,19 +197,13 @@ cargo build --release --target <arch>-pc-windows-msvc \
 
 The package's always-on dependencies must build for these targets, or move under `[target.'cfg(unix)'.dependencies]`, and `src/lib.rs` compiles its Unix-only modules only on Unix. The helper uses none of them.
 
-**Embedding in Linux builds.**
+**Shipping in Linux builds.**
 
-- When `MAIRU_WINDOWS_HELLO_HELPER` names an `.exe` at build time, `build.rs` embeds it with `include_bytes!` and records its SHA-256. Unset, the binary embeds nothing, and the client uses `windows_hello_helper` alone.
-- The client finds `%LOCALAPPDATA%` through `cmd.exe /c echo %LOCALAPPDATA%` and `wslpath`, which needs interop, as the method itself does.
-- It writes `windows-hello-<version>\mairu-windows-hello.exe` there: a temporary sibling first, then a rename. Before each run it compares the file's SHA-256 with the embedded one, and writes it again when they differ.
-- `windows_hello_helper` in `config.json`, when set, takes precedence over the extracted copy.
-- Directories `windows-hello-*` other than the current version's, unused for 30 days, are removed when extracting.
-
-It uses `Windows.Security.Credentials.KeyCredentialManager` with credential name `co.0w0.mairu`:
-- `create`: `RequestCreateAsync(…, FailIfExists)` creates the key, then prints the base64 SubjectPublicKeyInfo of the public key.
-- `public-key`: `OpenAsync` the existing key, then print its public key. Neither shows a prompt.
-- `sign`: read base64 bytes on stdin, `OpenAsync`, then `RequestSignAsync`, which shows the Windows Hello dialog. Print the base64 signature.
-- A console process owns no foreground window, so the dialog can open behind other windows (observed). The helper makes sure it comes to the front, for example by creating a foreground window to own it. `UserCanceled` and timeouts are a denial, reported with their own exit status.
+- The Linux tarballs carry `mairu-windows-hello.exe` next to `mairu`, and the debs install it as `/usr/lib/mairu/mairu-windows-hello.exe` ([002 Shipped helpers](002-build-layout.md#shipped-helpers)). `harden` copies it next to the hardened copy, where it is root-owned on the Linux side.
+- Release builds set `MAIRU_WINDOWS_HELLO_HELPER_SHA256` to the SHA-256 of the helper they ship, and `build.rs` records it.
+- `windows_hello_helper` in `config.json`, when set, takes precedence over the lookup.
+- Right before each run, the client reads the file and compares its SHA-256 with the pin: the recorded one, or else `windows_hello_helper_sha256` from the effective settings. A hardened client refuses a mismatch or a missing pin and declines the method (`"no-helper"`). An unhardened client only warns.
+- The client runs the file from where it is, through interop (Q-W6). If Q-W6 shows that a Windows executable on the Linux filesystem cannot use Windows Hello, the client copies the checked file to `%LOCALAPPDATA%\mairu\windows-hello-<version>\` and runs that copy instead.
 
 ### Challenge and verification
 
@@ -263,7 +260,8 @@ The approval anchor records the keys in `ApprovalAnchor.windows_hello_keys = 3` 
 
 - `windows_hello_keys[]`: objects with `name` and `public_key`, a base64 SubjectPublicKeyInfo of an RSA-2048 key. Unknown fields are rejected; a key that does not parse fails validation.
 - `"windows-hello"` is accepted in `methods` and `approval_methods`, and counts as a key-based method for the defaults.
-- `UserConfig.windows_hello_helper` (unprotected `config.json`): a helper path that overrides the extracted copy. Required when the binary embeds no helper.
+- `windows_hello_helper_sha256`: the hex SHA-256 of the helper, for builds that record none. Ignored while the file is unapproved, like every relaxing setting.
+- `UserConfig.windows_hello_helper` (unprotected `config.json`): a helper path that overrides the shipped one. Required when the build ships none.
 
 ### Release workflow
 
@@ -272,21 +270,24 @@ The same release workflow run, triggered by the same tag, builds the helper on W
 ```mermaid
 flowchart LR
   T["tag vX.Y.Z"] --> W["Windows helper<br/>x86_64 and aarch64"]
-  W --> L["Linux tarballs and debs<br/>MAIRU_WINDOWS_HELLO_HELPER<br/>= matching helper"]
+  W --> L["Linux tarballs and debs<br/>ship the matching helper,<br/>record its SHA-256"]
   W --> Z["mairu-windows-hello-#lt;target#gt;.zip"]
   L --> R["one GitHub release"]
   Z --> R
 ```
 
-- The Linux jobs, the musl tarballs and the debs, download the helper of the matching architecture from the Windows jobs and build with `MAIRU_WINDOWS_HELLO_HELPER` set.
-- `mairu-windows-hello-<target>.zip` is uploaded to the same GitHub release for builds that embed nothing. It is not published anywhere else.
-- The crate published to crates.io embeds nothing.
+- The Linux jobs, the musl tarballs and the debs, take the helper of the matching architecture from the Windows jobs, put it into the archive or package, and build with `MAIRU_WINDOWS_HELLO_HELPER_SHA256` set to its SHA-256.
+- `mairu-windows-hello-<target>.zip` is uploaded to the same GitHub release for builds that ship none. It is not published anywhere else.
+- The crate published to crates.io records no pin; builds from it rely on the approved one.
 
-### Open questions (settled on a WSL2 host)
+### Open questions
 
 ```text
 Q-W2 Hello padding (confirmed)   Q-W3 Hello via OpenSSH (fails)   Q-W4 channel without interop (not default)
+Q-W6 helper run from the Linux filesystem (open)
 ```
+
+- **Q-W6** (open, needs a WSL2 host). Whether `mairu-windows-hello.exe`, run through interop from the Linux filesystem (Windows sees a `\\wsl.localhost\<distro>\…` path), can open the key credential and show the Windows Hello dialog, without SmartScreen or Mark-of-the-Web blocking it. If not, the client copies the checked file to `%LOCALAPPDATA%` before running it, and the root-owned copy next to the hardened binary no longer helps against a swap.
 
 - **Q-W2** (confirmed): KeyCredential signatures are RSA-2048 PKCS #1 v1.5 with SHA-256, not PSS. The test vector is above.
 - **Q-W3** (answered: not on current builds). Whether Windows OpenSSH's FIDO support (`webauthn.dll`) can use Windows Hello itself as the authenticator, which would give the isolated profile Windows Hello through ssh-agent forwarding with no helper. Tested with OpenSSH_for_Windows 9.5p2 and WebAuthn API version 9 on Windows 11 25H2, `ssh-keygen -t ecdsa-sk`:
@@ -322,9 +323,10 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - [ ] Proto: `windows_hello_signature`; `windows-hello` challenge values
 - [ ] Settings: `windows_hello_keys`, `windows-hello` method; `UserConfig.windows_hello_helper`
 - [ ] `doctor`: helper reachability and enrollment
-- [ ] Embedding in Linux release builds (`MAIRU_WINDOWS_HELLO_HELPER`) and extraction on first use
-- [ ] Release workflow: Windows helper builds first in the same run; Linux tarballs and debs embed them
+- [ ] Shipping in Linux release archives and debs; SHA-256 pin (`MAIRU_WINDOWS_HELLO_HELPER_SHA256`, `windows_hello_helper_sha256`) checked before each run
+- [ ] Release workflow: Windows helper builds first in the same run; Linux tarballs and debs ship them
 - [x] Settle Q-W2, Q-W3 and Q-W4 on a WSL2 host
+- [ ] Settle Q-W6 on a WSL2 host
 
 ### Updates
 

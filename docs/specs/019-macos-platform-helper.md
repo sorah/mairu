@@ -2,7 +2,7 @@
 
 ## Summary
 
-This step gives macOS its platform services. The platform helper of [006](006-platform-helper.md) runs from an app bundle, `Mairu Helper.app`, which serves the `platform` presence method through LocalAuthentication (Touch ID or the login password), holds the macOS integrity stores, posts notifications and opens URLs. Official builds embed the bundle, signed with the Developer ID, and write it out at startup. Every other build assembles the bundle from its own binary and signs it ad-hoc. The agent and the helper verify each other as on Linux, plus a code-signature check of the running child.
+This step gives macOS its platform services. The platform helper of [006](006-platform-helper.md) runs from an app bundle, `Mairu Helper.app`, which serves the `platform` presence method through LocalAuthentication (Touch ID or the login password), holds the macOS integrity stores, posts notifications and opens URLs. Official release archives ship the bundle next to `mairu`, signed with the Developer ID. Every other build assembles the bundle from its own binary and signs it ad-hoc. The agent and the helper verify each other as on Linux, plus a code-signature check of the running child.
 
 Integrity on macOS has two strong stores: the protected directory created by `harden` ([018 harden on macOS](018-macos-install.md#harden-on-macos)), on every tier, and the data-protection keychain, reachable only from the Developer ID-signed helper bundle. The legacy keychain is a weak store. When every approval key is lost, `mairu policy reset-record` removes the record after an administrator authorization. A request from outside the console's audit session, such as an SSH login, raises the LocalAuthentication sheet on the Mac's screen with its origin named. `context.console_session` lets a policy forbid that.
 
@@ -90,20 +90,20 @@ When every approval key is lost, an administrator removes the record from every 
 - The state becomes `UNAPPROVED`, and the anchor falls back to `["platform"]`. A stale weak record then reads as `MISMATCHED`, so lockdown applies until the next approval.
 - Requiring an administrator here is deliberate: the administrator is already the top of the trust chain on macOS ([017](017-macos-peer-verification.md)).
 
-### Self-extracting official binaries
+### Shipped helper bundle
 
-Official binaries carry the helper bundle for their own architecture, and the agent writes it out at startup. Release tarballs, aqua, mise and ubi ([018 Distribution](018-macos-install.md#distribution)) need no knowledge of bundles. Versions installed side by side keep their bundles per version.
+Official release archives ship `Mairu Helper.app` next to `mairu`, built for the same architecture, and the agent finds it there ([002 Shipped helpers](002-build-layout.md#shipped-helpers)). Release tarballs, aqua, mise, ubi with `--extract-all` and the Homebrew cask ([018 Distribution](018-macos-install.md#distribution)) keep the two together, and versions installed side by side keep their own bundles. Builds that ship no bundle assemble one.
 
 ### Contributors on macOS
 
 - The helper bundle is assembled from the dev binary and signed ad-hoc as `co.0w0.mairu.dev.platform-helper`. Its notification permission starts out denied and is turned on once in System Settings (Q-M3). It is keyed by bundle id, so it survives rebuilds (Q-M4).
 - Integrity stores: the weak legacy keychain store works in every build. The protected directory needs `sudo mairu harden`, best in a disposable VM. The data-protection keychain needs the project's provisioning profile, so only official builds have it.
 - LocalAuthentication works with ad-hoc binaries.
-- Not possible without the program: the embedded Developer ID helper bundle with its data-protection keychain. Maintainers check it before each release.
+- Not possible without the program: the shipped Developer ID helper bundle with its data-protection keychain. Maintainers check it before each release.
 
 ## Drawbacks
 
-- **An app bundle in the user's Library.** Every build writes or assembles `Mairu Helper.app` under `~/Library/Application Support`, registers it with LaunchServices, and keeps up to five per flavour.
+- **App bundles registered from many places.** Shipped bundles are registered with LaunchServices from wherever the installer put them, and installers prune old versions without unregistering them. Builds without a shipped bundle assemble one under `~/Library/Application Support` and keep up to five per flavour.
 - **Notifications start denied** for a new bundle, and the user must turn them on once in System Settings.
 - **Only Developer ID builds get a strong store without `harden`.** Ad-hoc builds that skip `harden` never have an approved policy.
 - **The console sheet from SSH.** By default an SSH login can raise the Touch ID sheet on the Mac's screen, where someone else might approve it. A `forbid` on `context.console_session` turns that off.
@@ -119,10 +119,10 @@ Official binaries carry the helper bundle for their own architecture, and the ag
   - Both are supported, and every available store is written.
 - **The legacy keychain as a strong store.** Rejected: an item can be deleted and planted again by same-user code, under any requirement, team-based or cdhash. A MAC key kept in the keychain does not help either, because both items can be deleted and planted again.
 - **Secure Enclave `.userPresence` keys** for authorization. Rejected (tested): an unentitled binary can create one as a CryptoKit `dataRepresentation` blob, but any other binary that reads the blob can sign with it after Touch ID, under its own prompt text. A signature would prove that someone was present at this Mac, not that mairu asked. Permanent keys need an entitlement (`-34018`). The helper that reports the `LAContext` result is itself verified, so a boolean result is enough. A Secure Enclave key signing the integrity record would add nothing either, since it would sit behind the same access group.
-- **The official helper executable as a copy of mairu.** Impossible: mairu would then have to embed itself. The official helper is the `mairu-platform-helper` binary of [006 Helper binary](006-platform-helper.md#helper-binary). Other builds assemble the bundle around a clone of their own binary, which needs no embedding.
+- **The official helper executable as a copy of mairu.** Rejected: the bundle holds the keychain entitlement, so it carries only the platform code of the `mairu-platform-helper` binary ([006 Helper binary](006-platform-helper.md#helper-binary)), not the client and agent. Other builds assemble the bundle around a clone of their own binary, which carries no entitlement.
 - **"Trusted by construction" for the bundle.** Not enough on the agent's side: the bundle may sit in a user-writable directory and be swapped between any check and the exec. The agent checks the running child's code instead.
-- **Modifying an extracted bundle in place.** Rejected: since macOS Ventura, Gatekeeper checks notarized apps on every launch, and any modification makes the app show as damaged. Each version and flavour gets a fresh directory.
-- **The directory key for official bundles includes the architecture** (decided 2026-10-29, with per-architecture releases). An `x86_64` and an `aarch64` official mairu of the same version on one Mac then never share a bundle.
+- **Modifying a written bundle in place.** Rejected: since macOS Ventura, Gatekeeper checks notarized apps on every launch, and any modification makes the app show as damaged. Each version and flavour gets a fresh directory.
+- **Embedding the bundle in mairu and writing it out at startup (self-extraction).** Rejected with self-extraction as a whole ([002 Considered Alternatives](002-build-layout.md#considered-alternatives)): the archive ships the bundle next to the binary instead, which leaves the binary 2.5 MB smaller and removes the write-out for official builds. Registering a bundle from installers' directories is Q-M14.
 - **Separate bundle ids per flavour,** so LaunchServices never resolves to another flavour's copy, and System Settings rows stay apart.
 - **Click actions.** Rejected: they would need `NSApplication` in the instance LaunchServices starts on a click. Notifications carry no actions, and that instance exits at once.
 - **Routing around a notification denial with `osascript`.** Rejected: the user's choice in System Settings stands. `osascript` is only the fallback for an unusable bundle.
@@ -140,7 +140,7 @@ Official binaries carry the helper bundle for their own architecture, and the ag
 |---|---|
 | Forging the policy record | Only strong stores count on hardened tiers: the helper bundle's data-protection keychain and the protected directory through `harden`. The forgeable legacy keychain never approves on hardened builds. |
 | Deleting or forging a legacy keychain item | Weak by design: it never approves on hardened builds |
-| Swapping the extracted or assembled helper bundle | The agent checks the running child's code before use. On failure it runs the unbundled helper, which loses notifications and the data-protection keychain, so policy only tightens. |
+| Swapping the shipped or assembled helper bundle | The agent checks the running child's code before use. On failure it runs the unbundled helper, which loses notifications and the data-protection keychain, so policy only tightens. |
 | A rogue parent of the helper | The helper checks `token.pid == getppid()` and the parent's code against its own requirement before serving |
 | Lending the helper's socketpair | Both ends live only in hardened-runtime processes, whose task ports same-user code cannot obtain ([017 XPC transport](017-macos-peer-verification.md#xpc-transport)) |
 | A same-user bundle claiming the helper's bundle id | It inherits the notification permission and can post as "mairu", which carries no security weight. It never passes the running-child check. |
@@ -166,7 +166,7 @@ Official binaries carry the helper bundle for their own architecture, and the ag
 - Policies are approved by the protected directory after `harden`, and on Developer ID builds also by the data-protection keychain. The legacy keychain approves only on unhardened builds.
 - Notifications are posted from the bundle once the user allows them, and `doctor` says when they are not.
 - `mairu policy reset-record` restores a lost-key installation after an administrator authorization.
-- Official releases embed a Developer ID-signed, notarized helper bundle per architecture.
+- Official release archives ship a Developer ID-signed, notarized helper bundle per architecture, next to `mairu`.
 
 ## Implementation Plan
 
@@ -174,14 +174,14 @@ Stack layer: the macOS implementer's own layers, on top of [017](017-macos-peer-
 
 ```mermaid
 flowchart LR
-  A["mairu agent"] -- "socketpair,<br/>verified both ways" --> H["Mairu Helper.app<br/>embedded or assembled"]
+  A["mairu agent"] -- "socketpair,<br/>verified both ways" --> H["Mairu Helper.app<br/>shipped or assembled"]
   H -- "authorize" --> LA["LocalAuthentication<br/>Touch ID or password"]
   H -- "integrity" --> KC["data-protection keychain<br/>protected directory<br/>legacy keychain"]
   H -- "notify" --> UN["UNUserNotificationCenter"]
   H -- "open_url" --> OP["/usr/bin/open"]
 ```
 
-On macOS the platform helper always runs from an app bundle, `Mairu Helper.app` ([Helper bundle](#helper-bundle)). Official builds embed it, signed with the Developer ID. Other builds assemble it from their own binary and sign it ad-hoc. Everything below runs in the helper process, never in the agent ([006](006-platform-helper.md)). `MacosServices` implements `PlatformServices` inside the helper and replaces `FallbackServices` on macOS.
+On macOS the platform helper always runs from an app bundle, `Mairu Helper.app` ([Helper bundle](#helper-bundle)). Official release archives ship it next to `mairu`, signed with the Developer ID. Other builds assemble it from their own binary and sign it ad-hoc. Everything below runs in the helper process, never in the agent ([006](006-platform-helper.md)). `MacosServices` implements `PlatformServices` inside the helper and replaces `FallbackServices` on macOS.
 
 ### Helper process on macOS
 
@@ -212,22 +212,22 @@ So the helper checks `token.pid == getppid()` and `SecCodeCheckValidity` on that
 ### Helper bundle
 
 ```text
-official builds (Developer ID, embedded)
-  extract   <base>/helper-<version>-<arch>/Mairu Helper.app   byte-exact from MAIRU_HELPER_ARCHIVE
+official builds (Developer ID, shipped)
+  find      Mairu Helper.app next to the canonical mairu, or the root-owned copy of harden (002)
   check     SecStaticCodeCheckValidity: own team, identifier, CFBundleShortVersionString == own version
-other builds (ad-hoc, or Developer ID without an embedded bundle)
+other builds (ad-hoc, or Developer ID without a shipped bundle)
   assemble  <base>/helper-<version>-<own cdhash, 12 hex>/Mairu Helper.app
             Contents/Info.plist (MairuAgentCDHash = own cdhash)
             Contents/Resources/mairu.icns (embedded bytes)
             Contents/MacOS/mairu = clonefile(own binary)
   sign      /usr/bin/codesign --force --sign - --options runtime --identifier <flavour id>
+  write     a temporary sibling directory, checked, renamed into place; never modified in place
+  cleanup   unused for 30 days → lsregister -u, remove; at most 5 per flavour; never the running one
 both
-  write a temporary sibling directory, check it, rename it into place; never modify a bundle in place
-  strip com.apple.quarantine from what mairu wrote
+  strip com.apple.quarantine from what mairu wrote (assembled bundles)
   register  lsregister -f <bundle>, as the user, before the first exec of that path
   spawn     <exe> --fd <n> (official) · mairu platform-helper --fd <n> (assembled)   direct exec
   verify    the running child (above)
-  cleanup   unused for 30 days → lsregister -u, remove; at most 5 per flavour; never the running one
 each notification
   UNUserNotificationCenter add, from the helper; no NSApplication, no delegate, no actions
 started without --fd (a click relaunch by LaunchServices)
@@ -236,12 +236,19 @@ fallback (bundle unusable)
   the unbundled helper: osascript display notification, else delivered = false
 ```
 
-`<base>` is `~/Library/Application Support/mairu`, or `~/Library/Application Support/mairu-dev` for the dev profile ([004 Dev profile](004-peer-verification.md#dev-profile)). `<arch>` is the target architecture of the binary, `aarch64` or `x86_64`.
+`<base>` is `~/Library/Application Support/mairu`, or `~/Library/Application Support/mairu-dev` for the dev profile ([004 Dev profile](004-peer-verification.md#dev-profile)).
 
+- **Q-M14 (open): shipped bundle locations.** To confirm on a Mac, with an official build:
+  1. A bundle registered with `lsregister -f` from a mise or aqua install directory, the Homebrew Caskroom, and ubi's `--in` directory posts notifications and passes the running-child check. Only `~/Library/Application Support` is confirmed so far, and temporary directories are rejected.
+  2. ubi `--extract-all` can upgrade a notarized bundle in place, or App Management blocks the write.
+  3. LaunchServices copes with registrations left behind when installers prune old versions.
+
+  If 1 fails, the agent copies the shipped bundle into `<base>/helper-<version>-<cdhash>/`, with the write rules above, and registers that copy.
 - **One bundle (Q-M13, confirmed 2026-10-24).** `UNUserNotificationCenter` needs the main executable of a signed bundle that LaunchServices has registered. It does not need a LaunchServices launch. The helper is therefore one bundle that posts notifications itself, on every build, and on Developer ID builds it also holds the keychain entitlement ([Integrity store backends](#integrity-store-backends)).
-- **Official builds** embed the bundle that the release pipeline built from the `mairu-platform-helper` binary ([006 Helper binary](006-platform-helper.md#helper-binary)), with the macOS backends (objc2, UserNotifications, LocalAuthentication), then signed with the Developer ID, notarized and stapled ([Release pipeline additions](#release-pipeline-additions)).
-  - The executable cannot be a copy of mairu, which would then have to embed itself. A single `mairu` binary remains the only artifact.
-  - `MAIRU_HELPER_ARCHIVE` is a `tar` of the signed, stapled bundle that keeps modes and symlinks. It is embedded with `include_bytes!`, so mairu's own signature covers it. Each architecture's mairu embeds the bundle built for that architecture only.
+- **Official builds** ship the bundle that the release pipeline built from the `mairu-platform-helper` binary ([006 Helper binary](006-platform-helper.md#helper-binary)), with the macOS backends (objc2, UserNotifications, LocalAuthentication), then signed with the Developer ID, notarized and stapled ([Release pipeline additions](#release-pipeline-additions)).
+  - The bundle carries only platform code, since it holds the keychain entitlement.
+  - The release tarball keeps the bundle's modes and symlinks. Each architecture's archive carries the bundle built for that architecture only.
+  - The agent uses the bundle beside its own canonical path, or the root-owned copy that `harden` placed beside the hardened binary. It registers that path with `lsregister -f` before the first exec (Q-M14).
 - **Other builds** assemble the bundle from their own binary, which runs as `mairu platform-helper`, and sign it ad-hoc.
   - `MairuAgentCDHash` in the signed `Info.plist` lets the helper verify its parent.
   - Ad-hoc signing is deterministic (confirmed), so the same input always gives the same cdhash.
@@ -255,13 +262,13 @@ fallback (bundle unusable)
 
   Separate identifiers keep LaunchServices from resolving to another flavour's copy, and keep their rows in System Settings apart.
 - **Who writes it.**
-  - The agent extracts or assembles the bundle at startup, before spawning the helper.
-  - `harden` writes its root-owned copy directly into `<harden_home>/libexec/mairu/` (`/opt/mairu/libexec/mairu/` by default), from its own archive or by assembling and signing it as root, with no user-writable intermediate ([harden additions](#harden-additions)). The agent prefers that copy and registers it as the user.
+  - The agent finds or assembles the bundle at startup, before spawning the helper.
+  - `harden` writes its root-owned copy directly into `<harden_home>/libexec/mairu/` (`/opt/mairu/libexec/mairu/` by default), copied from the bundle next to itself or assembled and signed as root, with no user-writable intermediate ([harden additions](#harden-additions)). The agent prefers that copy and registers it as the user.
   - Concurrent agents or `harden` runs each write their own temporary directory. If the target appeared meanwhile, the later writer discards its copy and checks the existing one.
-- **Extraction rules:**
+- **Rules for written bundles:**
   - **Byte-exact, never in place.** Since macOS Ventura, Gatekeeper checks notarized apps on every launch, and any modification makes the app show as damaged. App Management may also block a process signed by another team from modifying a notarized bundle. Each version and flavour therefore gets a fresh directory.
   - **Quarantine.** Unsandboxed tools don't quarantine the files they create by default. A process that inherited quarantine, for example one started from a terminal inside a quarantined GUI app, may get every file it writes quarantined. mairu therefore removes `com.apple.quarantine` from the bundle it wrote. Files written by a quarantined, user-approved CLI, and by its child, carried no quarantine (confirmed).
-  - **Location.** Bundles under temporary directories are rejected ("Failed to find or validate client"), and a bundle under `~/Library/Application Support` registers (confirmed). An unsigned arm64 bundle does not launch at all.
+  - **Location.** Bundles under temporary directories are rejected ("Failed to find or validate client"), and a bundle under `~/Library/Application Support` registers (confirmed). An unsigned arm64 bundle does not launch at all. Shipped bundles in installers' directories are Q-M14.
   - **Registration.** A directly exec'd bundle executable gets "Notifications are not allowed" until the bundle is registered with `lsregister -f`. lsd's own automatic registration is not enough (confirmed). `open` registers as a side effect, which is why the earlier tests did not see this.
 - **Notifications.**
   - The helper posts with `UNUserNotificationCenter`. Posting needs neither `NSApplication` nor a run loop, since completion handlers run on a background queue (confirmed).
@@ -397,17 +404,16 @@ flowchart TB
   WF --> T
   subgraph T["per macOS target"]
     direction LR
-    HB["helper bundle<br/>build, sign, notarize,<br/>staple, tar"] --> MB["mairu<br/>embeds the tar"]
-    MB --> MS["sign, notarize"]
-    MS --> UP["upload"]
+    HB["helper bundle<br/>build, sign,<br/>notarize, staple"] --> MB["mairu<br/>build, sign, notarize"]
+    MB --> AR["one tarball<br/>with both"]
+    AR --> UP["upload"]
   end
 ```
 
-- Per target, the helper bundle comes first: `cargo build --release --target <target> --bin mairu-platform-helper --no-default-features --features platform-helper`, assembled into `Mairu Helper.app` with `embedded.provisionprofile`, signed with `codesign` (Developer ID, hardened runtime, `keychain-access-groups`), notarized with `notarytool`, stapled, and archived with `tar`.
-- Then `mairu` for the same target is built with `MAIRU_HELPER_ARCHIVE` set to that archive, signed (Developer ID, hardened runtime, timestamp, identifier `co.0w0.mairu`), notarized as a zip, and uploaded as `mairu-<target>.tar.gz`.
+- Per target, the helper bundle comes first: `cargo build --release --target <target> --bin mairu-platform-helper --no-default-features --features platform-helper`, assembled into `Mairu Helper.app` with `embedded.provisionprofile`, signed with `codesign` (Developer ID, hardened runtime, `keychain-access-groups`), notarized with `notarytool`, and stapled.
+- `mairu` for the same target is built, signed (Developer ID, hardened runtime, timestamp, identifier `co.0w0.mairu`) and notarized as a zip. Both go into one `mairu-<target>.tar.gz`, the bundle next to the binary.
 - The helper bundle's provisioning profile is a Developer ID profile for the explicit App ID `co.0w0.mairu.platform-helper`, with the keychain access group `<TEAMID>.co.0w0.mairu`. It is created once in the developer account and kept in the `release` environment with the certificate. It is not secret, but it is bound to the team. One profile serves both architectures.
-- `build.rs` embeds `MAIRU_HELPER_ARCHIVE` with `include_bytes!` when the variable is set, and builds without an embedded bundle otherwise (every non-official build).
-- The maintainer check before publishing ([018](018-macos-install.md)) adds: the embedded helper bundle posts notifications, and `doctor` reports the data-protection keychain.
+- The maintainer check before publishing ([018](018-macos-install.md)) adds: the shipped helper bundle posts notifications, and `doctor` reports the data-protection keychain.
 
 ### harden additions
 
@@ -418,14 +424,14 @@ flowchart TB
                                               executable root:mairu 2755
 ```
 
-- Official builds extract it from their archive. Other builds assemble and sign it as root, with `MairuAgentCDHash` set to the hardened copy's cdhash.
+- Official builds copy the bundle found next to the running `harden`. Other builds assemble and sign it as root, with `MairuAgentCDHash` set to the hardened copy's cdhash.
 - Everything `harden` writes is root-owned. The agent only registers the bundle with LaunchServices, as the user.
 
 ### Tests and CI
 
 - The macOS CI job of [017](017-macos-peer-verification.md) also assembles the ad-hoc helper bundle, spawns it from a `script/macos-dev-sign`ed agent, and checks verification in both directions and the fallback to the unbundled helper when the bundle is altered.
 - Unit tests: bundle assembly (Info.plist contents, directory names, byte-identity check of another process's bundle), cleanup selection, `LAError` mapping, the store tier table.
-- With the first official build: notifications from the Developer ID helper bundle (Q-M3), Q-M12 parts 1–3.
+- With the first official build: notifications from the Developer ID helper bundle (Q-M3), Q-M12 parts 1–3, and Q-M14.
 
 ### Files
 
@@ -433,16 +439,15 @@ flowchart TB
 - `src/platform/services/macos/local_authentication.rs`
 - `src/platform/services/macos/integrity.rs`: data-protection keychain, legacy keychain, protected directory, `ResetIntegrity`
 - `src/platform/services/macos/notify.rs`, `open_url.rs`
-- `src/platform/helper_bundle.rs`: extraction, assembly, signing, registration, cleanup; the running-child check in `HelperClient`
+- `src/platform/helper_bundle.rs`: lookup, assembly, signing, registration, cleanup; the running-child check in `HelperClient`
 - `src/cmd/platform_helper.rs`: parent verification by audit token on macOS; exit at once without `--fd`
 - `src/cmd/policy.rs`: `reset-record`
 - `src/agent.rs`: `ResetPolicyRecord`; `console_session` from the peer's audit session
 - `proto/mairu.proto`: `ResetPolicyRecord`
 - `src/policy/mairu.cedarschema`: `console_session?`
 - `src/cmd/harden.rs`: the helper bundle in `<harden_home>/libexec/mairu/`
-- `build.rs`: `MAIRU_HELPER_ARCHIVE`
 - `pkg/macos/mairu.icns`
-- `.github/workflows/release.yml`: helper bundle per architecture, provisioning profile, embedding
+- `.github/workflows/release.yml`: helper bundle per architecture, provisioning profile, one tarball with the binary and the bundle
 - `.claude/skills/releng/SKILL.md`: helper bundle items in the maintainer check
 
 ### Findings and open questions
@@ -452,12 +457,12 @@ Q-M1  socketpair peer info (confirmed)   Q-M2  GUI session (addressed)         Q
 Q-M4  permission kept on upgrade         Q-M5  bundle name, icon (settled)     Q-M6  ad-hoc store (decided)
 Q-M7  Homebrew (decided)                 Q-M8  LOCAL_PEERTOKEN (confirmed)     Q-M9  setgid non-member (confirmed)
 Q-M10 transport (XPC, decided)           Q-M11 SSH (no-console: deferred)      Q-M12 helper bundle (deferred)
-Q-M13 one helper bundle (confirmed)
+Q-M13 one helper bundle (confirmed)      Q-M14 shipped bundle locations (open)
 ```
 
 - Q-M8, Q-M10, Q-M11: [017](017-macos-peer-verification.md)
 - Q-M7, Q-M9: [018](018-macos-install.md)
-- Q-M1, Q-M2 (prompts), Q-M3 to Q-M6, Q-M12, Q-M13: this spec
+- Q-M1, Q-M2 (prompts), Q-M3 to Q-M6, Q-M12 to Q-M14: this spec
 
 ## Current Status
 
@@ -469,13 +474,13 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - [ ] LocalAuthentication backend
 - [ ] Integrity stores: legacy keychain (weak), protected directory after `harden` (strong)
 - [ ] Helper on macOS: always the bundle (unbundled only as the fallback), spawned by the LaunchAgent-run agent and verified as a running child both ways
-- [ ] Helper bundle: embedded (official) or assembled (`MairuAgentCDHash`), registration, notifications, click-relaunch exit, per-flavour names, icon `pkg/macos/mairu.icns`, cleanup
+- [ ] Helper bundle: shipped (official) or assembled (`MairuAgentCDHash`), registration, notifications, click-relaunch exit, per-flavour names, icon `pkg/macos/mairu.icns`, cleanup
 - [ ] Helper bundle `mairu-platform-helper` with the data-protection keychain store, and `ResetIntegrity` with an administrator authorization
 - [ ] `ResetPolicyRecord` and `mairu policy reset-record`
 - [ ] `context.console_session` and the origin in the reason text; confirm the session attributes for SSH logins
-- [ ] Release pipeline: helper bundle per architecture with its provisioning profile, embedded through `MAIRU_HELPER_ARCHIVE`
+- [ ] Release pipeline: helper bundle per architecture with its provisioning profile, shipped next to `mairu` in the release tarball
 - [ ] `harden` writes the helper bundle
-- [ ] With the first official build: notifications from the Developer ID helper bundle (Q-M3), Q-M12 parts 1–3
+- [ ] With the first official build: notifications from the Developer ID helper bundle (Q-M3), Q-M12 parts 1–3, Q-M14
 - [x] Q-M1 confirmed, Q-M2 addressed, Q-M3 confirmed for ad-hoc builds, Q-M4 confirmed, Q-M5 settled, Q-M6 decided, Q-M13 confirmed
 - [ ] Q-M12 (deferred until the Developer ID is issued)
 

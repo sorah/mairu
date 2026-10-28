@@ -4,11 +4,11 @@
 
 Before new code lands, this step settles how mairu is built, so that later steps add code without moving it. Release builds use link-time optimization, a single codegen unit and full symbol stripping. Within the one `mairu` package, the heavy dependencies and the client and agent modules move behind a default `cli` feature. That lets 006 build a small second binary, the platform helper, from the same crate, with the compiler keeping client code out of it.
 
-CI reports the size of the release binaries, so growth is noticed when it happens. macOS releases become one binary per architecture, x86_64 and arm64, and the universal binary is dropped. mairu stays a single crate on crates.io, and every release still ships all artifacts from one tag in one workflow run.
+It also defines how release archives ship helpers next to the binary, and how mairu finds them. CI reports the size of the release binaries, so growth is noticed when it happens. macOS releases become one binary per architecture, x86_64 and arm64, and the universal binary is dropped. mairu stays a single crate on crates.io, and every release still ships all artifacts from one tag in one workflow run.
 
 ## Motivation
 
-Release builds will be self-extracting. Official macOS builds embed a signed helper app bundle and write it out at startup (019). Linux builds embed, in part, the Windows Hello helper for WSL2 and write it out to the Windows side on first use (016). Whatever an embedded helper links is carried in every download and every installed copy, so its size has to be controlled before it exists.
+Release archives will carry helpers next to the binary: a signed helper app bundle in official macOS archives (019), and the Windows Hello helper for WSL2 in Linux archives (016). Whatever a helper links is carried in every download and every installed copy, so its size has to be controlled before it exists.
 
 Measured on Linux x86_64, release builds, on 2026-10-29 (mairu 0.12.0, rustc 1.96.0):
 
@@ -27,7 +27,7 @@ Three things follow:
 
 - **The release profile is the biggest lever.** LTO and stripping cut mairu by about 40% with no change in behavior. Release builds take about twice as long (88 s to 176 s in this measurement).
 - **The helper must not link client and agent code.** A helper built from the same package with every dependency would carry the AWS SDK, the HTTP client and the OAuth code, and only dead-code elimination would keep them out. That breaks easily: `crate::Error` has variants wrapping `oauth2`, `reqwest` and AWS SDK errors, so any helper code returning it pulls in their formatting code. Gating that code behind a feature makes the compiler enforce the split.
-- **A universal binary multiplies the helper.** Each architecture slice of a universal mairu would embed a helper bundle, and Apple is phasing out Intel Macs. Per-architecture binaries embed one helper each.
+- **A universal binary doubles everything.** A universal archive would carry both architectures of mairu and of the helper bundle, while Apple is phasing out Intel Macs. Per-architecture archives carry one of each.
 
 The authorization work adds the Cedar engine (007), up to about 6 MB on top of the 18 MB. It is the policy engine, so it cannot be optional. The size reports keep that and later growth visible.
 
@@ -85,6 +85,37 @@ mairu_<version>-1_{amd64,arm64}.deb         unchanged
 
 Everything is still built and uploaded by one workflow run from one `v<version>` tag, and the crate is published last, as today.
 
+### Shipped helpers
+
+Two helpers live outside the `mairu` binary: the macOS helper bundle (019) and, for WSL2, the Windows Hello helper (016). Release archives ship them as files next to `mairu`, and mairu finds them relative to its own canonical path. Nothing is embedded in the binary, and release builds write nothing out at run time.
+
+```text
+mairu-<target>.tar.gz
+├── mairu
+├── Mairu Helper.app/            macOS targets (019)
+└── mairu-windows-hello.exe      Linux targets, for the matching Windows architecture (016)
+```
+
+Lookup, for a helper file named `F`:
+
+1. `<dir>/F`, where `<dir>` is the directory of `canonicalize(current_exe())`. On macOS `current_exe()` returns the path mairu was started through, which may be a symlink from Homebrew's `bin` or another directory on `PATH`, so it is canonicalized first.
+2. `<dir>/../lib/mairu/F`, where distribution packages install helpers.
+3. Otherwise the helper is missing, and the fallback of its spec applies.
+
+| Installed by | Helpers next to `mairu` |
+|---|---|
+| mise (github and aqua backends), aqua | yes, in a directory per version |
+| ubi with `--extract-all` | yes, in its single `--in` directory. Files are overwritten in place on upgrade, so stop the agent with `mairu kill-agent` first. |
+| ubi without `--extract-all` | no, only the binary |
+| Homebrew cask with `binary "mairu"` | yes, in the Caskroom directory of the version. The `app` stanza is not used, because it moves a bundle to `/Applications`. |
+| deb, AUR `mairu-bin` | in `/usr/lib/mairu/` |
+| `mairu harden` | copies the helpers found next to itself next to the hardened copy (005) |
+| `cargo install`, AUR `mairu`, Homebrew `mairu-src`, other builds from source | none; the fallbacks apply |
+
+- **Fallbacks.** A macOS build without a shipped bundle assembles one around its own binary, under `~/Library/Application Support/mairu` (019). On WSL2, the helper path comes from `config.json`, pointing at the release's `mairu-windows-hello-<target>.zip` (016).
+- **Checked before use.** An installer's directory is often writable by the user's processes, so a helper may be swapped at any time. Each helper's consumer checks it right before use, by the code signature of the running child or by a pinned SHA-256, and relies on nothing beyond what that check proves.
+- **One version per directory.** A helper is used only from beside the binary that found it, so versions installed side by side never mix.
+
 ### Size reports
 
 Every pull request reports the release-profile size of `mairu` per target in the CI job summary. From 006 on, the report also covers `mairu-platform-helper`. A generous ceiling per binary fails the job when it is exceeded. The pull request that adds a large dependency raises the ceiling on purpose, so the growth is visible in review.
@@ -113,6 +144,11 @@ The figures above are illustrative.
 - **Feature flags that switch off security features** (the Cedar engine, gate 2, presence methods) for smaller builds. Rejected: official builds need every feature, so the official binary would not shrink, and builds where a hardened agent lacks its checks would become possible.
 - **`panic = "abort"`.** Smaller and faster, but one panicking task would end the agent.
 - **`opt-level = "s"` or `"z"`.** Not measured. LTO and stripping already give about 40%; the size reports can show whether more is worth it.
+- **Self-extraction:** embedding the helpers in the binary and writing them out at run time. Rejected (decided 2026-10-29) in favor of shipping them next to the binary:
+  - It adds every helper to every binary (about 2.5 MB for the macOS helper), a build-order dependency in the release workflow, and write-out code with its own atomicity and cleanup rules.
+  - mise, aqua, ubi with `--extract-all`, Homebrew casks and distribution packages all keep files next to the binary. Builds from source would embed nothing anyway, so they need the fallbacks either way.
+  - Only ubi's default mode drops sibling files; ubi users install with `--extract-all`.
+  - Tools that ship an app bundle in their tarball (tart, Teleport, terminal-notifier) are prior art for archives carrying bundles.
 - **Keeping the universal macOS binary.** It would carry both architectures and, from 019, a helper bundle per architecture slice, while Intel Macs are being phased out.
 
 ## Prior Art
@@ -136,6 +172,7 @@ Tools:
 - Cargo 1.90 stabilized `cargo publish --workspace`. It publishes in dependency order and verifies the whole set before uploading, but the [release notes](https://blog.rust-lang.org/2025/09/18/Rust-1.90.0/) warn that a failure can still leave a partly published workspace.
 - dist groups packages of one version under one `vX.Y.Z` tag and one GitHub release ([concepts](https://axodotdev.github.io/cargo-dist/book/reference/concepts.html)).
 - release-plz needs tags turned off for all crates but one, or the second crate's tag collides after the first crate is already live ([write-up](https://blog-570662.gitlab.io/three-traps-release-plz-workspace/)).
+- Installers and multi-file archives, for shipping helpers next to the binary: ubi's [installer](https://github.com/houseabsolute/ubi/blob/88c2ce36af284e675921dc00f9aafcbd49129883/ubi/src/installer.rs#L157) and [`--extract-all`](https://github.com/houseabsolute/ubi/blob/88c2ce36af284e675921dc00f9aafcbd49129883/README.md#L91-L97), mise's [github backend](https://github.com/jdx/mise/blob/e0f96486baa98ae4a5fdab71cecca432af9fff82/src/backend/github.rs#L2184-L2257), aqua's [unarchiver](https://github.com/aquaproj/aqua/blob/b65c14634ef70a848471a1e5dd1e43613138578e/pkg/unarchive/archives.go#L61-L170), cargo-binstall's [bin handling](https://github.com/cargo-bins/cargo-binstall/blob/81df5c23b0dc775b009efdfc9895c5965b7a4e40/crates/binstalk-bins/src/lib.rs#L263-L273), and [tart](https://github.com/openai/tart/blob/c8bfa928b7dd462a73d1ff090efa4a39032c18d7/.goreleaser.yml#L36-L48) shipping `tart.app` in its tarball.
 - On crates.io, a new crate's first version must be published with an API token before trusted publishing can be configured for it ([crates.io development update](https://blog.rust-lang.org/2025/07/11/crates-io-development-update-2025-07)).
 
 ## Security and Privacy Considerations
@@ -147,8 +184,8 @@ Tools:
 
 ### Out of scope
 
-- The helper binary itself and the `platform-helper` feature (006), and embedding it in macOS builds (019)
-- The Windows Hello helper and embedding it in Linux builds (016)
+- The helper binary itself and the `platform-helper` feature (006)
+- The helpers themselves: the macOS helper bundle (019) and the Windows Hello helper (016). This step defines how release archives ship them and how mairu finds them.
 - `opt-level` tuning
 - Updates in other repositories that select release assets by name: the Homebrew tap, the aqua registry, and installers such as ubi or mise. They are follow-ups once the first per-architecture release is out.
 
@@ -159,6 +196,7 @@ Tools:
 - Every pull request shows the release binary sizes; a binary over its ceiling fails CI.
 - Releases publish `x86_64-apple-darwin` and `aarch64-apple-darwin` binaries and no universal binary, from one tag in one workflow run, with one crate on crates.io.
 - Existing build commands, including packagers' `--no-default-features --features rustls`, still produce the full CLI.
+- `crate::helpers::locate` finds helpers next to the canonical executable or in `../lib/mairu/`, with its tests passing.
 
 ## Implementation Plan
 
@@ -178,6 +216,11 @@ Stack layer: `hardening/build-layout`.
 - Core modules stay unconditional: `error`, `os`, `ppid`, `proto`.
 - Every other module gets `#[cfg(feature = "cli")]`.
 - In `src/error.rs`, the `Error` variants that wrap `cli`-only types (`oauth2`, `reqwest`, the AWS SDK) get `#[cfg(feature = "cli")]`, so core code can keep using `crate::Error`.
+
+**Shipped helpers** (`src/helpers.rs`)
+
+- `crate::helpers::locate(file_name) -> Option<PathBuf>` implements the lookup above. It never falls back to `PATH`.
+- Unit tests: a symlinked executable (the lookup follows the canonical path), the package layout, a missing helper.
 
 **CI** (`.github/workflows/_test.yml`)
 
@@ -211,6 +254,7 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - [ ] Release profile: LTO, one codegen unit, strip
 - [ ] `cli` feature: optional dependencies, gated modules and `Error` variants, `required-features` on `mairu`
 - [ ] CI: core library check without default features
+- [ ] Shipped helpers: `crate::helpers::locate` with its tests
 - [ ] CI: size reports with ceilings
 - [ ] Release: `x86_64-apple-darwin` and `aarch64-apple-darwin`, no universal binary
 - [ ] README, CHANGELOG and the releng skill updated

@@ -96,7 +96,7 @@ The helper is the only process that writes integrity records and answers authori
 ### Out of scope
 
 - Any concrete backend: authorization facilities, integrity stores, notifications and opening URLs, and the WSL2 variants. They arrive in later steps ([001 Roadmap](001-security-model.md#roadmap)); until then the helper serves `FallbackServices`.
-- The macOS helper bundle, its code-signature checks between agent and helper, and embedding `mairu-platform-helper` in official builds (macOS implementer's own layers).
+- The macOS helper bundle, its code-signature checks between agent and helper, and shipping `mairu-platform-helper` in official builds (macOS implementer's own layers).
 
 ### Expected Outcomes
 
@@ -423,7 +423,7 @@ required-features = ["platform-helper"]
 - `mairu-platform-helper --fd <n>` serves exactly the same helper. Its `main` parses its two arguments by hand, so it needs no clap, and calls the same entry point as the subcommand.
 - It is built with `cargo build --release --no-default-features --features platform-helper --bin mairu-platform-helper`. With `cli` off, the client and agent modules are not compiled, so the build fails if platform code touches them. That is the compile-time guarantee a separate crate would give.
 - `cargo install mairu` builds only `mairu`: default features do not include `platform-helper`.
-- Official macOS builds embed this binary. The Linux helper stays `mairu platform-helper`.
+- Official macOS builds ship this binary inside their helper bundle. The Linux helper stays `mairu platform-helper`.
 - CI builds `mairu-platform-helper` on Linux and macOS for every pull request, and its size joins the reports of [002 Size reports](002-build-layout.md#size-reports).
 
 ### Tests

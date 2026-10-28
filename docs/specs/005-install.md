@@ -70,6 +70,7 @@ Linux only (BSD later). It must run as root (`euid == 0`); otherwise it exits wi
    3. `fchown(0, mairu)`, `fchmod(0o2755)`, `fsync`.
    4. `rename` to `mairu`, then `fsync` the directory.
    5. If `/usr/sbin/setcap` or `/usr/bin/setcap` exists, run `setcap cap_ipc_lock=+ep` on the final path. This must come after the `chown`, because `chown` clears file capabilities. It is needed so the agent's `mlockall` succeeds without RLIMIT_MEMLOCK headroom.
+   6. Copy every helper found next to its own executable ([002 Shipped helpers](002-build-layout.md#shipped-helpers)) into the same directory, owned by root and not group- or other-writable, with the same temporary-file and rename steps. Each copy is checked as its consumer checks it before the rename, and a helper that fails is skipped with a warning.
 4. **State directory.** Create `/var/lib/mairu` and `/var/lib/mairu/users` as `root:mairu 2770`.
 5. **Manifest.** Record every file written in `.harden-manifest`.
 6. **Next steps.** Print them: the next hardened `mairu` invocation replaces the running unhardened agent automatically ([004 Replacing an unverified agent](004-peer-verification.md#replacing-an-unverified-agent)), or the user can run `mairu kill-agent`.

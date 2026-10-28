@@ -69,18 +69,19 @@ diagnose    mairu doctor
 
 ```text
 GitHub release tarball · aqua · mise · ubi   official: mairu-<arch>-apple-darwin.tar.gz, installed unchanged
-Homebrew cask "mairu"                        official: binary symlinked from Caskroom, never re-signed
+Homebrew cask "mairu"                        official: binary symlinked from the Caskroom, bundle beside it, never re-signed
 Homebrew formula "mairu-src"                 ad-hoc (built from source)
 cargo install                                ad-hoc
 ```
 
-- **Release tarballs** are per architecture: `mairu-aarch64-apple-darwin.tar.gz` and `mairu-x86_64-apple-darwin.tar.gz`. No universal binary is published ([002](002-build-layout.md)).
-- **aqua, mise and ubi** install the official release tarball unchanged.
+- **Release tarballs** are per architecture: `mairu-aarch64-apple-darwin.tar.gz` and `mairu-x86_64-apple-darwin.tar.gz`. No universal binary is published ([002](002-build-layout.md)). Official tarballs carry the helper bundle next to `mairu` ([002 Shipped helpers](002-build-layout.md#shipped-helpers)).
+- **aqua, mise and ubi** install the official release tarball unchanged. ubi needs `--extract-all`, or it installs the binary alone and the bundle is assembled ad-hoc instead.
   - They download with their own HTTP clients, which do not set quarantine.
-  - They keep each version in its own directory, and versions can run side by side. The team-based requirement does not depend on paths ([017 Build tiers](017-macos-peer-verification.md#build-tiers)).
+  - aqua and mise keep each version in its own directory, and versions can run side by side. The team-based requirement does not depend on paths ([017 Build tiers](017-macos-peer-verification.md#build-tiers)).
+  - Standalone ubi installs into one directory and overwrites the binary in place, writing into the same inode. Apple warns that modifying a signed binary in place can crash processes running it, so the README tells ubi users to run `mairu kill-agent` before upgrading.
   - The aarch64 asset name is unchanged. Intel Macs switch from the universal asset to `x86_64-apple-darwin`, so the aqua registry entry and any mise or ubi asset matching that picked the universal asset need updating.
 - **Homebrew cask `mairu`** in `sorah/homebrew-sorah`:
-  - `binary "mairu"`, pointing at the notarized release tarball, with a URL and checksum per architecture (`on_arm`, `on_intel`), and Linux URLs too.
+  - `binary "mairu"`, pointing at the notarized release tarball, with no `app` stanza, so the helper bundle stays next to the binary in the Caskroom, with a URL and checksum per architecture (`on_arm`, `on_intel`), and Linux URLs too.
   - Nothing strips quarantine.
   - Users of the old formula are migrated with `tap_migrations.json`.
   - `postflight` refreshes an existing hardened copy, and prints the command instead of failing when `sudo` fails.
