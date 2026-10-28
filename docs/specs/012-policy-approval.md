@@ -201,6 +201,7 @@ after 24 h    the pending anchor becomes the anchor in force at the next verific
 - The first registration of keys waits too. Until then the anchor in force, `["platform"]` before any approval, keeps approving, as it did before.
 - The delay is fixed. It cannot be shortened by the policy being approved, which is exactly what it guards against. Root bypasses it through recovery ([Recovery](#recovery)).
 - The confirmation code is a guardrail: a process with its own pseudo-terminal can type a code too. What bounds a stolen approval is the second check and the delay.
+- **Q-A1 (open): how the confirmation binds the gesture to the terminal.** A code typed back from the terminal binds nothing that same-user code cannot reproduce. Under exploration: number matching, with the code shown only in the platform prompt and typed in the terminal, wherever the prompt is a channel same-user code cannot read (the macOS sheet, a polkit dialog under Wayland), and what headless sessions and key-based methods can do instead. The typed code above stands until this is settled.
 
 **What the user sees:**
 
@@ -476,6 +477,7 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - [ ] `APPROVED` and `TAMPERED` effective policies; lockdown built-ins; warnings in every client
 - [ ] Per-server digests: server states, the stricter-state rule, digests of the configs captured at login, `ServerIntegrity` in `GetPolicy`
 - [ ] `ApprovePolicy` and `mairu policy approve`; `approval_methods`; confirmation code
+- [ ] Settle Q-A1, the confirmation design
 - [ ] Anchor changes: second check, pending anchor with a 24-hour delay, `CancelAnchorChange` and `mairu policy cancel-anchor-change`, warnings
 - [ ] `CHANGED` servers refused, with the server URL in prompts
 - [ ] `PingAgentResponse.policy_integrity`
