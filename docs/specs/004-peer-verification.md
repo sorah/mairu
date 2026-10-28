@@ -491,6 +491,7 @@ Spec drafted; awaiting review before implementation. Implementors MUST keep this
 - [ ] Dev profile (socket path, state directory, `MAIRU_PROFILE`, ignored when hardened)
 - [ ] Hardened agent environment: allowlist, explicit AWS client configuration, no proxy, system TLS roots
 - [ ] Minimum client and agent versions
+- [ ] Agent connections opened `O_CLOEXEC` and closed before `mairu exec` runs the command
 
 ### Updates
 

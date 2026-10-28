@@ -30,7 +30,7 @@ anchor        setgid marker group                team + identifier co.0w0.mairu 
 transport     Unix socket                        XPC Mach service of a per-user LaunchAgent (both tiers)
 peer id       SO_PEERCRED + pidfd                audit token of each XPC message + pid version (both tiers)
 anti-tamper   AT_SECURE, non-dumpable            hardened runtime, PT_DENY_ATTACH (both tiers)
-downgrade     old copies unreachable             signed minimum versions                   cdhash differs per version
+downgrade     minimum versions (004)             signed minimum versions                   cdhash differs per version
 top of chain  root                               administrator (sudo, /etc/authorization)
 ```
 
@@ -178,7 +178,7 @@ release   minimum-client-version   minimum-agent-version
   This is a step of the `releng` skill.
 - **Not every release.** Versions newer than the last raise keep working side by side, such as per-directory mise versions. A minimum client version raised in every release would lock out any older install as soon as a newer agent runs. A minimum agent version raised in every release would make alternating versions replace each other's agents, dropping sessions each time.
 - An old client knows only its own release's values, so it accepts any agent at or above them. The protection covers clients from the fixing release on.
-- Linux needs neither: every installation re-execs the single hardened copy ([005 Re-exec](005-install.md#re-exec)), and old copies are unreachable. Ad-hoc macOS builds don't need them either, because their cdhash identity already differs per version.
+- On Linux the same two versions are compiled in and exchanged between verified peers ([004 Minimum versions](004-peer-verification.md#minimum-versions)), since an older hardened copy left on the host is still genuine there. Ad-hoc macOS builds don't need them, because their cdhash identity already differs per version.
 
 ### Top of the trust chain
 

@@ -201,7 +201,7 @@ Helpers in `crate::hardening`:
 
 Process-specific rules:
 
-- **Executor** (`mairu exec` parent): drops permanently before `exec`'ing the user's command. Without this, the command (attacker-influenced) would inherit `egid == mairu` and pass the agent's check.
+- **Executor** (`mairu exec` parent): drops permanently before `exec`'ing the user's command. Without this, the command (attacker-influenced) would inherit `egid == mairu` and pass the agent's check. It also closes every agent connection first, and opens them all with `O_CLOEXEC`: `SO_PEERCRED` is recorded at `connect()`, so an inherited connected socket would make the command a verified client.
 - **Sidecar** (`mairu exec` child): keeps the saved marker for reconnects, and holds the effective marker only inside `with_privileged_gid`.
 - **Agent**: holds the effective marker only for `listen()`.
 - **Every other client**: holds it only for `connect()`.
