@@ -383,7 +383,7 @@ message ResetPolicyRecordResponse {
 }
 ```
 
-1. `mairu policy reset-record` sends `ResetPolicyRecord`. It needs only a trusted peer; the administrator authorization is the check. The next approval then follows [012 Approval](012-policy-approval.md#approval), with its confirmation code; registering keys again is an anchor change and waits ([012 Anchor changes](012-policy-approval.md#anchor-changes)).
+1. `mairu policy reset-record` sends `ResetPolicyRecord`. It needs only a trusted peer; the administrator authorization is the check. The next approval then follows [012 Approval](012-policy-approval.md#approval).
 2. The agent calls `ResetIntegrity{name: "policy", uid}` on the helper.
 3. The helper calls `AuthorizationCopyRights` for `system.privilege.admin` with interaction allowed. `-60007` (`errAuthorizationInteractionNotAllowed`) maps to an error telling the user to run the command from a GUI login after `mairu kill-agent`.
 4. On success it removes the record from every strong store it can reach, and returns the per-store results.
