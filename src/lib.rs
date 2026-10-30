@@ -1,3 +1,6 @@
+// async_trait and async_recursion expansions trip this lint on code we do not write.
+#![allow(clippy::double_must_use)]
+
 mod error;
 pub use error::{Error, Result};
 

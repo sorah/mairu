@@ -193,6 +193,7 @@ fn generate_bearer_token() -> secrecy::SecretString {
 }
 
 #[tracing::instrument(skip_all)]
+#[allow(clippy::result_large_err)]
 async fn handle_get_credentials<B: Backend + 'static, U: UserFeedbackDelegate>(
     crate::ext_axum::ExtractBearer {
         value: bearer,
