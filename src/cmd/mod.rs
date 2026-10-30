@@ -2,6 +2,7 @@ pub mod agent;
 pub mod credential_process;
 pub mod doctor;
 pub mod exec;
+pub mod harden;
 pub mod kill_agent;
 pub mod list_roles;
 pub mod list_sessions;

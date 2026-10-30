@@ -6,6 +6,10 @@
 - Release archives carry a GitHub artifact attestation of `mairu` as `mairu.sigstore.json`; verify with `gh attestation verify mairu --repo sorah/mairu`. Debian packages are attested too.
 - When mairu is installed setgid to a dedicated `mairu` group, the agent and its clients verify each other through that group. The agent serves only verified clients, apart from diagnostics; a client sends nothing to an agent it cannot verify, and replaces it with a verified one. A hardened agent also ignores proxies, `AWS_*` variables and `~/.aws/config`.
 - New `mairu doctor` command shows how the client and the agent see each other.
+- New `mairu harden` command (Linux, as root) installs a hardened copy at `/usr/local/libexec/mairu/mairu`, creates the `mairu` group and `/var/lib/mairu`, and removes them again with `--uninstall [--purge]`. `--home`, `MAIRU_HARDEN_HOME` or `harden_home` in `config.json` choose another prefix. `harden --from FILE` upgrades the hardened copy after verifying the GitHub artifact attestation of `FILE`.
+- Other installations (mise, cargo, aqua, tarballs) run the hardened copy when one exists, and warn when its version differs. `MAIRU_NO_HARDENED_REEXEC=1` opts out. Without a hardened copy, mairu suggests `harden` at most once an hour on a terminal (`MAIRU_NO_HARDEN_SUGGESTION=1` or `harden_suggestion` in `config.json`).
+- The Debian package installs `/usr/bin/mairu` setgid to the `mairu` group and creates `/var/lib/mairu`. `pkg/sysusers.d` and `pkg/tmpfiles.d` carry the same for other packagers.
+- `mairu doctor` lists hardened copies and their versions, and warns when `sudo -n true` succeeds or the user is in `docker`, `lxd`, `incus-admin` or `disk`.
 
 ### Miscellaneous
 

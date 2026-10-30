@@ -38,7 +38,7 @@ impl Profile {
         })
     }
 
-    fn resolve(hardened: bool, requested: Option<&str>) -> Self {
+    pub(crate) fn resolve(hardened: bool, requested: Option<&str>) -> Self {
         if hardened {
             return Self::build_default();
         }
@@ -170,6 +170,37 @@ fn socket_path_from(
 pub struct UserConfig {
     #[serde(default)]
     pub disallow_roles: Vec<DisallowedRole>,
+    #[serde(default)]
+    pub harden_suggestion: HardenSuggestionConfig,
+    /// Prefix of the hardened copy, `<harden_home>/libexec/mairu/mairu`. `MAIRU_HARDEN_HOME` overrides it.
+    #[serde(default)]
+    pub harden_home: Option<std::path::PathBuf>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HardenSuggestionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 0 shows the suggestion once per terminal session instead.
+    #[serde(default = "default_harden_suggestion_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for HardenSuggestionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: default_harden_suggestion_interval_secs(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_harden_suggestion_interval_secs() -> u64 {
+    3600
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -185,6 +216,19 @@ impl UserConfig {
 
     pub async fn load() -> crate::Result<Self> {
         match tokio::fs::read(Self::path()).await {
+            Ok(data) => Ok(serde_json::from_slice(&data)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// For startup, before a runtime exists.
+    pub fn load_sync() -> crate::Result<Self> {
+        Self::load_from(&Self::path())
+    }
+
+    pub fn load_from(path: &std::path::Path) -> crate::Result<Self> {
+        match std::fs::read(path) {
             Ok(data) => Ok(serde_json::from_slice(&data)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
@@ -787,6 +831,28 @@ mod tests {
         assert!(config.is_role_disallowed(&server, "222222222222/Admin"));
         assert!(!config.is_role_disallowed(&server, "333333333333/Admin"));
         assert!(!config.is_role_disallowed(&server, "111111111111/ReadOnly"));
+    }
+
+    #[test]
+    fn test_harden_settings() {
+        let config: UserConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.harden_suggestion, HardenSuggestionConfig::default());
+        assert!(config.harden_suggestion.enabled);
+        assert_eq!(config.harden_suggestion.interval_secs, 3600);
+        assert_eq!(config.harden_home, None);
+
+        let config: UserConfig = serde_json::from_str(
+            r#"{"harden_suggestion": {"interval_secs": 0}, "harden_home": "/opt"}"#,
+        )
+        .unwrap();
+        assert!(config.harden_suggestion.enabled);
+        assert_eq!(config.harden_suggestion.interval_secs, 0);
+        assert_eq!(config.harden_home, Some("/opt".into()));
+
+        let config: UserConfig =
+            serde_json::from_str(r#"{"harden_suggestion": {"enabled": false}}"#).unwrap();
+        assert!(!config.harden_suggestion.enabled);
+        assert_eq!(config.harden_suggestion.interval_secs, 3600);
     }
 
     #[test]

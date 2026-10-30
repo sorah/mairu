@@ -1,3 +1,8 @@
+/// Helpers that release archives ship next to `mairu` on this OS. `mairu harden` copies them next to the hardened
+/// copy.
+#[cfg(target_os = "linux")]
+pub const SHIPPED: &[&str] = &["mairu-windows-hello.exe"];
+
 /// Finds a helper shipped beside the running executable, or in `../lib/mairu/` relative to it.
 ///
 /// Never searches `PATH`. Callers verify the returned helper before use.
@@ -6,7 +11,8 @@ pub fn locate(file_name: &str) -> Option<std::path::PathBuf> {
     crate::helpers::locate_for_executable(&exe, file_name)
 }
 
-fn locate_for_executable(exe: &std::path::Path, file_name: &str) -> Option<std::path::PathBuf> {
+/// As [`locate`], for the executable at `exe`.
+pub fn locate_for_executable(exe: &std::path::Path, file_name: &str) -> Option<std::path::PathBuf> {
     // On macOS current_exe() returns the path mairu was started through, which may be a symlink.
     let exe = std::fs::canonicalize(exe).ok()?;
     let dir = exe.parent()?;

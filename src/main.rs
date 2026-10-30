@@ -48,10 +48,15 @@ enum Commands {
 
     /// Show how this mairu and the agent verify each other
     Doctor(mairu::cmd::doctor::DoctorArgs),
+
+    /// Install a hardened copy of mairu for this host (run as root)
+    Harden(mairu::cmd::harden::HardenArgs),
 }
 
 fn main() -> Result<std::process::ExitCode, anyhow::Error> {
     mairu::hardening::Hardening::detect();
+    #[cfg(target_os = "linux")]
+    let suggest_hardening = mairu::hardening::reexec_hardened_if_available();
 
     use clap::Parser;
     let cli = Cli::parse();
@@ -82,7 +87,12 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::CredentialProcess(_) => enable_log(LogType::Custom),
         Commands::KillAgent => enable_log(LogType::Custom),
         Commands::Doctor(_) => enable_log(LogType::Custom),
+        Commands::Harden(_) => enable_log(LogType::Custom),
         _ => enable_log(LogType::Default),
+    }
+    #[cfg(target_os = "linux")]
+    if suggest_hardening && !matches!(cli.command, Commands::Agent(_)) {
+        mairu::hardening::suggestion::maybe_show();
     }
     let retval = match &cli.command {
         Commands::Agent(args) => mairu::cmd::agent::run(args),
@@ -96,6 +106,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::KillAgent => mairu::cmd::kill_agent::run(),
         Commands::SetupSso(args) => mairu::cmd::setup_sso::run(args),
         Commands::Doctor(args) => mairu::cmd::doctor::run(args),
+        Commands::Harden(args) => mairu::cmd::harden::run(args),
     };
     match retval {
         Ok(_) => Ok(std::process::ExitCode::SUCCESS),
