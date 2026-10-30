@@ -1,3 +1,4 @@
+#[cfg(feature = "cli")]
 pub(crate) fn set_cloexec<T>(fd: &T, value: bool) -> crate::Result<()>
 where
     T: std::os::fd::AsFd,

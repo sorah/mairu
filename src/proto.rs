@@ -59,6 +59,7 @@ impl AssumeRoleRequest {
     }
 }
 
+#[cfg(feature = "cli")]
 impl ExecEnvironment {
     pub(crate) unsafe fn apply(&self) {
         for name in self.remove_vars.iter() {
@@ -74,12 +75,14 @@ impl ExecEnvironment {
     }
 }
 
+#[cfg(feature = "cli")]
 #[derive(zeroize::ZeroizeOnDrop)]
 pub(crate) enum ExecEnvironmentAction {
     Set(#[zeroize(skip)] &'static str, String),
     Remove(#[zeroize(skip)] &'static str),
 }
 
+#[cfg(feature = "cli")]
 impl FromIterator<ExecEnvironmentAction> for ExecEnvironment {
     fn from_iter<I: IntoIterator<Item = ExecEnvironmentAction>>(iter: I) -> Self {
         let mut set_vars = vec![];
@@ -102,8 +105,10 @@ impl FromIterator<ExecEnvironmentAction> for ExecEnvironment {
     }
 }
 
+#[cfg(feature = "cli")]
 static EXEC_IPC_VERSION: u32 = 100u32;
 
+#[cfg(feature = "cli")]
 impl ExecIpcInformExecutorRequest {
     #[inline]
     pub(crate) fn ready(ready: crate::proto::exec_ipc_inform_executor_request::Ready) -> Self {

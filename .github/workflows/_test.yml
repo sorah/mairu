@@ -34,6 +34,17 @@ jobs:
         with: { target: "${{ matrix.target }}" }
       - run: "cargo test --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features || 'default' }}"
 
+  core:
+    name: cargo check (core library)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with: { target: x86_64-unknown-linux-gnu }
+      - run: rustup component add clippy
+      - run: cargo check --lib --no-default-features
+      - run: cargo clippy --lib --no-default-features -- -D warnings
+
   build:
     if: ${{ inputs.build }}
     name: cargo build
@@ -46,3 +57,48 @@ jobs:
       - uses: ./.github/actions/setup
         with: { target: "${{ matrix.target }}" }
       - run: "cargo build --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features || 'default' }}"
+
+  size:
+    if: ${{ inputs.build }}
+    name: release binary size
+    runs-on: "${{ matrix.os }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            features: "rustls"
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    env:
+      # Ceilings in MB per binary. Raise on purpose when adding a large dependency.
+      SIZE_CEILING_MAIRU: '30'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with: { target: "${{ matrix.target }}" }
+      - run: "cargo build --release --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features || 'default' }}"
+      - name: report sizes
+        shell: bash
+        env:
+          TARGET: "${{ matrix.target }}"
+          BINS: mairu
+        run: |
+          failed=0
+          {
+            echo "| target | binary | size | ceiling |"
+            echo "|--------|--------|------|---------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for bin in $BINS; do
+            size=$(( $(wc -c < "target/${TARGET}/release/${bin}") ))
+            ceiling_var="SIZE_CEILING_$(echo "$bin" | tr 'a-z-' 'A-Z_')"
+            ceiling_mb="${!ceiling_var}"
+            size_mb=$(awk -v s="$size" 'BEGIN { printf "%.1f", s / 1000000 }')
+            echo "| ${TARGET} | ${bin} | ${size_mb} MB | ${ceiling_mb} MB |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$size" -gt $(( ceiling_mb * 1000000 )) ]; then
+              echo "::error::${bin} for ${TARGET} is ${size_mb} MB, over its ${ceiling_mb} MB ceiling"
+              failed=1
+            fi
+          done
+          exit "$failed"

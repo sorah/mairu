@@ -573,7 +573,7 @@ mod provider {
                 ExecEnvironmentAction::Set("AWS_CONTAINER_CREDENTIALS_FULL_URI", url.to_string()),
                 ExecEnvironmentAction::Set(
                     "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-                    format!("Bearer {}", &server.bearer_token().expose_secret()),
+                    format!("Bearer {}", server.bearer_token().expose_secret()),
                 ),
             ];
             crate::proto::ExecEnvironment::from_iter(vars.into_iter())

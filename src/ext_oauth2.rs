@@ -127,6 +127,24 @@ pub(crate) fn reqwest_give_client_auth(
     }
 }
 
+// We can't use oauth2 provided method where prohibits cloning strings
+pub(crate) fn generate_pkce_challenge() -> (oauth2::PkceCodeChallenge, secrecy::SecretString) {
+    use base64::Engine;
+    use rand::RngCore;
+    use secrecy::ExposeSecret;
+
+    let mut buf = [0u8; 64];
+    rand::rng().fill_bytes(&mut buf);
+    let verifier_raw =
+        secrecy::SecretString::new(base64::engine::general_purpose::URL_SAFE.encode(buf).into());
+    let verifier = oauth2::PkceCodeVerifier::new(verifier_raw.expose_secret().to_owned());
+
+    (
+        oauth2::PkceCodeChallenge::from_code_verifier_sha256(&verifier),
+        verifier_raw,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,22 +196,4 @@ mod tests {
             assert_eq!(d.interval, 5);
         }
     }
-}
-
-// We can't use oauth2 provided method where prohibits cloning strings
-pub(crate) fn generate_pkce_challenge() -> (oauth2::PkceCodeChallenge, secrecy::SecretString) {
-    use base64::Engine;
-    use rand::RngCore;
-    use secrecy::ExposeSecret;
-
-    let mut buf = [0u8; 64];
-    rand::rng().fill_bytes(&mut buf);
-    let verifier_raw =
-        secrecy::SecretString::new(base64::engine::general_purpose::URL_SAFE.encode(buf).into());
-    let verifier = oauth2::PkceCodeVerifier::new(verifier_raw.expose_secret().to_owned());
-
-    (
-        oauth2::PkceCodeChallenge::from_code_verifier_sha256(&verifier),
-        verifier_raw,
-    )
 }

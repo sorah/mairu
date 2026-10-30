@@ -506,25 +506,6 @@ fn default_oauth_scope() -> Vec<String> {
 }
 
 impl ServerOAuth {
-    pub(crate) fn validate(&self) -> Result<(), crate::Error> {
-        if self.code_grant.is_none() && self.device_code_grant.is_none() {
-            return Err(crate::Error::ConfigError(
-                "Either oauth.code_grant or oauth.device_code_grant must be provided, but absent"
-                    .to_owned(),
-            ));
-        }
-        if match self.default_grant_type {
-            None => false,
-            Some(OAuthGrantType::DeviceCode) => self.device_code_grant.is_none(),
-            Some(OAuthGrantType::Code) => self.code_grant.is_none(),
-        } {
-            return Err(crate::Error::ConfigError(
-                "default_grant_type is specified but its configuration is not given".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
     pub fn default_grant_type(&self) -> Result<OAuthGrantType, crate::Error> {
         match self.default_grant_type {
             Some(x) => Ok(x),

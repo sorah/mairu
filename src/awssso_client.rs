@@ -149,7 +149,7 @@ impl crate::client::CredentialVendor for Client {
                 }
             };
             let rs = self.list_accounts_page(sso.clone(), page).await?;
-            roles.extend(rs.into_iter());
+            roles.extend(rs);
         }
 
         roles.sort_by(|a, b| a.name.cmp(&b.name));
@@ -177,7 +177,7 @@ impl Client {
         }
         while let Some(res) = set.join_next().await {
             match res {
-                Ok(Ok(rs)) => roles.extend(rs.into_iter()),
+                Ok(Ok(rs)) => roles.extend(rs),
                 Ok(Err(e)) => return Err(e),
                 Err(e) => {
                     return Err(crate::Error::UnknownError(format!(

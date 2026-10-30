@@ -217,6 +217,7 @@ const HTML_OK: &str = include_str!("oauth_code_ok.html");
 
 #[allow(clippy::type_complexity)]
 #[tracing::instrument(skip_all)]
+#[allow(clippy::result_large_err)]
 async fn callback(
     query: axum::extract::Query<CallbackQuery>,
     axum::extract::Extension(context): axum::extract::Extension<
