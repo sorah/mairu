@@ -105,18 +105,39 @@ fn print_agent_status(
         ),
         None => println!("caller   unknown"),
     }
+    if !status.platform_helper.is_empty() {
+        println!("helper   {}", status.platform_helper);
+    }
     if let Some(caps) = &status.capabilities {
-        let verification = caps.peer_verification().as_str_name();
-        println!(
-            "capabilities  peer_verification={}",
-            verification
-                .strip_prefix("PEER_VERIFICATION_")
-                .unwrap_or(verification)
-        );
+        println!("capabilities  {}", describe_capabilities(caps));
         for note in &caps.notes {
             println!("  note: {note}");
         }
     }
+}
+
+fn describe_capabilities(caps: &crate::proto::platform::Capabilities) -> String {
+    let strip = |name: &'static str, prefix: &str| name.strip_prefix(prefix).unwrap_or(name);
+    let stores: Vec<&str> = caps
+        .integrity_stores()
+        .map(|s| strip(s.as_str_name(), "INTEGRITY_STORE_KIND_"))
+        .collect();
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    format!(
+        "peer_verification={} authorization={} integrity_stores={} notifications={} open_url={}",
+        strip(caps.peer_verification().as_str_name(), "PEER_VERIFICATION_"),
+        strip(
+            caps.authorization().as_str_name(),
+            "AUTHORIZATION_FACILITY_"
+        ),
+        if stores.is_empty() {
+            "-".to_owned()
+        } else {
+            stores.join(",")
+        },
+        yes_no(caps.notifications),
+        yes_no(caps.open_url),
+    )
 }
 
 fn describe_state(state: &crate::hardening::HardeningState) -> &'static str {
@@ -298,6 +319,29 @@ mod install {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_describe_capabilities() {
+        let caps = crate::proto::platform::Capabilities {
+            peer_verification: crate::proto::platform::PeerVerification::Setgid.into(),
+            authorization: crate::proto::platform::AuthorizationFacility::Polkit.into(),
+            integrity_stores: vec![
+                crate::proto::platform::IntegrityStoreKind::ProtectedDirectory.into(),
+                crate::proto::platform::IntegrityStoreKind::SecretService.into(),
+            ],
+            notifications: true,
+            open_url: false,
+            notes: vec![],
+        };
+        assert_eq!(
+            describe_capabilities(&caps),
+            "peer_verification=SETGID authorization=POLKIT integrity_stores=PROTECTED_DIRECTORY,SECRET_SERVICE notifications=yes open_url=no"
+        );
+        assert_eq!(
+            describe_capabilities(&Default::default()),
+            "peer_verification=UNSPECIFIED authorization=UNSPECIFIED integrity_stores=- notifications=no open_url=no"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

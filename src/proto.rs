@@ -2,6 +2,16 @@ tonic::include_proto!("mairu");
 
 pub mod platform {
     tonic::include_proto!("mairu.platform");
+
+    impl AuthorizeResponse {
+        pub fn unavailable(reason: &str, detail: impl Into<String>) -> Self {
+            Self {
+                result: authorize_response::Result::Unavailable.into(),
+                reason: reason.to_owned(),
+                detail: detail.into(),
+            }
+        }
+    }
 }
 
 impl Credentials {

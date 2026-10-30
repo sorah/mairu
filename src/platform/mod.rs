@@ -1,6 +1,14 @@
-//! In-process platform primitives: who is on the other end of an agent connection.
+//! Platform-dependent code: in-process primitives (who is on the other end of a connection) and the platform
+//! services that run only inside the platform helper.
 
+#[cfg(feature = "cli")]
+pub mod helper;
 pub mod process;
+#[cfg(feature = "platform-services")]
+pub mod services;
+
+/// Exit status of a platform helper that refused its parent.
+pub const HELPER_EXIT_PARENT_UNVERIFIED: u8 = 3;
 
 /// Runs in-process in every mairu process; never remoted.
 pub trait ProcessPlatform: Send + Sync + std::fmt::Debug {
@@ -13,6 +21,89 @@ pub trait ProcessPlatform: Send + Sync + std::fmt::Debug {
     fn peer_verification(&self) -> crate::proto::platform::PeerVerification;
     /// Diagnostics about this host, such as missing kernel features.
     fn notes(&self) -> Vec<String>;
+    /// Platform helper side: checks that the other end of the inherited socket is this process's parent.
+    /// Returns the parent's pid.
+    fn verify_parent(&self, fd: std::os::fd::BorrowedFd<'_>) -> crate::Result<u32>;
+}
+
+/// The `PlatformHelper` contract as a trait. The agent only holds `HelperClient`; the backends that implement it
+/// run inside the platform helper.
+#[async_trait::async_trait]
+pub trait PlatformServices: Send + Sync + std::fmt::Debug {
+    async fn capabilities(&self) -> crate::proto::platform::Capabilities;
+
+    async fn authorize(
+        &self,
+        req: crate::proto::platform::AuthorizeRequest,
+    ) -> crate::proto::platform::AuthorizeResponse;
+    async fn notify(
+        &self,
+        req: crate::proto::platform::NotifyRequest,
+    ) -> crate::proto::platform::NotifyResponse;
+    async fn open_url(
+        &self,
+        req: crate::proto::platform::OpenUrlRequest,
+    ) -> crate::proto::platform::OpenUrlResponse;
+    async fn record_integrity(
+        &self,
+        req: crate::proto::platform::RecordIntegrityRequest,
+    ) -> crate::proto::platform::RecordIntegrityResponse;
+    async fn verify_integrity(
+        &self,
+        req: crate::proto::platform::VerifyIntegrityRequest,
+    ) -> crate::proto::platform::VerifyIntegrityResponse;
+}
+
+/// The backend for this OS. Runs only inside the platform helper.
+#[cfg(feature = "platform-services")]
+pub fn services() -> &'static dyn PlatformServices {
+    &crate::platform::services::fallback::FallbackServices
+}
+
+/// The credentials the kernel recorded for the creator of the platform helper's socketpair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentCredentials {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// `None` when it could not be read.
+    pub real_gid: Option<u32>,
+}
+
+impl ParentCredentials {
+    /// The creator must be the parent, of the same uid, and when hardened hold the marker without it being its real
+    /// gid.
+    pub fn verify(
+        &self,
+        own_uid: u32,
+        ppid: u32,
+        state: &crate::hardening::HardeningState,
+    ) -> crate::Result<()> {
+        if self.uid != own_uid {
+            return Err(crate::Error::PeerError(format!(
+                "the socket's creator pid {} runs as uid {}, not {own_uid}",
+                self.pid, self.uid
+            )));
+        }
+        if self.pid != ppid {
+            return Err(crate::Error::PeerError(format!(
+                "the socket's creator is pid {}, not the parent pid {ppid}",
+                self.pid
+            )));
+        }
+        if let crate::hardening::HardeningState::Hardened { marker } = state
+            && !holds_marker(marker.as_raw(), self.gid, self.real_gid)
+        {
+            let real_gid = self
+                .real_gid
+                .map_or_else(|| "unknown".to_owned(), |g| g.to_string());
+            return Err(crate::Error::PeerError(format!(
+                "the parent pid {} is not hardened mairu (gid {}, real gid {real_gid})",
+                self.pid, self.gid
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// The peer of an accepted connection, as the kernel reported it at `connect()`.
@@ -200,6 +291,61 @@ mod tests {
             AgentTrust::evaluate(&hardened(), MARKER, None),
             AgentTrust::Unverified
         );
+    }
+
+    fn parent(gid: u32, real_gid: Option<u32>) -> ParentCredentials {
+        ParentCredentials {
+            pid: 4242,
+            uid: 1000,
+            gid,
+            real_gid,
+        }
+    }
+
+    #[test]
+    fn test_parent_hardened() {
+        assert!(
+            parent(MARKER, Some(RGID))
+                .verify(1000, 4242, &hardened())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_parent_not_parent_pid() {
+        let err = parent(MARKER, Some(RGID))
+            .verify(1000, 1, &hardened())
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::PeerError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_parent_other_uid() {
+        for state in not_hardened() {
+            assert!(parent(RGID, Some(RGID)).verify(1001, 4242, &state).is_err());
+        }
+        assert!(
+            parent(MARKER, Some(RGID))
+                .verify(1001, 4242, &hardened())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_parent_hardened_without_marker() {
+        for (gid, rgid) in [(RGID, Some(RGID)), (MARKER, Some(MARKER)), (MARKER, None)] {
+            assert!(
+                parent(gid, rgid).verify(1000, 4242, &hardened()).is_err(),
+                "{gid} {rgid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parent_unhardened_checks_uid_and_pid_only() {
+        for state in not_hardened() {
+            assert!(parent(RGID, None).verify(1000, 4242, &state).is_ok());
+        }
     }
 
     #[test]

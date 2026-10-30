@@ -62,6 +62,36 @@ impl crate::platform::ProcessPlatform for FallbackProcess {
         })
     }
 
+    /// Checks the uid only, where the OS reports one. How the helper and agent check each other here is left to the
+    /// OS's own peer verification.
+    fn verify_parent(&self, fd: std::os::fd::BorrowedFd<'_>) -> crate::Result<u32> {
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        {
+            let (uid, _gid) = nix::unistd::getpeereid(fd)?;
+            let euid = nix::unistd::geteuid();
+            if uid != euid {
+                return Err(crate::Error::PeerError(format!(
+                    "the parent runs as uid {uid}, not {euid}"
+                )));
+            }
+        }
+        #[cfg(not(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )))]
+        let _ = fd;
+        Ok(u32::try_from(nix::unistd::getppid().as_raw()).unwrap_or(0))
+    }
+
     fn peer_verification(&self) -> crate::proto::platform::PeerVerification {
         crate::proto::platform::PeerVerification::None
     }

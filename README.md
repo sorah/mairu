@@ -232,7 +232,9 @@ It listens on `$XDG_RUNTIME_DIR/mairu/mairu-agent.sock` (or `~/.local/state/mair
 
 Debug builds (`cargo build`) use a separate `dev` profile, so a development build never touches your installed agent: the agent listens on `mairu-dev-agent.sock` and keeps state in `~/.local/state/mairu-dev`, while configuration in `~/.config/mairu` is shared. `MAIRU_PROFILE=dev` or `MAIRU_PROFILE=default` overrides the build's default.
 
-`mairu doctor` shows how the client and the agent see each other, and warns about setups that weaken them.
+The agent runs platform services (desktop prompts, notifications and the like) in a child process, `mairu platform-helper`, which holds no tokens. The two check each other, the helper exits with the agent, and the agent restarts a helper that died within 30 seconds; until then those services fail closed.
+
+`mairu doctor` shows how the client and the agent see each other, the state of the platform helper, and warns about setups that weaken them.
 
 ## Hardening
 
@@ -288,6 +290,8 @@ Root can replace the hardened copy and read the agent's memory, so hardening pro
 - Back `sudo` and polkit's `polkit-1` PAM stack with something a captured password cannot replay, such as `pam_u2f` locally, or `pam_ssh_agent_auth` with an approval-protected key over SSH.
 
 ### Packaging
+
+`cargo build --release --no-default-features --features platform-helper --bin mairu-platform-helper` builds the platform helper as a standalone `mairu-platform-helper` binary, without the client and agent, for packagers that ship it separately. On Linux the agent always runs `mairu platform-helper`.
 
 Packages install `/usr/bin/mairu` as `root:mairu 2755` with `cap_ipc_lock` (setcap after chgrp, which clears file capabilities), and create `/var/lib/mairu` and `/var/lib/mairu/users` as `root:mairu 2770`. [pkg/debian/postinst](./pkg/debian/postinst) does this for the Debian package; [pkg/sysusers.d](./pkg/sysusers.d/mairu.conf) and [pkg/tmpfiles.d](./pkg/tmpfiles.d/mairu.conf) declare the group and directories for systemd distributions.
 

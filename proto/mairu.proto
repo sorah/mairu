@@ -180,6 +180,7 @@ message GetAgentStatusResponse {
   HardeningState agent_hardening = 2;
   PeerView caller = 3;
   mairu.platform.Capabilities capabilities = 4;
+  string platform_helper = 8;  // e.g. "running pid=4321 verified", "unavailable: helper-unverified"
   string profile = 10;  // "default" or "dev"
 }
 

@@ -51,6 +51,13 @@ enum Commands {
 
     /// Install a hardened copy of mairu for this host (run as root)
     Harden(mairu::cmd::harden::HardenArgs),
+
+    /// Serve platform services to the parent agent; started only by the agent
+    #[command(hide = true)]
+    PlatformHelper {
+        #[arg(long)]
+        fd: std::os::fd::RawFd,
+    },
 }
 
 fn main() -> Result<std::process::ExitCode, anyhow::Error> {
@@ -60,6 +67,9 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
 
     use clap::Parser;
     let cli = Cli::parse();
+    if let Commands::PlatformHelper { fd } = cli.command {
+        return Ok(mairu::cmd::platform_helper::run(fd));
+    }
 
     match &cli.command {
         Commands::Agent(a) => {
@@ -107,6 +117,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::SetupSso(args) => mairu::cmd::setup_sso::run(args),
         Commands::Doctor(args) => mairu::cmd::doctor::run(args),
         Commands::Harden(args) => mairu::cmd::harden::run(args),
+        Commands::PlatformHelper { .. } => unreachable!(),
     };
     match retval {
         Ok(_) => Ok(std::process::ExitCode::SUCCESS),

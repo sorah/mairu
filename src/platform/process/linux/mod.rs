@@ -163,6 +163,27 @@ impl crate::platform::ProcessPlatform for LinuxProcess {
         }
     }
 
+    fn verify_parent(&self, fd: std::os::fd::BorrowedFd<'_>) -> crate::Result<u32> {
+        let cred = peer::PeerCred::read(fd)?;
+        let state = crate::hardening::Hardening::state();
+        // A non-dumpable parent's status stays readable.
+        let real_gid = match state {
+            crate::hardening::HardeningState::Hardened { .. } => {
+                procfs::read_real_gid(cred.pid).ok()
+            }
+            _ => None,
+        };
+        let ppid = u32::try_from(nix::unistd::getppid().as_raw()).unwrap_or(0);
+        crate::platform::ParentCredentials {
+            pid: cred.pid,
+            uid: cred.uid,
+            gid: cred.gid,
+            real_gid,
+        }
+        .verify(nix::unistd::geteuid().as_raw(), ppid, state)?;
+        Ok(cred.pid)
+    }
+
     fn notes(&self) -> Vec<String> {
         let mut notes = vec![];
         if !Self::pidfd_supported() {
@@ -180,6 +201,7 @@ impl crate::platform::ProcessPlatform for LinuxProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::ProcessPlatform;
     use std::os::fd::AsFd;
 
     fn hardened(marker: u32) -> crate::hardening::HardeningState {
@@ -231,6 +253,14 @@ mod tests {
     fn test_inspect_other_uid_is_refused() {
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
         let err = LinuxProcess::inspect(a.as_fd(), &unhardened(), euid() + 1).unwrap_err();
+        assert!(matches!(err, crate::Error::PeerError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_verify_parent_refuses_own_socketpair() {
+        // This process created the pair, and it is not its own parent.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let err = LinuxProcess.verify_parent(a.as_fd()).unwrap_err();
         assert!(matches!(err, crate::Error::PeerError(_)), "{err:?}");
     }
 

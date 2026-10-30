@@ -4,15 +4,32 @@ pub struct Agent {
     auth_flow_manager: crate::auth_flow_manager::AuthFlowManager,
     session_manager: crate::session_manager::SessionManager,
     shutdown_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    platform_helper: crate::platform::helper::HelperClient,
 }
 
 impl Agent {
-    pub fn new(shutdown_tx: tokio::sync::oneshot::Sender<()>) -> Self {
+    pub fn new(
+        shutdown_tx: tokio::sync::oneshot::Sender<()>,
+        platform_helper: crate::platform::helper::HelperClient,
+    ) -> Self {
         Self {
             auth_flow_manager: crate::auth_flow_manager::AuthFlowManager::new(),
             session_manager: crate::session_manager::SessionManager::new(),
             shutdown_tx: tokio::sync::Mutex::new(Some(shutdown_tx)),
+            platform_helper,
         }
+    }
+
+    /// What the helper reports, with this agent's own peer verification and notes.
+    async fn capabilities(&self) -> crate::proto::platform::Capabilities {
+        use crate::platform::PlatformServices;
+        let platform = crate::platform::process();
+        let mut capabilities = self.platform_helper.capabilities().await;
+        capabilities.peer_verification = platform.peer_verification().into();
+        let mut notes = platform.notes();
+        notes.append(&mut capabilities.notes);
+        capabilities.notes = notes;
+        capabilities
     }
 }
 
@@ -52,15 +69,12 @@ impl crate::proto::agent_server::Agent for Agent {
             crate::hardening::HardeningState::Hardened { .. } => HardeningState::Hardened,
             crate::hardening::HardeningState::Misconfigured { .. } => HardeningState::Misconfigured,
         };
-        let platform = crate::platform::process();
         Ok(tonic::Response::new(GetAgentStatusResponse {
             version: crate::version::VERSION.to_owned(),
             agent_hardening: agent_hardening.into(),
             caller,
-            capabilities: Some(crate::proto::platform::Capabilities {
-                peer_verification: platform.peer_verification().into(),
-                notes: platform.notes(),
-            }),
+            capabilities: Some(self.capabilities().await),
+            platform_helper: self.platform_helper.describe(),
             profile: crate::config::Profile::current().name().to_owned(),
         }))
     }

@@ -10,11 +10,13 @@
 - Other installations (mise, cargo, aqua, tarballs) run the hardened copy when one exists, and warn when its version differs. `MAIRU_NO_HARDENED_REEXEC=1` opts out. Without a hardened copy, mairu suggests `harden` at most once an hour on a terminal (`MAIRU_NO_HARDEN_SUGGESTION=1` or `harden_suggestion` in `config.json`).
 - The Debian package installs `/usr/bin/mairu` setgid to the `mairu` group and creates `/var/lib/mairu`. `pkg/sysusers.d` and `pkg/tmpfiles.d` carry the same for other packagers.
 - `mairu doctor` lists hardened copies and their versions, and warns when `sudo -n true` succeeds or the user is in `docker`, `lxd`, `incus-admin` or `disk`.
+- The agent runs platform services in a child process, `mairu platform-helper`, that holds no tokens. The agent and the helper verify each other, the helper exits with the agent, and a helper that died is restarted within 30 seconds; meanwhile those services fail closed. `mairu doctor` shows the helper's state and capabilities.
 
 ### Miscellaneous
 
 - macOS binaries are now published per architecture as `mairu-x86_64-apple-darwin.tar.gz` and `mairu-aarch64-apple-darwin.tar.gz`. The universal binary `mairu-universal-apple-darwin.tar.gz` is no longer published.
 - Debug builds use a separate `dev` profile (`mairu-dev-agent.sock`, `~/.local/state/mairu-dev`), so a development build no longer talks to the installed agent. `MAIRU_PROFILE` overrides it.
+- New `platform-helper` Cargo feature builds a standalone `mairu-platform-helper` binary without the client and agent: `cargo build --no-default-features --features platform-helper --bin mairu-platform-helper`.
 - The client and agent are behind a new default `cli` Cargo feature. `native-tls` and `rustls` imply it, so existing build commands such as `--no-default-features --features rustls` still build the full CLI.
 
 ## 0.12.0

@@ -66,6 +66,7 @@ cli = [
   "dep:sigstore-verify",
   "dep:snap",
   "dep:tracing-appender",
+  "platform-services",
   "tokio/full",
   "tracing-subscriber/json",
   "tracing-subscriber/local-time",
@@ -73,11 +74,20 @@ cli = [
 ]
 native-tls = ["cli", "reqwest/default-tls", "sigstore-trust-root?/native-tls"]
 rustls = ["cli", "reqwest/rustls-tls-native-roots", "sigstore-trust-root?/rustls"]
+# The platform helper's server and backends. Backend dependencies are enabled here.
+platform-services = []
+# The standalone helper binary, built without `cli`.
+platform-helper = ["platform-services"]
 
 [[bin]]
 name = "mairu"
 path = "src/main.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "mairu-platform-helper"
+path = "src/bin/mairu_platform_helper.rs"
+required-features = ["platform-helper"]
 
 [dependencies]
 anyhow = { version = "1.0.100", features = ["backtrace"] }
