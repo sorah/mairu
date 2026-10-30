@@ -248,16 +248,24 @@ pub enum MisconfiguredReason {
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented. Root-level behavior verified in Docker (debian:trixie); see Updates.
 
 ### Checklist
 
-- [ ] `Hardening::detect()` and classification in `src/hardening.rs`, called first in `main`
-- [ ] `with_privileged_gid`, `drop_privileged_gid_permanently`, `command()`
-- [ ] Privileged `connect()` and `bind()`+`listen()`; executor drop before exec; agent spawned through `command()`
-- [ ] Unit tests for classification and the drop assertion
-- [ ] BSD: design only
+- [x] `Hardening::detect()` and classification in `src/hardening.rs`, called first in `main`
+- [x] `with_privileged_gid`, `drop_privileged_gid_permanently`, `command()`
+- [x] Privileged `connect()` and `bind()`+`listen()`; executor drop before exec; agent spawned through `command()`
+- [x] Unit tests for classification and the drop assertion
+- [x] BSD: design only
 
 ### Updates
 
 - 2026-10-29: Split out of hardening.md, policy.md and platform-helper.md.
+- 2026-10-31: Implemented.
+  - Classification is the pure `Facts::classify()`; `Hardening::detect()` gathers the facts on Linux only. Every other OS classifies as `Unhardened`, and the gid helpers run `f` unchanged or do nothing.
+  - Interpretation: a `Misconfigured` process, or one setgid to another group, also drops the granted gid permanently at startup (`setresgid(rgid, rgid, rgid)`, only when `AT_SECURE` is set). "Acts as `Unhardened`" is otherwise not exact: it would keep the marker as its effective gid and leak it to `mairu exec` children.
+  - Interpretation: an unreadable `/proc/sys/fs/suid_dumpable` does not misconfigure; only the value `1` does.
+  - Client `connect()` is a blocking `std` connect inside `with_privileged_gid`, then handed to tokio, so the marker is never held across an `await`. `bind()`+`listen()` is the `std`/tokio `bind`, so the socket file is created with group `mairu` (mode stays `0700` under the agent's umask).
+  - `with_privileged_gid` takes `FnOnce() -> std::io::Result<T>`. Failing to lower the gid again, or to lower it at startup, aborts the process. `command()`'s `pre_exec` skips the process-wide mutex, since another thread may have held it at fork.
+  - A misconfigured or other-group warning prints twice when the client auto-spawns the agent, since the agent inherits stderr.
+  - Verified in Docker as root, with the build installed `root:mairu 2755` and run as an unprivileged user via `setpriv`: the auto-spawned agent classifies as `Hardened` with `Gid: 1000 1000 <mairu> 1000`, and so does the `mairu exec` sidecar; the exec'd command shows no `mairu` in `id` or its `Gid:` line; the hardened agent's `/proc/<pid>/environ` is unreadable by the same user; `list-sessions` and `kill-agent` work for every combination of hardened and unhardened client and agent; under `strace` the setgid bit is not applied and the process is unhardened; a supplementary member and a user whose primary group is `mairu` get the `Misconfigured` warning and hold no marker; a binary `root:utmp 2755` warns and holds no marker. The `fs.suid_dumpable = 1` row is unit-tested only, and the `fs.protected_hardlinks` warning was not exercised, since both sysctls are the host's and read-only in a container.

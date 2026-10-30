@@ -748,9 +748,13 @@ pub async fn connect_to_agent_with_path(
     let ch = tonic::transport::Endpoint::try_from("http://[::]:50051")?
         .connect_with_connector(tower::service_fn(move |_| {
             let path = path.clone();
-            async {
+            async move {
+                let stream = crate::hardening::with_privileged_gid(|| {
+                    std::os::unix::net::UnixStream::connect(&path)
+                })?;
+                stream.set_nonblocking(true)?;
                 Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
-                    tokio::net::UnixStream::connect(path).await?,
+                    tokio::net::UnixStream::from_std(stream)?,
                 ))
             }
         }))

@@ -862,6 +862,8 @@ mod executor {
             .command
             .first()
             .ok_or_else(|| anyhow::anyhow!("command cannot be empty"))?;
+        // An attacker-influenced command holding the marker would pass as mairu.
+        crate::hardening::drop_privileged_gid_permanently()?;
         let err = std::process::Command::new(arg0)
             .args(&args.command[1..])
             .exec();

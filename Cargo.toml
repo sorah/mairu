@@ -96,7 +96,7 @@ hyper = { version = "1.8.1", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1.19", optional = true }
 indoc = { version = "2.0.7", optional = true }
 libc = "0.2.178"
-nix = { version = "0.30.1", features = ["resource", "process", "ptrace", "mman", "fs", "signal", "hostname"] }
+nix = { version = "0.30.1", features = ["resource", "process", "ptrace", "mman", "fs", "signal", "hostname", "user", "socket"] }
 oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest"], optional = true }
 once_cell = { version = "1.21.3", features = ["parking_lot"] }
 parking_lot = "0.12.5"

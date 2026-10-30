@@ -48,6 +48,8 @@ enum Commands {
 }
 
 fn main() -> Result<std::process::ExitCode, anyhow::Error> {
+    mairu::hardening::Hardening::detect();
+
     use clap::Parser;
     let cli = Cli::parse();
 

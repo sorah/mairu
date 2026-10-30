@@ -4,6 +4,7 @@
 mod error;
 pub use error::{Error, Result};
 
+pub mod hardening;
 pub mod os;
 pub mod ppid;
 pub mod proto;
