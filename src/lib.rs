@@ -5,6 +5,8 @@ pub mod os;
 pub mod ppid;
 pub mod proto;
 
+pub mod helpers;
+
 #[cfg(feature = "cli")]
 pub mod ext_awssso;
 #[cfg(feature = "cli")]
