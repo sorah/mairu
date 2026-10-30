@@ -8,6 +8,11 @@ pub struct AgentArgs {
     #[arg(long, default_value_t = false)]
     pub log_to_file: bool,
 
+    /// Shut down an agent at the socket path that this mairu cannot verify, or one older than its minimum agent
+    /// version, and take its place.
+    #[arg(long, default_value_t = false)]
+    replace_unverified: bool,
+
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[arg(long, hide = true)]
     uds_fd: Option<std::os::fd::RawFd>, // See daemonize_reexec() for details
@@ -21,7 +26,7 @@ pub fn run(args: &AgentArgs) -> Result<(), anyhow::Error> {
     crate::config::runtime_dir_mkpath()?;
 
     if args.daemonize {
-        return serve_on_path_daemon(path);
+        return serve_on_path_daemon(path, args.replace_unverified);
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -32,7 +37,7 @@ pub fn run(args: &AgentArgs) -> Result<(), anyhow::Error> {
         }
     }
 
-    serve_on_path(path)
+    serve_on_path(path, args.replace_unverified)
 }
 
 fn daemonize() -> Result<(), anyhow::Error> {
@@ -116,9 +121,12 @@ fn macos_pt_deny_attach() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::main]
-pub async fn serve_on_path(path: std::path::PathBuf) -> Result<(), anyhow::Error> {
+pub async fn serve_on_path(
+    path: std::path::PathBuf,
+    replace_unverified: bool,
+) -> Result<(), anyhow::Error> {
     tracing::info!(path = ?path, "Server starting");
-    let uds = try_bind_or_check_liveness(&path, false).await?;
+    let uds = try_bind_or_check_liveness(&path, false, replace_unverified).await?;
     serve(uds).await
 }
 
@@ -139,9 +147,12 @@ pub async fn serve_on_fd(raw_fd: std::os::fd::RawFd) -> Result<(), anyhow::Error
 }
 
 #[cfg_attr(any(target_os = "macos", target_os = "ios"), allow(unreachable_code))]
-pub fn serve_on_path_daemon(path: std::path::PathBuf) -> Result<(), anyhow::Error> {
+pub fn serve_on_path_daemon(
+    path: std::path::PathBuf,
+    replace_unverified: bool,
+) -> Result<(), anyhow::Error> {
     tracing::debug!(path = ?path, "Server starting as a daemon");
-    let uds = try_bind_or_check_liveness_std(&path)?;
+    let uds = try_bind_or_check_liveness_std(&path, replace_unverified)?;
     tracing::info!(path = ?path, "Agent starting as a daemon");
 
     // See daemonize_reexec() for details
@@ -160,12 +171,104 @@ pub fn serve_on_path_daemon(path: std::path::PathBuf) -> Result<(), anyhow::Erro
 pub async fn serve_on_path_daemon2(
     uds: std::os::unix::net::UnixListener,
 ) -> Result<(), anyhow::Error> {
+    relisten(&uds)?;
     uds.set_nonblocking(true)?;
     serve(tokio::net::UnixListener::from_std(uds)?).await
 }
 
+/// Clients check the listener's credentials, which name the process that called listen(2). That process exited
+/// when daemonizing, so the daemon listens again to put its own pid there.
+fn relisten(uds: &std::os::unix::net::UnixListener) -> std::io::Result<()> {
+    crate::hardening::with_privileged_gid(|| {
+        nix::sys::socket::listen(uds, nix::sys::socket::Backlog::MAXCONN).map_err(Into::into)
+    })
+}
+
+/// An accepted connection and its peer as inspected at accept. tonic puts the peer in every request's extensions.
+pub struct PeerStream {
+    inner: tokio::net::UnixStream,
+    peer: std::sync::Arc<crate::platform::PeerIdentity>,
+}
+
+impl PeerStream {
+    /// `None` when the connection must be closed, such as for a peer of another uid.
+    fn accept(inner: tokio::net::UnixStream) -> Option<Self> {
+        match crate::platform::process().inspect_peer(&inner) {
+            Ok(peer) => Some(Self {
+                inner,
+                peer: std::sync::Arc::new(peer),
+            }),
+            Err(e) => {
+                tracing::warn!(err = %e, "Closing a connection from a peer that failed inspection");
+                None
+            }
+        }
+    }
+}
+
+impl tonic::transport::server::Connected for PeerStream {
+    type ConnectInfo = std::sync::Arc<crate::platform::PeerIdentity>;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.peer.clone()
+    }
+}
+
+impl tokio::io::AsyncRead for PeerStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for PeerStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 pub async fn serve(uds: tokio::net::UnixListener) -> Result<(), anyhow::Error> {
-    let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
+    use tokio_stream::StreamExt;
+    let uds_stream =
+        tokio_stream::wrappers::UnixListenerStream::new(uds).filter_map(
+            |accepted| match accepted {
+                Ok(stream) => PeerStream::accept(stream).map(Ok),
+                Err(e) => Some(Err(e)),
+            },
+        );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let agent = crate::agent::Agent::new(shutdown_tx);
 
@@ -191,6 +294,7 @@ pub async fn serve(uds: tokio::net::UnixListener) -> Result<(), anyhow::Error> {
 async fn try_bind_or_check_liveness(
     path: &std::path::PathBuf,
     retry: bool,
+    replace_unverified: bool,
 ) -> Result<tokio::net::UnixListener, anyhow::Error> {
     match crate::hardening::with_privileged_gid(|| tokio::net::UnixListener::bind(path)) {
         Ok(s) => Ok(s),
@@ -200,14 +304,15 @@ async fn try_bind_or_check_liveness(
                 return Err(e.into());
             }
             // Attempt to connect and say hello.
-            check_liveness(path).await?;
-            try_bind_or_check_liveness(path, true).await
+            check_liveness(path, replace_unverified).await?;
+            try_bind_or_check_liveness(path, true, replace_unverified).await
         }
     }
 }
 
 fn try_bind_or_check_liveness_std(
     path: &std::path::PathBuf,
+    replace_unverified: bool,
 ) -> Result<std::os::unix::net::UnixListener, anyhow::Error> {
     match crate::hardening::with_privileged_gid(|| std::os::unix::net::UnixListener::bind(path)) {
         Ok(s) => Ok(s),
@@ -220,7 +325,7 @@ fn try_bind_or_check_liveness_std(
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(check_liveness(path))?;
+            rt.block_on(check_liveness(path, replace_unverified))?;
 
             Ok(crate::hardening::with_privileged_gid(|| {
                 std::os::unix::net::UnixListener::bind(path)
@@ -230,39 +335,106 @@ fn try_bind_or_check_liveness_std(
 }
 
 #[cfg(unix)]
-async fn check_liveness(path: &std::path::PathBuf) -> Result<(), anyhow::Error> {
-    use std::os::unix::fs::FileTypeExt;
-    if let Err(e) = crate::agent::connect_to_agent_with_path(&path).await {
-        tracing::info!(err = ?e, path = ?path, "Attempting to replace the stale socket file as failing to connect to the existing agent");
-        let stat = tokio::fs::symlink_metadata(&path).await?;
-        if stat.file_type().is_socket() {
-            tokio::fs::remove_file(&path).await?;
-        } else {
-            anyhow::bail!(
-                "A file at the socket path ({path}) is not a socket, aborting",
-                path = path.display()
-            );
+async fn check_liveness(
+    path: &std::path::PathBuf,
+    replace_unverified: bool,
+) -> Result<(), anyhow::Error> {
+    let mut conn = match crate::agent::connect_to_agent_with_path(&path).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!(err = ?e, path = ?path, "Attempting to replace the stale socket file as failing to connect to the existing agent");
+            return remove_socket_file(path).await;
         }
-        tracing::debug!(err = ?e, path = ?path, "removed stale socket file");
-        return Ok(());
+    };
+    let Some(reason) = conn.replacement_reason() else {
+        anyhow::bail!("There is already running agent on the same socket path");
+    };
+    if !replace_unverified {
+        anyhow::bail!(
+            "The agent on the same socket path is {}; start with --replace-unverified to replace it",
+            describe_replacement(&conn, reason)
+        );
     }
-    anyhow::bail!("There is already running agent on the same socket path");
+    tracing::info!(path = ?path, agent = ?conn.identity(), agent_version = conn.version(), reason = ?reason, "Replacing the agent on the socket path");
+    // A squatter that ignores this keeps running on an unlinked socket and is never reached again.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        conn.shutdown_agent(tonic::Request::new(crate::proto::ShutdownAgentRequest {})),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(err = ?e, "The replaced agent refused ShutdownAgent"),
+        Err(_) => tracing::warn!("The replaced agent did not answer ShutdownAgent in time"),
+    }
+    remove_socket_file(path).await
+}
+
+async fn remove_socket_file(path: &std::path::Path) -> Result<(), anyhow::Error> {
+    use std::os::unix::fs::FileTypeExt;
+    let stat = tokio::fs::symlink_metadata(&path).await?;
+    if !stat.file_type().is_socket() {
+        anyhow::bail!(
+            "A file at the socket path ({path}) is not a socket, aborting",
+            path = path.display()
+        );
+    }
+    tokio::fs::remove_file(&path).await?;
+    tracing::debug!(path = ?path, "removed socket file");
+    Ok(())
+}
+
+fn describe_replacement(
+    conn: &crate::agent::AgentConn,
+    reason: crate::agent::ReplacementReason,
+) -> String {
+    let pid = conn
+        .identity()
+        .pid
+        .map(|p| format!("pid {p}"))
+        .unwrap_or_else(|| "unknown pid".to_owned());
+    match reason {
+        crate::agent::ReplacementReason::Unverified => format!("not hardened ({pid})"),
+        crate::agent::ReplacementReason::Outdated => format!(
+            "older than {} ({pid}, version {})",
+            crate::version::MINIMUM_AGENT_VERSION,
+            conn.version()
+        ),
+    }
 }
 
 pub async fn connect_or_start() -> Result<crate::agent::AgentConn, anyhow::Error> {
     let liveness = crate::agent::connect_to_agent().await;
-    match liveness {
-        Ok(c) => return Ok(c),
+    let replace_unverified = match liveness {
+        Ok(c) => {
+            let Some(reason) = c.replacement_reason() else {
+                return Ok(c);
+            };
+            let description = describe_replacement(&c, reason);
+            if std::env::var_os("MAIRU_NO_AUTO_AGENT").is_some() {
+                anyhow::bail!(
+                    "The agent at {} is {description}; not replacing it because MAIRU_NO_AUTO_AGENT is set",
+                    c.path().display()
+                );
+            }
+            let product = env!("CARGO_PKG_NAME");
+            crate::terminal::send(&format!(
+                ":: {product} :: Replacing an agent that is {description}; you may need to log in again."
+            ))
+            .await;
+            true
+        }
         Err(e) => {
             if std::env::var_os("MAIRU_NO_AUTO_AGENT").is_some() {
                 return Err(e.into());
             }
             tracing::info!("Starting the agent");
             tracing::debug!(err = ?e, "Starting the agent");
+            false
         }
-    }
+    };
 
-    spawn_agent().await?;
+    spawn_agent(replace_unverified).await?;
 
     let fut = attempt_connect_to_agent_loop();
     let timeout = tokio::time::timeout(std::time::Duration::from_secs(20), fut);
@@ -278,17 +450,26 @@ pub async fn connect_or_start() -> Result<crate::agent::AgentConn, anyhow::Error
 async fn attempt_connect_to_agent_loop() -> Result<crate::agent::AgentConn, anyhow::Error> {
     loop {
         match crate::agent::connect_to_agent().await {
-            Ok(c) => return Ok(c),
+            Ok(c) if c.replacement_reason().is_none() => return Ok(c),
+            Ok(_) => tracing::debug!("Waiting for the agent to be replaced"),
             Err(e) => tracing::debug!(err = ?e, "Waiting for agent to start"),
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 
-pub async fn spawn_agent() -> Result<(), anyhow::Error> {
+pub async fn spawn_agent(replace_unverified: bool) -> Result<(), anyhow::Error> {
     let arg0 = process_path::get_executable_path().expect("Can't get executable path");
-    tokio::process::Command::from(crate::hardening::command(arg0))
-        .args(["agent", "--log-to-file", "--daemonize"])
+    let mut cmd = crate::hardening::command(arg0);
+    cmd.args(["agent", "--log-to-file", "--daemonize"]);
+    if replace_unverified {
+        cmd.arg("--replace-unverified");
+    }
+    if crate::hardening::Hardening::marker().is_some() {
+        cmd.env_clear()
+            .envs(crate::hardening::sanitized_environment());
+    }
+    tokio::process::Command::from(cmd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())

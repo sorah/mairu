@@ -2,6 +2,7 @@
 pub async fn run() -> Result<(), anyhow::Error> {
     use tokio::io::AsyncWriteExt;
 
+    // Shutting down an impostor needs no trust, so this works against an unverified agent too.
     let mut agent = match crate::agent::connect_to_agent().await {
         Ok(agent) => agent,
         Err(e) => {

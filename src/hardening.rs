@@ -327,6 +327,57 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     cmd
 }
 
+/// Variables a hardened agent keeps, besides `LC_*`. The rest could redirect its traffic, such as `HTTPS_PROXY`,
+/// `SSL_CERT_FILE` or `AWS_ENDPOINT_URL`.
+const ENV_ALLOWLIST: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "TZ",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "MAIRU_AGENT_SOCK",
+    "MAIRU_LOG",
+    "MAIRU_AGENT_LOG",
+];
+const SANITIZED_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+fn is_allowed_env(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    ENV_ALLOWLIST.contains(&name) || name.starts_with("LC_")
+}
+
+/// The allowlisted part of this process's environment, with a fixed `PATH`. A hardened agent runs with this.
+pub fn sanitized_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(k, _)| is_allowed_env(k))
+        .chain(std::iter::once((
+            "PATH".into(),
+            std::ffi::OsString::from(SANITIZED_PATH),
+        )))
+        .collect()
+}
+
+/// Clears this process's environment down to [`sanitized_environment`].
+///
+/// # Safety
+///
+/// The process must be single-threaded.
+pub unsafe fn sanitize_environment() {
+    for (name, _) in std::env::vars_os() {
+        if !is_allowed_env(&name) {
+            // SAFETY: the caller guarantees no other thread reads the environment.
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+    // SAFETY: as above.
+    unsafe { std::env::set_var("PATH", SANITIZED_PATH) };
+}
+
 // The kernel resets dumpability to fs.suid_dumpable on every credential change.
 #[cfg(target_os = "linux")]
 fn set_gids(
@@ -339,7 +390,7 @@ fn set_gids(
 }
 
 #[cfg(target_os = "linux")]
-fn read_sysctl(path: &str) -> Option<u8> {
+pub(crate) fn read_sysctl(path: &str) -> Option<u8> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
@@ -527,6 +578,43 @@ mod tests {
             facts.classify(),
             misconfigured(MisconfiguredReason::SuidDumpable)
         );
+    }
+
+    #[test]
+    fn test_is_allowed_env() {
+        for name in [
+            "HOME",
+            "XDG_RUNTIME_DIR",
+            "MAIRU_AGENT_SOCK",
+            "LC_ALL",
+            "LC_CTYPE",
+        ] {
+            assert!(is_allowed_env(name.as_ref()), "{name}");
+        }
+        for name in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "AWS_ENDPOINT_URL",
+            "AWS_CONFIG_FILE",
+            "AWS_PROFILE",
+            "MAIRU_PROFILE",
+            "PATH",
+            "LD_PRELOAD",
+            "LANGUAGE",
+        ] {
+            assert!(!is_allowed_env(name.as_ref()), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_sanitized_environment_resets_path() {
+        let env = sanitized_environment();
+        let paths: Vec<_> = env.iter().filter(|(k, _)| k == "PATH").collect();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].1, SANITIZED_PATH);
     }
 
     #[test]

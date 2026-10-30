@@ -18,6 +18,13 @@ pub async fn login(
     agent: &mut crate::agent::AgentConn,
     args: &LoginArgs,
 ) -> Result<(), anyhow::Error> {
+    // An unverified agent may be a socket squatter waiting for an authorization code.
+    if agent.replacement_reason().is_some() {
+        anyhow::bail!(
+            "Refusing to log in through the agent at {}, which this mairu cannot verify; run `mairu doctor` for details",
+            agent.path().display()
+        );
+    }
     let mut server = get_server(agent, &args.server_name).await?;
     if server.aws_sso.is_some() && server.oauth.is_none() {
         agent

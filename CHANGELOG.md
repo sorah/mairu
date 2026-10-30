@@ -4,10 +4,13 @@
 
 - Release binaries are built with link-time optimization and stripped, shrinking them by about 40%.
 - Release archives carry a GitHub artifact attestation of `mairu` as `mairu.sigstore.json`; verify with `gh attestation verify mairu --repo sorah/mairu`. Debian packages are attested too.
+- When mairu is installed setgid to a dedicated `mairu` group, the agent and its clients verify each other through that group. The agent serves only verified clients, apart from diagnostics; a client sends nothing to an agent it cannot verify, and replaces it with a verified one. A hardened agent also ignores proxies, `AWS_*` variables and `~/.aws/config`.
+- New `mairu doctor` command shows how the client and the agent see each other.
 
 ### Miscellaneous
 
 - macOS binaries are now published per architecture as `mairu-x86_64-apple-darwin.tar.gz` and `mairu-aarch64-apple-darwin.tar.gz`. The universal binary `mairu-universal-apple-darwin.tar.gz` is no longer published.
+- Debug builds use a separate `dev` profile (`mairu-dev-agent.sock`, `~/.local/state/mairu-dev`), so a development build no longer talks to the installed agent. `MAIRU_PROFILE` overrides it.
 - The client and agent are behind a new default `cli` Cargo feature. `native-tls` and `rustls` imply it, so existing build commands such as `--no-default-features --features rustls` still build the full CLI.
 
 ## 0.12.0

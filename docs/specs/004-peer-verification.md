@@ -477,22 +477,38 @@ Linux 5.3 (pidfd) is required for hardened mode; 6.5 (`SO_PEERPIDFD`) is recomme
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented on `hardening/peer-verification`. Root-requiring scenarios verified in Docker (see Updates).
 
 ### Checklist
 
-- [ ] `ProcessPlatform`, `PeerIdentity`, `LinuxProcess`, `FallbackProcess`
-- [ ] `/proc` parsing, pidfds and liveness re-checks (`src/platform/process/linux/procfs.rs`)
-- [ ] Agent side: `PeerStream`/`Connected`, real-gid check, `require_trusted`
-- [ ] Client side: `verify_agent` in `connect_to_agent_with_path`, unverified agents limited to three RPCs
-- [ ] Unverified-agent replacement (`--replace-unverified`); `kill-agent` without verification; `login` stops on an unverified agent
-- [ ] `proto/mairu_platform.proto`; `GetAgentStatus`, `PeerView`, `AuthorizationError{REASON_UNVERIFIED_PEER}`
-- [ ] `mairu doctor`
-- [ ] Dev profile (socket path, state directory, `MAIRU_PROFILE`, ignored when hardened)
-- [ ] Hardened agent environment: allowlist, explicit AWS client configuration, no proxy, system TLS roots
-- [ ] Minimum client and agent versions
-- [ ] Agent connections opened `O_CLOEXEC` and closed before `mairu exec` runs the command
+- [x] `ProcessPlatform`, `PeerIdentity`, `LinuxProcess`, `FallbackProcess`
+- [x] `/proc` parsing, pidfds and liveness re-checks (`src/platform/process/linux/procfs.rs`)
+- [x] Agent side: `PeerStream`/`Connected`, real-gid check, `require_trusted`
+- [x] Client side: `verify_agent` in `connect_to_agent_with_path`, unverified agents limited to three RPCs
+- [x] Unverified-agent replacement (`--replace-unverified`); `kill-agent` without verification; `login` stops on an unverified agent
+- [x] `proto/mairu_platform.proto`; `GetAgentStatus`, `PeerView`, `AuthorizationError{REASON_UNVERIFIED_PEER}`
+- [x] `mairu doctor`
+- [x] Dev profile (socket path, state directory, `MAIRU_PROFILE`, ignored when hardened)
+- [x] Hardened agent environment: allowlist, explicit AWS client configuration, no proxy, system TLS roots
+- [x] Minimum client and agent versions
+- [x] Agent connections opened `O_CLOEXEC` and closed before `mairu exec` runs the command
 
 ### Updates
 
 - 2026-10-29: Split out of hardening.md, policy.md and platform-helper.md.
+- 2026-10-31: Implemented. Decisions and deviations:
+  - `ProcessPlatform::verify_agent` returns `AgentIdentity { pid, trust }` rather than a bare `AgentTrust`, so the replacement notice can name the pid. The trait also has `peer_verification()` and `notes()`, which feed `Capabilities` and `doctor`.
+  - `PeerIdentity.real_gid` is an `Option`. An unhardened agent that cannot pin a peer (no pidfd, unreadable `/proc`) serves it as `Unverifiable` with no pidfd, keeping today's behavior; a hardened agent closes the connection instead.
+  - A daemonized agent calls `listen(2)` again, with the marker raised, after daemonizing. The process that bound the socket exits while daemonizing, and `SO_PEERCRED` on the client side names the pid that last called `listen()`; without this the client's real-gid read fails and a genuine agent is unverified.
+  - The hardened AWS configuration is `aws_config::SdkConfig::builder()` with the behavior version and an explicit region, not `aws_config::defaults(…).no_credentials()`, because `defaults()` still reads `~/.aws/config` and `AWS_*` for endpoint URLs. The second hop of role chaining uses the session's AWS SSO region, else `us-east-1`.
+  - TLS roots stay the system trust store of the TLS backend (native-tls, or rustls with native roots). `SSL_CERT_FILE`/`SSL_CERT_DIR` are cleared by the allowlist, so only the default locations are read; their ownership is not checked.
+  - Authorization details are the encoded `AuthorizationError` itself in the status's binary details, not a `google.rpc.Status`. The status message repeats the detail. The CLI prints `Error: the agent refused this request: <detail>`.
+  - The client ping to an unverified agent has a 2 s timeout, so a squatter that never answers does not hang a hardened client; it is replaced like any unverified agent. Verified and unverifiable agents are pinged without a timeout, as before.
+  - tonic reconnects re-run `verify_agent`; a reconnect fails if the agent's trust differs from the first connection's.
+  - A verified client that sends no `mairu-version` is treated as older than the minimum.
+  - `login` also refuses an agent older than the minimum agent version. With `MAIRU_NO_AUTO_AGENT` set, a client refuses to replace an unverified agent and fails instead. A hardened agent started by hand without `--replace-unverified` refuses to start over an unverified one and names the flag.
+  - `ShutdownAgent` from a rejected peer is refused by a hardened agent (the open set is `PingAgent`/`GetAgentStatus`), so an unhardened `kill-agent` cannot stop a hardened agent; a hardened `kill-agent` stops any agent.
+  - `O_CLOEXEC`: `std::os::unix::net::UnixStream::connect` opens sockets with `SOCK_CLOEXEC`, and in `mairu exec` only the sidecar child connects to the agent; the executor that execs the command never holds a connection. No code change was needed.
+  - Minimum client and agent versions start at 0.12.0 in `[package.metadata.mairu]`; `build.rs` exports them as `MAIRU_MINIMUM_{CLIENT,AGENT}_VERSION` (`crate::version`).
+  - Verified in Docker (debian:trixie, host kernel 7.0, `root:mairu 2755` install, scenario `004-peer-verification`, 49 checks): hardened client and agent verify each other and `doctor` reports both hardened with the caller verified; an unhardened copy is refused with `REASON_UNVERIFIED_PEER` while its `doctor` works; a client with real gid `mairu` is refused and its `doctor` says why; an unhardened agent is replaced with the notice, also past a non-gRPC squatter; `kill-agent` stops an unverified agent; `login` stops before sending anything when it may not replace an unverified agent; an older hardened build (0.11.0) is replaced as an agent and refused as a client; a client-spawned hardened agent's environment holds only the allowlist; a hardened agent ignores `endpoint_url` in `~/.aws/config` and `AWS_ENDPOINT_URL` while an unhardened one follows them; dev profile paths, and `MAIRU_PROFILE` ignored when hardened.
+  - Not verified: the `pidfd_open` fallback on kernels without `SO_PEERPIDFD` (unit tests cover `pidfd_open`, the probes and liveness checks only), and macOS/BSD (`FallbackProcess`; the core library checks for `x86_64-apple-darwin`).

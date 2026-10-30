@@ -11,6 +11,11 @@ repository = "https://github.com/sorah/mairu"
 edition = "2024"
 license = "Apache-2.0"
 
+[package.metadata.mairu]
+# Hardened peers older than these are not trusted. Raise on releases fixing a client-side or agent-side flaw.
+minimum-client-version = "0.12.0"
+minimum-agent-version = "0.12.0"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

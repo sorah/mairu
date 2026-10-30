@@ -24,6 +24,9 @@ pub enum Error {
     #[error(transparent)]
     UrlParseError(#[from] url::ParseError),
 
+    #[error("PeerError: {0}")]
+    PeerError(String),
+
     #[error("AuthNotReadyError: flow not yet ready")]
     AuthNotReadyError { slow_down: bool },
 

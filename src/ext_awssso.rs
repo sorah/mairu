@@ -1,13 +1,33 @@
 use aws_smithy_runtime_api::client::endpoint::ResolveEndpoint;
 
-pub async fn sso_config_to_ssooidc(sso: &crate::config::ServerAwsSso) -> aws_sdk_ssooidc::Client {
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest())
-        .await
-        .to_builder()
-        .region(Some(aws_config::Region::new(sso.region.clone())))
+/// Region a hardened agent uses when no server configuration names one.
+const HARDENED_FALLBACK_REGION: &str = "us-east-1";
+
+/// AWS SDK configuration for the agent. A hardened agent builds it from `region` and the default endpoints only, never
+/// from `~/.aws/config`, `~/.aws/credentials` or `AWS_*` variables, which same-user code can edit to redirect tokens.
+pub async fn sdk_config(region: Option<&str>) -> aws_config::SdkConfig {
+    let builder = if crate::hardening::Hardening::marker().is_some() {
+        aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(Some(aws_config::Region::new(
+                region.unwrap_or(HARDENED_FALLBACK_REGION).to_owned(),
+            )))
+    } else {
+        let mut builder = aws_config::load_defaults(aws_config::BehaviorVersion::latest())
+            .await
+            .to_builder();
+        if let Some(r) = region {
+            builder.set_region(Some(aws_config::Region::new(r.to_owned())));
+        }
+        builder
+    };
+    builder
         .identity_cache(aws_config::identity::IdentityCache::no_cache())
-        .build();
-    aws_sdk_ssooidc::Client::new(&config)
+        .build()
+}
+
+pub async fn sso_config_to_ssooidc(sso: &crate::config::ServerAwsSso) -> aws_sdk_ssooidc::Client {
+    aws_sdk_ssooidc::Client::new(&sdk_config(Some(&sso.region)).await)
 }
 
 pub async fn register_client(
@@ -113,12 +133,7 @@ pub fn create_token_output_to_token(
 pub async fn ssooidc_authorize_url(sso: &crate::config::ServerAwsSso) -> url::Url {
     let interceptor = EndpointStealingInterceptor::new();
     let interceptor_cell = interceptor.inner.clone();
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest())
-        .await
-        .to_builder()
-        .region(Some(aws_config::Region::new(sso.region.clone())))
-        .identity_cache(aws_config::identity::IdentityCache::no_cache())
-        .build();
+    let config = sdk_config(Some(&sso.region)).await;
     let sconfig = aws_sdk_ssooidc::config::Builder::from(&config)
         .interceptor(interceptor)
         .build();

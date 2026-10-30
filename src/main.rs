@@ -45,6 +45,9 @@ enum Commands {
 
     /// Setup Mairu for your AWS SSO (AWS IAM Identity Center) instance
     SetupSso(mairu::cmd::setup_sso::SetupSsoArgs),
+
+    /// Show how this mairu and the agent verify each other
+    Doctor(mairu::cmd::doctor::DoctorArgs),
 }
 
 fn main() -> Result<std::process::ExitCode, anyhow::Error> {
@@ -55,6 +58,13 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
 
     match &cli.command {
         Commands::Agent(a) => {
+            if mairu::hardening::Hardening::marker().is_some() {
+                // SAFETY: Called during program initialization in single-threaded context
+                // before any threads are spawned.
+                unsafe {
+                    mairu::hardening::sanitize_environment();
+                }
+            }
             if let Ok(l) = std::env::var("MAIRU_AGENT_LOG") {
                 // SAFETY: Called during program initialization in single-threaded context
                 // before any threads are spawned.
@@ -71,6 +81,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::Exec(_) => enable_log(LogType::Custom),
         Commands::CredentialProcess(_) => enable_log(LogType::Custom),
         Commands::KillAgent => enable_log(LogType::Custom),
+        Commands::Doctor(_) => enable_log(LogType::Custom),
         _ => enable_log(LogType::Default),
     }
     let retval = match &cli.command {
@@ -84,13 +95,20 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::Exec(args) => mairu::cmd::exec::run(args),
         Commands::KillAgent => mairu::cmd::kill_agent::run(),
         Commands::SetupSso(args) => mairu::cmd::setup_sso::run(args),
+        Commands::Doctor(args) => mairu::cmd::doctor::run(args),
     };
     match retval {
         Ok(_) => Ok(std::process::ExitCode::SUCCESS),
         Err(e) => match e.downcast_ref::<mairu::Error>() {
             Some(mairu::Error::FailureButSilentlyExit) => Ok(std::process::ExitCode::FAILURE),
             Some(mairu::Error::SilentlyExitWithCode(c)) => Ok(*c),
-            _ => Err(e),
+            _ => match mairu::agent::authorization_error(&e) {
+                Some(authz) => {
+                    eprintln!("Error: the agent refused this request: {}", authz.detail);
+                    Ok(std::process::ExitCode::FAILURE)
+                }
+                None => Err(e),
+            },
         },
     }
 }

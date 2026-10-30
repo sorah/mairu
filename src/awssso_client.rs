@@ -1,11 +1,5 @@
 async fn sso_config_to_sso(sso: &crate::config::ServerAwsSso) -> aws_sdk_sso::Client {
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest())
-        .await
-        .to_builder()
-        .region(Some(aws_config::Region::new(sso.region.clone())))
-        .identity_cache(aws_config::identity::IdentityCache::no_cache())
-        .build();
-    aws_sdk_sso::Client::new(&config)
+    aws_sdk_sso::Client::new(&crate::ext_awssso::sdk_config(Some(&sso.region)).await)
 }
 
 pub struct Client {

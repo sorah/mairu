@@ -2,6 +2,7 @@ syntax = "proto3";
 package mairu;
 
 import "google/protobuf/timestamp.proto";
+import "mairu_platform.proto";
 
 message Session {
   uint32 id = 1;
@@ -38,6 +39,8 @@ service Agent {
   rpc ListRoles(ListRolesRequest) returns (ListRolesResponse);
 
   rpc ShutdownAgent(ShutdownAgentRequest) returns (ShutdownAgentResponse);
+
+  rpc GetAgentStatus(GetAgentStatusRequest) returns (GetAgentStatusResponse);
 }
 
 message PingAgentRequest {
@@ -161,6 +164,40 @@ message ListRolesResponse {
 message ShutdownAgentRequest {
 }
 message ShutdownAgentResponse {
+}
+
+enum HardeningState {
+  HARDENING_STATE_UNSPECIFIED = 0;
+  HARDENING_STATE_UNHARDENED = 1;
+  HARDENING_STATE_HARDENED = 2;
+  HARDENING_STATE_MISCONFIGURED = 3;
+}
+
+message GetAgentStatusRequest {
+}
+message GetAgentStatusResponse {
+  string version = 1;
+  HardeningState agent_hardening = 2;
+  PeerView caller = 3;
+  mairu.platform.Capabilities capabilities = 4;
+  string profile = 10;  // "default" or "dev"
+}
+
+// A client as the agent sees it.
+message PeerView {
+  bool verified = 1;
+  uint32 pid = 2;
+  uint64 start_time = 3;
+}
+
+// Carried in the binary details of a non-OK status.
+message AuthorizationError {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_UNVERIFIED_PEER = 1;  // PERMISSION_DENIED
+  }
+  Reason reason = 1;
+  string detail = 2;
 }
 
 //----- The following is used for mairu-exec subprocess IPC

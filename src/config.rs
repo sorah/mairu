@@ -10,6 +10,73 @@ pub fn config_dir() -> std::path::PathBuf {
         .join(env!("CARGO_PKG_NAME"))
 }
 
+/// Separates a contributor's debug build from their installed mairu: its own agent socket and state directory,
+/// with configuration shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    Default,
+    Dev,
+}
+
+impl Profile {
+    pub fn build_default() -> Self {
+        if cfg!(debug_assertions) {
+            Profile::Dev
+        } else {
+            Profile::Default
+        }
+    }
+
+    /// `MAIRU_PROFILE` overrides the build default, except in a hardened process.
+    pub fn current() -> Self {
+        static CURRENT: std::sync::OnceLock<Profile> = std::sync::OnceLock::new();
+        *CURRENT.get_or_init(|| {
+            Self::resolve(
+                crate::hardening::Hardening::marker().is_some(),
+                std::env::var("MAIRU_PROFILE").ok().as_deref(),
+            )
+        })
+    }
+
+    fn resolve(hardened: bool, requested: Option<&str>) -> Self {
+        if hardened {
+            return Self::build_default();
+        }
+        match requested {
+            None | Some("") => Self::build_default(),
+            Some("default") => Profile::Default,
+            Some("dev") => Profile::Dev,
+            Some(other) => {
+                tracing::warn!(
+                    profile = other,
+                    "Unknown MAIRU_PROFILE (expected dev or default); ignoring"
+                );
+                Self::build_default()
+            }
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Profile::Default => "default",
+            Profile::Dev => "dev",
+        }
+    }
+
+    fn base_name(self) -> &'static str {
+        match self {
+            Profile::Default => env!("CARGO_PKG_NAME"),
+            Profile::Dev => concat!(env!("CARGO_PKG_NAME"), "-dev"),
+        }
+    }
+}
+
+impl std::fmt::Display for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 pub fn state_dir() -> std::path::PathBuf {
     match std::env::var("XDG_STATE_HOME") {
         Ok(d) => std::path::PathBuf::from(d),
@@ -19,7 +86,7 @@ pub fn state_dir() -> std::path::PathBuf {
         .join(".local")
         .join("state"),
     }
-    .join(env!("CARGO_PKG_NAME"))
+    .join(Profile::current().base_name())
 }
 
 pub fn log_dir() -> std::path::PathBuf {
@@ -80,9 +147,22 @@ pub fn runtime_dir_mkpath() -> std::io::Result<std::path::PathBuf> {
 }
 
 pub fn socket_path() -> std::path::PathBuf {
-    std::env::var("MAIRU_AGENT_SOCK")
-        .map(|x| x.into())
-        .unwrap_or_else(|_| runtime_dir().join(format!("{}-agent.sock", env!("CARGO_PKG_NAME"))))
+    socket_path_from(
+        std::env::var_os("MAIRU_AGENT_SOCK"),
+        runtime_dir(),
+        Profile::current(),
+    )
+}
+
+fn socket_path_from(
+    explicit: Option<std::ffi::OsString>,
+    runtime_dir: std::path::PathBuf,
+    profile: Profile,
+) -> std::path::PathBuf {
+    match explicit {
+        Some(p) if !p.is_empty() => p.into(),
+        _ => runtime_dir.join(format!("{}-agent.sock", profile.base_name())),
+    }
 }
 
 /// Personal configuration read from config.json.
@@ -707,5 +787,52 @@ mod tests {
         assert!(config.is_role_disallowed(&server, "222222222222/Admin"));
         assert!(!config.is_role_disallowed(&server, "333333333333/Admin"));
         assert!(!config.is_role_disallowed(&server, "111111111111/ReadOnly"));
+    }
+
+    #[test]
+    fn test_profile_build_default() {
+        let expected = if cfg!(debug_assertions) {
+            Profile::Dev
+        } else {
+            Profile::Default
+        };
+        assert_eq!(Profile::build_default(), expected);
+        assert_eq!(Profile::resolve(false, None), expected);
+        assert_eq!(Profile::resolve(false, Some("")), expected);
+        assert_eq!(Profile::resolve(false, Some("bogus")), expected);
+    }
+
+    #[test]
+    fn test_profile_override() {
+        assert_eq!(Profile::resolve(false, Some("dev")), Profile::Dev);
+        assert_eq!(Profile::resolve(false, Some("default")), Profile::Default);
+    }
+
+    #[test]
+    fn test_profile_hardened_ignores_override() {
+        for requested in [Some("dev"), Some("default"), None] {
+            assert_eq!(Profile::resolve(true, requested), Profile::build_default());
+        }
+    }
+
+    #[test]
+    fn test_socket_path_from() {
+        let run = std::path::PathBuf::from("/run/user/1000/mairu");
+        assert_eq!(
+            socket_path_from(None, run.clone(), Profile::Default),
+            run.join("mairu-agent.sock")
+        );
+        assert_eq!(
+            socket_path_from(None, run.clone(), Profile::Dev),
+            run.join("mairu-dev-agent.sock")
+        );
+        assert_eq!(
+            socket_path_from(Some("".into()), run.clone(), Profile::Dev),
+            run.join("mairu-dev-agent.sock")
+        );
+        assert_eq!(
+            socket_path_from(Some("/tmp/explicit.sock".into()), run, Profile::Dev),
+            std::path::PathBuf::from("/tmp/explicit.sock")
+        );
     }
 }
