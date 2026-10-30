@@ -1,5 +1,9 @@
 tonic::include_proto!("mairu");
 
+pub mod platform {
+    tonic::include_proto!("mairu.platform");
+}
+
 impl Credentials {
     pub fn expiration(
         &self,
@@ -23,6 +27,35 @@ impl Session {
                 |st| -> chrono::DateTime<chrono::Utc> { chrono::DateTime::from(st) },
             )?)),
         }
+    }
+}
+
+impl AuthorizationError {
+    pub fn unverified_peer(detail: impl Into<String>) -> Self {
+        Self {
+            reason: authorization_error::Reason::UnverifiedPeer.into(),
+            detail: detail.into(),
+        }
+    }
+
+    /// A non-OK status carrying this error in its binary details. The message repeats the detail for clients that
+    /// do not decode details.
+    pub fn into_status(self) -> tonic::Status {
+        use prost::Message;
+        let code = match self.reason() {
+            authorization_error::Reason::UnverifiedPeer => tonic::Code::PermissionDenied,
+            authorization_error::Reason::Unspecified => tonic::Code::PermissionDenied,
+        };
+        let message = self.detail.clone();
+        tonic::Status::with_details(code, message, self.encode_to_vec().into())
+    }
+
+    pub fn from_status(status: &tonic::Status) -> Option<Self> {
+        use prost::Message;
+        if status.code() == tonic::Code::Ok || status.details().is_empty() {
+            return None;
+        }
+        Self::decode(status.details()).ok()
     }
 }
 

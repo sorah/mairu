@@ -6,8 +6,10 @@ pub use error::{Error, Result};
 
 pub mod hardening;
 pub mod os;
+pub mod platform;
 pub mod ppid;
 pub mod proto;
+pub mod version;
 
 pub mod helpers;
 

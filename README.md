@@ -224,7 +224,11 @@ TBD
 
 Mairu automatically launches agent process in background. This is similar to ssh-agent and gpg-agent. Mairu Agent retains all access tokens for credential server, and caches AWS credentials for re-use on memory.
 
-It listens on `$XDG_RUNTIME_DIR/mairu-agent.sock` (or `~/.local/state/mairu/run/mairu-agent.sock`) by default.
+It listens on `$XDG_RUNTIME_DIR/mairu/mairu-agent.sock` (or `~/.local/state/mairu/run/mairu-agent.sock`) by default. `MAIRU_AGENT_SOCK` overrides the path.
+
+Debug builds (`cargo build`) use a separate `dev` profile, so a development build never touches your installed agent: the agent listens on `mairu-dev-agent.sock` and keeps state in `~/.local/state/mairu-dev`, while configuration in `~/.config/mairu` is shared. `MAIRU_PROFILE=dev` or `MAIRU_PROFILE=default` overrides the build's default.
+
+`mairu doctor` shows how the client and the agent see each other, and warns about setups that weaken them.
 
 ## Credential Server API
 

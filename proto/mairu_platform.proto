@@ -1,0 +1,15 @@
+syntax = "proto3";
+package mairu.platform;
+
+enum PeerVerification {
+  PEER_VERIFICATION_UNSPECIFIED = 0;
+  PEER_VERIFICATION_NONE = 1;
+  PEER_VERIFICATION_SETGID = 2;
+  PEER_VERIFICATION_CODE_SIGNATURE = 3;
+}
+
+message Capabilities {
+  PeerVerification peer_verification = 1;
+  // Free-form diagnostics for `mairu doctor`, e.g. "SO_PEERPIDFD unavailable".
+  repeated string notes = 6;
+}
