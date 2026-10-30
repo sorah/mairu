@@ -262,7 +262,8 @@ message AuthorizeResponse {
   }
   Result result = 1;
   // Machine-readable for UNAVAILABLE: "no-authentication-agent", "polkit-action-not-installed",
-  // "polkit-unavailable", "untrusted-authority", "helper-unavailable", "helper-unverified", "timeout".
+  // "polkit-unavailable", "untrusted-authority", "helper-unavailable", "helper-unverified", "timeout",
+  // "no-authorization-facility", "foreign-uid".
   string reason = 2;
   string detail = 3;
 }
@@ -459,18 +460,32 @@ required-features = ["platform-helper"]
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented on `hardening/platform-helper`. Root-requiring scenarios verified in Docker (see Updates). macOS was checked by cross-compiling the standalone helper only; the CI job covers the rest.
 
 ### Checklist
 
-- [ ] `mairu.platform` service and messages; `PlatformServices` trait
-- [ ] Platform helper process: inherited socketpair, mutual verification, fail closed, respawn
-- [ ] `FallbackServices`; `ResetIntegrity` answered `UNIMPLEMENTED`
-- [ ] System bus pinning and authority-owner check, ready for backends
-- [ ] `platform-helper` feature and `mairu-platform-helper` binary; CI build without `cli` on Linux and macOS
-- [ ] `GetAgentStatus` and `doctor` report the helper's state and capabilities
-- [ ] Rogue-helper and rogue-caller tests
+- [x] `mairu.platform` service and messages; `PlatformServices` trait
+- [x] Platform helper process: inherited socketpair, mutual verification, fail closed, respawn
+- [x] `FallbackServices`; `ResetIntegrity` answered `UNIMPLEMENTED`
+- [x] System bus pinning and authority-owner check, ready for backends (the D-Bus query itself arrives with zbus in 007)
+- [x] `platform-helper` feature and `mairu-platform-helper` binary; CI build without `cli` on Linux and macOS
+- [x] `GetAgentStatus` and `doctor` report the helper's state and capabilities
+- [x] Rogue-helper and rogue-caller tests
 
 ### Updates
 
 - 2026-10-29: Split out of hardening.md, policy.md and platform-helper.md.
+- 2026-10-31: Implemented. Decisions and deviations:
+  - The parent check is `ProcessPlatform::verify_parent`, a process primitive next to `inspect_peer` and `verify_agent`, over the pure `ParentCredentials::verify`. `FallbackProcess` checks only the uid (`getpeereid`); the OS steps define more.
+  - The helper exits with status 3 (`crate::platform::HELPER_EXIT_PARENT_UNVERIFIED`) when its fd is not a socket or its parent fails verification. The agent maps that exit status to `helper-unverified`. A spawn failure, a crash, an exit, or no answer to the first `GetCapabilities` within 10 s maps to `helper-unavailable`. A helper counts as running and verified once it answered that first `GetCapabilities`.
+  - Respawn is driven by a supervisor task in `HelperClient`, so a dead helper is restarted without waiting for a call. Spawn attempts are at least 30 s apart, measured from the previous attempt; a helper that lived longer than that is restarted at once. The rate limit is a pure `RespawnLimiter` tested with given instants rather than a mocked clock. While the supervisor has not yet noticed an exit, the kept pidfd already makes calls fail closed.
+  - The helper's stderr is piped into the agent's log (`platform-helper: ...` lines), with `MAIRU_LOG` as its filter. Its argv[0] is `mairu`, so `ps` shows `mairu platform-helper --fd <n>`.
+  - The helper serves its one connection and ends when the connection is dropped (EOF), with `crate::ppid` as the backstop. It is non-dumpable, has core dumps off and umask 077, also when unhardened.
+  - `platform-helper` is skipped by hardened re-exec (005), so the helper always runs the agent's own image.
+  - `FallbackServices` answers `Authorize` with `UNAVAILABLE`/`no-authorization-facility` and reports the note "no platform service backends on this OS yet". `open_url` accepts only `http`/`https` URLs. Both reasons, and `foreign-uid` below, are added to the comment in the proto.
+  - Foreign uids: the helper answers `PERMISSION_DENIED` for `RecordIntegrity`, `VerifyIntegrity`, `ResetIntegrity`, and `Authorize` whose subject has another uid. `HelperClient` refuses them before calling: `Authorize` answers `UNAVAILABLE`/`foreign-uid`, and the integrity calls return no results.
+  - The system service rules live in `src/platform/services/system_bus.rs`: the address (pinned socket and a check that `/run/dbus` is root-owned and not group/other-writable when hardened, `DBUS_SYSTEM_BUS_ADDRESS` otherwise), and the uid-0 owner check that maps to `untrusted-authority`. No backend calls them yet, so they are unit-tested only.
+  - `src/cmd` is compiled with `cli` or `platform-services`; only `platform_helper` is in the latter. The CI `platform-helper` job builds and lints the standalone binary on Linux and macOS; the size job reports it with a 5 MB ceiling (2.9 MB on x86_64 glibc).
+  - Integration tests in `tests/platform_helper.rs` run the real `mairu platform-helper` (Linux, `cli`): verified start, kill and respawn, a caller other than the parent, a start by hand, exit on EOF. Unit tests cover fake helpers (exits 0 or 3, silent, missing) and foreign uids.
+  - Verified in Docker as root (debian:trixie, scenario `006-platform-helper`, 41 checks): the hardened agent's helper is its child, runs its image, holds the marker only as saved gid and is reported `running pid=<n> verified` with merged capabilities; killing it shows `unavailable: helper-unavailable` and empty capabilities, then a respawn within 30 s; a rogue file at the binary's path is never run, as respawn uses `/proc/self/exe`; the same user cannot list the helper's fds or connect through `/proc/<pid>/fd`; a hand-started helper, a hardened helper under an unhardened parent, and a helper whose parent is not the socket's creator all refuse with status 3; an unhardened helper accepts its unhardened parent; the helper exits with the agent on `kill-agent` and on SIGKILL; each user gets their own helper; the standalone `mairu-platform-helper` behaves the same. The linux-hardened CI script gained the helper checks. Scenarios 003, 004 and 005 still pass.
+  - Not verified in Docker: a parent whose real gid is `mairu` while the helper is hardened (unit-tested through `ParentCredentials::verify`), and the system bus rules (no D-Bus client yet).

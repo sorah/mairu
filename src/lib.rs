@@ -68,5 +68,5 @@ pub mod agent;
 #[cfg(feature = "cli")]
 pub mod ecs_server;
 
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "cli", feature = "platform-services"))]
 pub mod cmd;

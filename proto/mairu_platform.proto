@@ -1,6 +1,16 @@
 syntax = "proto3";
 package mairu.platform;
 
+service PlatformHelper {
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (Capabilities);
+  rpc Authorize(AuthorizeRequest) returns (AuthorizeResponse);
+  rpc Notify(NotifyRequest) returns (NotifyResponse);
+  rpc OpenUrl(OpenUrlRequest) returns (OpenUrlResponse);
+  rpc RecordIntegrity(RecordIntegrityRequest) returns (RecordIntegrityResponse);
+  rpc VerifyIntegrity(VerifyIntegrityRequest) returns (VerifyIntegrityResponse);
+  rpc ResetIntegrity(ResetIntegrityRequest) returns (ResetIntegrityResponse);
+}
+
 enum PeerVerification {
   PEER_VERIFICATION_UNSPECIFIED = 0;
   PEER_VERIFICATION_NONE = 1;
@@ -8,8 +18,153 @@ enum PeerVerification {
   PEER_VERIFICATION_CODE_SIGNATURE = 3;
 }
 
+enum AuthorizationFacility {
+  AUTHORIZATION_FACILITY_UNSPECIFIED = 0;
+  AUTHORIZATION_FACILITY_NONE = 1;
+  AUTHORIZATION_FACILITY_POLKIT = 2;
+  AUTHORIZATION_FACILITY_LOCAL_AUTHENTICATION = 3;
+}
+
+// Strong: PROTECTED_DIRECTORY, DATA_PROTECTION_KEYCHAIN. Weak: SECRET_SERVICE, LEGACY_KEYCHAIN.
+enum IntegrityStoreKind {
+  INTEGRITY_STORE_KIND_UNSPECIFIED = 0;
+  INTEGRITY_STORE_KIND_PROTECTED_DIRECTORY = 1;
+  INTEGRITY_STORE_KIND_SECRET_SERVICE = 2;
+  INTEGRITY_STORE_KIND_DATA_PROTECTION_KEYCHAIN = 3;
+  INTEGRITY_STORE_KIND_LEGACY_KEYCHAIN = 4;
+}
+
+enum IntegrityStatus {
+  INTEGRITY_STATUS_UNSPECIFIED = 0;
+  INTEGRITY_STATUS_MATCHED = 1;
+  INTEGRITY_STATUS_MISMATCHED = 2;
+  INTEGRITY_STATUS_NOT_RECORDED = 3;
+  INTEGRITY_STATUS_UNAVAILABLE = 4;
+}
+
+message GetCapabilitiesRequest {}
+
 message Capabilities {
   PeerVerification peer_verification = 1;
-  // Free-form diagnostics for `mairu doctor`, e.g. "SO_PEERPIDFD unavailable".
+  AuthorizationFacility authorization = 2;
+  // Stores reachable right now, in authority order.
+  repeated IntegrityStoreKind integrity_stores = 3;
+  bool notifications = 4;
+  bool open_url = 5;
+  // Free-form diagnostics for `mairu doctor`, e.g. "session bus unreachable".
   repeated string notes = 6;
+}
+
+message Process {
+  uint32 pid = 1;
+  // Linux: clock ticks since boot (/proc/<pid>/stat field 22). macOS: microseconds since epoch.
+  uint64 start_time = 2;
+  uint32 uid = 3;
+  bytes executable = 4;
+  repeated bytes argv = 5;
+  string name = 6;
+}
+
+message AuthorizeRequest {
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    ACTION_ASSUME_ROLE = 1;
+    ACTION_APPROVE_POLICY = 2;
+  }
+  Action action = 1;
+  // The process the human is approving; the polkit subject on Linux.
+  Process subject = 2;
+  // One line, shown where the facility allows a custom reason.
+  string message = 3;
+  // Keys: server, role, command, cwd, tty, requester, intent, tools, policy_digest.
+  map<string, string> details = 4;
+}
+
+message AuthorizeResponse {
+  enum Result {
+    RESULT_UNSPECIFIED = 0;
+    RESULT_ALLOWED = 1;
+    RESULT_DENIED = 2;
+    RESULT_CANCELLED = 3;
+    RESULT_UNAVAILABLE = 4;
+  }
+  Result result = 1;
+  // Machine-readable for UNAVAILABLE: "no-authentication-agent", "polkit-action-not-installed",
+  // "polkit-unavailable", "untrusted-authority", "helper-unavailable", "helper-unverified", "timeout",
+  // "no-authorization-facility", "foreign-uid".
+  string reason = 2;
+  string detail = 3;
+}
+
+message NotifyRequest {
+  enum Urgency {
+    URGENCY_UNSPECIFIED = 0;
+    URGENCY_LOW = 1;
+    URGENCY_NORMAL = 2;
+    URGENCY_CRITICAL = 3;
+  }
+  string title = 1;
+  string body = 2;
+  Urgency urgency = 3;
+  string event = 4;  // "login-required" | "ai-agent-denied" | "policy-lockdown"
+  SessionHint session = 5;
+}
+message NotifyResponse { bool delivered = 1; }
+
+message OpenUrlRequest {
+  string url = 1;
+  SessionHint session = 2;
+}
+message OpenUrlResponse { bool opened = 1; string detail = 2; }
+
+// The requesting client's desktop session, passed through by the agent.
+message SessionHint {
+  string display = 1;                   // $DISPLAY
+  string wayland_display = 2;           // $WAYLAND_DISPLAY
+  string dbus_session_bus_address = 3;  // honored only as unix:path= under $XDG_RUNTIME_DIR
+  bool ssh = 4;                         // $SSH_CONNECTION or $SSH_TTY was set
+}
+
+// What an integrity store keeps for a name.
+message IntegrityRecord {
+  bytes digest = 1;            // 32 bytes
+  ApprovalAnchor approval = 2;
+  uint64 generation = 3;       // orders the records of strong stores
+  map<string, bytes> server_digests = 4;  // server id → digest of its config
+}
+
+// Who may approve the next change: the approval_methods and their keys at the time of approval.
+message ApprovalAnchor {
+  repeated string methods = 1;             // e.g. "ssh-agent", "windows-hello", "platform"
+  repeated string ssh_agent_keys = 2;      // OpenSSH public key lines
+  repeated bytes windows_hello_keys = 3;   // DER SubjectPublicKeyInfo
+}
+
+message RecordIntegrityRequest {
+  string name = 1;   // "policy"
+  uint32 uid = 2;
+  IntegrityRecord record = 3;
+}
+message RecordIntegrityResponse { repeated IntegrityStoreResult results = 1; }
+
+message VerifyIntegrityRequest {
+  string name = 1;
+  uint32 uid = 2;
+  bytes digest = 3;
+}
+message VerifyIntegrityResponse { repeated IntegrityStoreResult results = 1; }
+
+// macOS only: asks for an administrator authorization, then removes the record from every strong store.
+message ResetIntegrityRequest {
+  string name = 1;
+  uint32 uid = 2;
+}
+message ResetIntegrityResponse { repeated IntegrityStoreResult results = 1; }
+
+message IntegrityStoreResult {
+  IntegrityStoreKind store = 1;
+  // For record: MATCHED means written; UNAVAILABLE means skipped.
+  IntegrityStatus status = 2;
+  string detail = 3;
+  IntegrityRecord stored = 4;  // verify: the record the store holds, when it holds one
 }

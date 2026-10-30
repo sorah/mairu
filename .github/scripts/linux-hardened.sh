@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Integration checks for a hardened Linux host: classification, peer verification both ways, unverified-agent
-# replacement, re-exec and `mairu harden` itself. Runs as a user with passwordless sudo, after `cargo build`.
+# replacement, the platform helper, re-exec and `mairu harden` itself. Runs as a user with passwordless sudo, after
+# `cargo build`.
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -43,6 +44,23 @@ capture "$hardened" doctor
 # shellcheck disable=SC2016
 check "agent is hardened and verified" bash -c 'grep "^agent    hardened" <<<"$1" | grep -q " verified$"' _ "$out"
 check "caller verified" has "^caller   verified" "$out"
+check "platform helper running and verified" has "^helper   running pid=[0-9]* verified" "$out"
+
+echo "--- platform helper"
+helper="$(pgrep -u "$(id -u)" -f 'platform-helper --fd' | head -n1)"
+check "helper holds the marker only as saved gid" test "$(awk '/^Gid:/ {print $3, $4}' "/proc/$helper/status")" = "$(id -g) $(getent group mairu | cut -d: -f3)"
+capture "$hardened" platform-helper --fd 0 </dev/null
+check "helper started by hand refuses" test "$rc" -eq 3
+kill -KILL "$helper"
+sleep 0.5
+capture "$hardened" doctor
+check "killed helper fails closed" has "^helper   unavailable: helper-unavailable" "$out"
+for _ in $(seq 1 80); do
+  capture "$hardened" doctor >/dev/null
+  grep -q "^helper   running pid=" <<<"$out" && break
+  sleep 0.5
+done
+check "helper respawned" has "^helper   running pid=[0-9]* verified" "$out"
 capture "$dev" list-sessions
 check "hardened agent refuses an unhardened client" has "the agent refused this request" "$out"
 "$hardened" kill-agent >/dev/null 2>&1

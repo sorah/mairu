@@ -32,7 +32,14 @@ pub fn reexec_hardened_if_available() -> bool {
         );
         return false;
     }
-    if std::env::args_os().nth(1).as_deref() == Some("harden".as_ref()) {
+    // The helper must run as the same image as its agent, which spawned it.
+    if matches!(
+        std::env::args_os()
+            .nth(1)
+            .as_deref()
+            .and_then(|a| a.to_str()),
+        Some("harden" | "platform-helper")
+    ) {
         return false;
     }
     let home = crate::hardening::home::HardenHome::for_client();
