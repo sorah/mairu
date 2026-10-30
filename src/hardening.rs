@@ -3,6 +3,18 @@
 //! A hardened process keeps the marker only in its saved gid, raises it with [`with_privileged_gid`] and drops it
 //! for good before exec'ing anything.
 
+#[cfg(target_os = "linux")]
+pub mod candidate;
+#[cfg(feature = "cli")]
+pub mod home;
+#[cfg(all(feature = "cli", target_os = "linux"))]
+pub mod reexec;
+#[cfg(all(feature = "cli", target_os = "linux"))]
+pub mod suggestion;
+
+#[cfg(all(feature = "cli", target_os = "linux"))]
+pub use reexec::reexec_hardened_if_available;
+
 /// The name the marker group must have.
 pub const MARKER_GROUP_NAME: &str = "mairu";
 

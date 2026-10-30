@@ -23,6 +23,8 @@ Mairu can retrieve credentials from __AWS SSO (AWS IAM Identity Center),__ or a 
   * Keep every file of the archive next to `mairu`, as it may ship helpers.
   * Each `mairu` binary carries a GitHub artifact attestation. Verify a download with `gh attestation verify mairu --repo sorah/mairu`.
 
+On Linux, harden the installation afterwards with `sudo mairu harden`; see [Hardening](#hardening).
+
 ## Get started
 
 Mairu can be used like the following cases. In any case, Mairu automatically retrieves a AWS credential for specified role and prompts user to login when server token is expired or doesn't exist yet.
@@ -138,6 +140,8 @@ List roles in `disallow_roles` to make Mairu refuse to vend credentials for them
 
 This is a local safety net against accidental use, not an access control; permissions are still governed by your credential server.
 
+`harden_home` and `harden_suggestion` are described under [Hardening](#hardening).
+
 ### Local port for callback URL
 
 Mairu uses ephemeral port number for OAuth 2.0 callback URLs. Otherwise, you can specify `--local-port` (or `.oauth.local_port`, `.aws_sso.local_port`) to use fixed port number.
@@ -229,6 +233,63 @@ It listens on `$XDG_RUNTIME_DIR/mairu/mairu-agent.sock` (or `~/.local/state/mair
 Debug builds (`cargo build`) use a separate `dev` profile, so a development build never touches your installed agent: the agent listens on `mairu-dev-agent.sock` and keeps state in `~/.local/state/mairu-dev`, while configuration in `~/.config/mairu` is shared. `MAIRU_PROFILE=dev` or `MAIRU_PROFILE=default` overrides the build's default.
 
 `mairu doctor` shows how the client and the agent see each other, and warns about setups that weaken them.
+
+## Hardening
+
+On Linux, `mairu harden` lets the agent tell genuine mairu clients apart from other programs running as you. It installs a root-owned copy of mairu, setgid to a dedicated `mairu` group, and every mairu command then runs through that copy. Root is needed once per host, and again for upgrades.
+
+### First install
+
+Run `harden` from a copy of mairu you trust, as `sudo` runs it as root:
+
+```sh
+gh attestation verify mairu --repo sorah/mairu   # a release binary, from its archive
+sudo ./mairu harden
+```
+
+The Debian package from the releases page is hardened on install, and needs no `harden`.
+
+`harden` creates the `mairu` system group (it must have no members), installs `/usr/local/libexec/mairu/mairu` as `root:mairu 2755` with `cap_ipc_lock`, along with the helpers shipped next to it, and creates `/var/lib/mairu`, which only hardened mairu can open. It is safe to run again. The next mairu command replaces an agent started before hardening; `mairu kill-agent` does it right away.
+
+Other installations (mise, cargo, aqua, tarballs) keep working: they run the hardened copy instead of themselves, and say so when its version differs. `MAIRU_NO_HARDENED_REEXEC=1` turns this off, for development; debug builds never do it unless `MAIRU_PROFILE=default` is set. `mairu doctor` shows which mairu ran and which hardened copies exist.
+
+### Harden home
+
+The hardened copy goes to `<harden home>/libexec/mairu/`, with `/usr/local` as the default harden home. To use another prefix where root-owned software lives, pass `--home <path>` to `harden`, or set `MAIRU_HARDEN_HOME` or `harden_home` in `~/.config/mairu/config.json`; mairu commands find the hardened copy through the same settings. `/usr/bin/mairu` from a package is used when no copy exists in the harden home.
+
+### Upgrading
+
+Upgrade through the hardened copy, which verifies the GitHub artifact attestation of the new binary and never runs it:
+
+```sh
+sudo /usr/local/libexec/mairu/mairu harden --from ~/Downloads/mairu
+mairu kill-agent
+```
+
+The attestation is read from `mairu.sigstore.json` next to the file, as release archives ship it, or else fetched from GitHub. A release older than the hardened copy is refused unless `--allow-downgrade` is given. A build from source has no attestation; install it with `--unattested`.
+
+### Reminders
+
+Until a host is hardened, mairu suggests it at most once an hour on a terminal. Set `MAIRU_NO_HARDEN_SUGGESTION=1`, or configure it in `config.json`; `interval_secs: 0` shows it once per terminal session instead:
+
+```jsonc
+{"harden_suggestion": {"enabled": true, "interval_secs": 3600}}
+```
+
+### Uninstalling
+
+`sudo mairu harden --uninstall` removes what `harden` installed in the harden home; `--purge` also removes `/var/lib/mairu`. The group stays; remove it with `sudo groupdel mairu`.
+
+### Root
+
+Root can replace the hardened copy and read the agent's memory, so hardening protects your credentials only as well as root is protected from programs running as you. `mairu doctor` warns when `sudo -n true` succeeds or you are in `docker`, `lxd`, `incus-admin` or `disk`.
+
+- Avoid `NOPASSWD` sudo rules and root-equivalent groups for your user.
+- Back `sudo` and polkit's `polkit-1` PAM stack with something a captured password cannot replay, such as `pam_u2f` locally, or `pam_ssh_agent_auth` with an approval-protected key over SSH.
+
+### Packaging
+
+Packages install `/usr/bin/mairu` as `root:mairu 2755` with `cap_ipc_lock` (setcap after chgrp, which clears file capabilities), and create `/var/lib/mairu` and `/var/lib/mairu/users` as `root:mairu 2770`. [pkg/debian/postinst](./pkg/debian/postinst) does this for the Debian package; [pkg/sysusers.d](./pkg/sysusers.d/mairu.conf) and [pkg/tmpfiles.d](./pkg/tmpfiles.d/mairu.conf) declare the group and directories for systemd distributions.
 
 ## Credential Server API
 

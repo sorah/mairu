@@ -46,6 +46,9 @@ pub mod oauth_device_code;
 #[cfg(feature = "cli")]
 pub mod oauth_refresh_token;
 
+#[cfg(all(feature = "cli", target_os = "linux"))]
+pub mod attestation;
+
 #[cfg(feature = "cli")]
 pub mod api_client;
 #[cfg(feature = "cli")]

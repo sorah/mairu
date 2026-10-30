@@ -45,6 +45,16 @@ jobs:
       - run: cargo check --lib --no-default-features
       - run: cargo clippy --lib --no-default-features -- -D warnings
 
+  linux-hardened:
+    name: linux-hardened
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with: { target: x86_64-unknown-linux-gnu }
+      - run: cargo build
+      - run: .github/scripts/linux-hardened.sh
+
   build:
     if: ${{ inputs.build }}
     name: cargo build
