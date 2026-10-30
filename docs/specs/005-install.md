@@ -345,22 +345,37 @@ linux-hardened job       sudo harden in the runner; marker, re-exec, peer verifi
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented on `hardening/install`. Root-requiring scenarios verified in Docker (see Updates). The AUR packages are a follow-up in their own repositories.
 
 ### Checklist
 
-- [ ] `mairu harden`, `--uninstall`, `--purge`; `--uninstall` reads only a root-owned manifest
-- [ ] Upgrades: `harden --from FILE` with sigstore attestation verification, `--unattested`, `--allow-downgrade`; no `sudo` command printed for user-writable binaries
-- [ ] `/var/lib/mairu/installs`, and `doctor` listing hardened copies
-- [ ] Harden home: `--home`, `MAIRU_HARDEN_HOME`, `harden_home`
-- [ ] Re-exec with candidate validation and the version-skew warning; dev profile disables it
-- [ ] Periodic harden suggestion (`harden_suggestion`, `MAIRU_NO_HARDEN_SUGGESTION`)
-- [ ] Debian postinst; sysusers/tmpfiles snippets
-- [ ] Root-reachability warnings in `doctor`
-- [ ] linux-hardened CI job
-- [ ] README and CHANGELOG
+- [x] `mairu harden`, `--uninstall`, `--purge`; `--uninstall` reads only a root-owned manifest
+- [x] Upgrades: `harden --from FILE` with sigstore attestation verification, `--unattested`, `--allow-downgrade`; no `sudo` command printed for user-writable binaries
+- [x] `/var/lib/mairu/installs`, and `doctor` listing hardened copies
+- [x] Harden home: `--home`, `MAIRU_HARDEN_HOME`, `harden_home`
+- [x] Re-exec with candidate validation and the version-skew warning; dev profile disables it
+- [x] Periodic harden suggestion (`harden_suggestion`, `MAIRU_NO_HARDEN_SUGGESTION`)
+- [x] Debian postinst; sysusers/tmpfiles snippets
+- [x] Root-reachability warnings in `doctor`
+- [x] linux-hardened CI job (run in Docker as a passwordless-sudo user; not yet on a GitHub runner)
+- [x] README and CHANGELOG
 - [ ] Follow-up: AUR packages (`mairu`, `mairu-bin`, separate repositories)
 
 ### Updates
 
 - 2026-10-29: Split out of hardening.md, policy.md and platform-helper.md.
+- 2026-10-31: Implemented. Decisions and deviations:
+  - Attestations are verified with `sigstore-verify` and `sigstore-trust-root` 0.15 (the sigstore organization's sigstore-rust) rather than the `sigstore` crate. They verify bundles only, embed the public-good TUF root and fetch the trusted root through TUF, and use the system trust store (reqwest 0.13 with `rustls-platform-verifier`, or native-tls); no `webpki-roots`. reqwest 0.13 sits next to the 0.12 the rest of mairu uses. The x86_64 glibc rustls release binary grows from 18.6 MB to 21.3 MB. The dependencies are Linux-only.
+  - The trusted root is fetched fresh through TUF on every `harden --from`, without a cache. Bundles from GitHub's attestation API are tried in turn: inline bundles, else the snappy-compressed `bundle_url`. The first bundle whose certificate chain and transparency log entry verify, with issuer `https://token.actions.githubusercontent.com` and identity `https://github.com/sorah/mairu/.github/workflows/release.yml@refs/tags/v<X.Y.Z>`, gives the version. Verification runs over the bytes read once, which are the bytes installed.
+  - "The installed copy's" version is the version of the binary running `harden`, which is the hardened copy in the documented upgrade command. `--unattested` skips the version check, as an unattested file has no version that mairu would trust without running it.
+  - The version-skew message prints the update command only when the user-installed copy is newer, since an older one would be refused as a downgrade.
+  - Candidate validation also rejects a candidate on a `nosuid` mount, where the setgid bit is ignored. A process that was re-exec'd (`MAIRU_HARDENED_REEXEC_*` set) but did not come up hardened never re-execs again; it warns and continues unhardened.
+  - `harden` verifies the `--from` attestation before creating the group or any file. The busybox fallback is `addgroup -S mairu`, the form busybox accepts. Helpers are copied when they are regular files; their consumer-specific checks (016's SHA-256 pin) do not exist yet. The helper list is `crate::helpers::SHIPPED` (`mairu-windows-hello.exe` on Linux).
+  - `/var/lib/mairu/installs` is `root:mairu 0640`, readable by `doctor` with the marker raised. `harden` trusts it when it is a root-owned regular file not writable by group or others; its directory is writable by the marker gid by design.
+  - `harden` reads `harden_home` from `~/.config/mairu/config.json` under the `SUDO_UID` user's passwd home, as `sudo` does not pass `XDG_CONFIG_HOME`; non-regular files are ignored. A relative `--home` is rejected by argument parsing; relative values from the environment or config are ignored with a warning.
+  - `doctor` shows the harden home and its source, and each known copy (the resolved home, `/var/lib/mairu/installs`, `/usr/bin/mairu`) with whether it passes candidate validation and its version, read by running it with `--version` and `MAIRU_NO_HARDENED_REEXEC=1`.
+  - The harden suggestion is printed after argument parsing and logging setup, so `--help` and `--version` do not show it, and never for `agent` or `harden`. A debug build in the dev profile still suggests hardening when no valid candidate exists. With `interval_secs: 0` and no controlling terminal session, it falls back to once an hour.
+  - The Debian postinst runs with `set -e`. The linux-hardened CI job runs `.github/scripts/linux-hardened.sh`.
+  - Executing a binary with `cap_ipc_lock=+ep` fails with `EPERM` where `CAP_IPC_LOCK` is outside the capability bounding set, such as Docker's default; re-exec then warns and continues unhardened. The Docker scenarios add `--cap-add IPC_LOCK`.
+  - Verified in Docker (debian:trixie, scenario `005-install`, 120 checks, plus `005-ci-script` running the CI script, 16 checks): the non-root refusal with and without a `sudo` command; the suggestion on a pty (shown, not repeated within the interval, repeated after it, disabled by the variable and the config, once per terminal session with 0, skipped with an unwritable state file, absent without a terminal or with a hardened copy); `harden` from a user-installed copy creating the system group, `root:mairu 2755` with `cap_ipc_lock`, `root:root 0755` directory, `/var/lib/mairu{,/users}` `root:mairu 2770`, the helper `root:root 0755`, manifest and installs; idempotent re-run replacing the binary; re-exec from a user copy, dev profile and `MAIRU_NO_HARDENED_REEXEC=1` opt-outs, the hardened agent refusing the opted-out client, unhardened-agent replacement, re-exec variables unset; skew warnings both ways; `--from --unattested` installing the file's exact bytes and warning; `--from` refused offline and with a malformed bundle, leaving the copy unchanged; the group-member, primary-group and group-password checks; `--home`, `MAIRU_HARDEN_HOME` and the invoking user's `harden_home`, for `harden` and for clients; a user-owned harden home refused; candidates rejected for a user-owned ancestor, no setgid, another group, other-writable; `doctor` root-reachability warnings for `docker` and `NOPASSWD`; a minimum-version warning for an old copy; `--uninstall` refusing a user-owned manifest, removing only listed files, `--purge`, the group left; the Debian package built with cargo-deb installing `/usr/bin/mairu` `root:mairu 2755` with `cap_ipc_lock` and the state directories, and becoming the re-exec candidate. Scenarios 003 and 004 still pass unchanged.
+  - Not verified against the network: attestation verification of a real mairu release, as none is attested yet. Unit tests verify a real GitHub build-provenance bundle (jdx/mise, `testdata/attestation/`) offline against the embedded trust root, including the identity, digest and signer checks, and an ignored test fetches the trust root through TUF and a bundle from GitHub's API (run by hand: both TLS backends pass). The downgrade refusal is unit-tested.
