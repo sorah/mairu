@@ -21,10 +21,32 @@ where
         EcsServer {
             inner: std::sync::Arc::new(EcsServerInner {
                 bearer_token: generate_bearer_token(),
-                backend: AgentBackend { agent, request },
+                backend: AgentBackend {
+                    agent,
+                    request,
+                    demand: None,
+                },
                 coalesce_group: crate::singleflight::Singleflight::new(),
                 feedback,
             }),
+        }
+    }
+}
+
+impl<U> EcsServer<AgentBackend, U>
+where
+    U: UserFeedbackDelegate + Send + Sync + Clone + std::fmt::Debug + 'static,
+{
+    /// Notified on every credentials request the command makes.
+    pub fn on_demand(self, demand: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        let inner = std::sync::Arc::try_unwrap(self.inner)
+            .map(|mut inner| {
+                inner.backend.demand = Some(demand);
+                inner
+            })
+            .expect("on_demand is called before the server is shared");
+        EcsServer {
+            inner: std::sync::Arc::new(inner),
         }
     }
 }
@@ -132,19 +154,40 @@ impl BackendRequestError {
             _ => self.to_string(),
         }
     }
+
+    /// The agent's authorization refusal, worded for the terminal.
+    pub fn refusal_message(&self) -> Option<String> {
+        match self {
+            BackendRequestError::Forbidden(crate::Error::TonicStatusError(s))
+            | BackendRequestError::Unauthorized(crate::Error::TonicStatusError(s))
+            | BackendRequestError::Unknown(crate::Error::TonicStatusError(s)) => {
+                crate::cmd::authorization::refusal_message(s)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct AgentBackend {
     pub agent: crate::agent::AgentConn,
     pub request: crate::proto::AssumeRoleRequest,
+    pub demand: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 #[async_trait::async_trait]
 impl Backend for AgentBackend {
     async fn request(&mut self) -> Result<crate::proto::AssumeRoleResponse, BackendRequestError> {
         tracing::debug!(request = ?self.request, agent = ?self.agent, "requesting credentials to agent");
-        let resp = self.agent.assume_role(self.request.clone()).await;
+        if let Some(demand) = &self.demand {
+            demand.notify_one();
+        }
+        let resp = crate::cmd::authorization::assume_role_with_notice(
+            &mut self.agent,
+            self.request.clone(),
+            false,
+        )
+        .await;
         match resp {
             Ok(r) => Ok(r.into_inner()),
             Err(e) => {

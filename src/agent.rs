@@ -4,20 +4,26 @@ pub struct Agent {
     auth_flow_manager: crate::auth_flow_manager::AuthFlowManager,
     session_manager: crate::session_manager::SessionManager,
     shutdown_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    platform_helper: crate::platform::helper::HelperClient,
+    platform_helper: std::sync::Arc<crate::platform::helper::HelperClient>,
+    authorizer: crate::authorization::Authorizer,
 }
 
 impl Agent {
+    /// Needs a Tokio runtime.
     pub fn new(
         shutdown_tx: tokio::sync::oneshot::Sender<()>,
         platform_helper: crate::platform::helper::HelperClient,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, crate::policy::PolicyError> {
+        let platform_helper = std::sync::Arc::new(platform_helper);
+        let authorizer = crate::authorization::Authorizer::builtin(platform_helper.clone())?;
+        tracing::info!(authorizer = ?authorizer, "Authorization policy loaded");
+        Ok(Self {
             auth_flow_manager: crate::auth_flow_manager::AuthFlowManager::new(),
             session_manager: crate::session_manager::SessionManager::new(),
             shutdown_tx: tokio::sync::Mutex::new(Some(shutdown_tx)),
             platform_helper,
-        }
+            authorizer,
+        })
     }
 
     /// What the helper reports, with this agent's own peer verification and notes.
@@ -63,7 +69,9 @@ impl crate::proto::agent_server::Agent for Agent {
                 verified: peer.trust == crate::platform::PeerTrust::Verified,
                 pid: peer.pid,
                 start_time: peer.start_time,
+                session: describe_session(peer),
             });
+        let (grants, leases) = self.authorizer.counts();
         let agent_hardening = match crate::hardening::Hardening::state() {
             crate::hardening::HardeningState::Unhardened { .. } => HardeningState::Unhardened,
             crate::hardening::HardeningState::Hardened { .. } => HardeningState::Hardened,
@@ -74,7 +82,10 @@ impl crate::proto::agent_server::Agent for Agent {
             agent_hardening: agent_hardening.into(),
             caller,
             capabilities: Some(self.capabilities().await),
+            grants,
+            leases,
             platform_helper: self.platform_helper.describe(),
+            authorization_methods: self.authorizer.methods().await,
             profile: crate::config::Profile::current().name().to_owned(),
         }))
     }
@@ -146,13 +157,22 @@ impl crate::proto::agent_server::Agent for Agent {
                 crate::config::UserConfig::path().display()
             ))
         })?;
-        if user_config.is_role_disallowed(&server_config, role) {
-            tracing::warn!(server_id = ?query, role = ?role, "requested role is disallowed by user configuration");
-            return Err(tonic::Status::permission_denied(format!(
-                "role '{role}' is disallowed by disallow_roles in {}",
-                crate::config::UserConfig::path().display()
-            )));
-        }
+        let peer = request
+            .extensions()
+            .get::<std::sync::Arc<crate::platform::PeerIdentity>>()
+            .cloned();
+        // Before the session and cache lookups, so that a refused request fetches nothing.
+        let authorized = self
+            .authorizer
+            .authorize_assume_role(crate::authorization::Request {
+                peer: peer.as_deref(),
+                server: &server_config,
+                user_config: &user_config,
+                rolespec: &rolespec,
+                client_context: request.get_ref().client_context.as_ref(),
+            })
+            .await
+            .map_err(AuthorizationError::into_status)?;
         let Ok(session) = self.session_manager.get(query) else {
             tracing::warn!(server_id = ?query, role = ?role, "session doesn't exist, require authentication");
             return Err(tonic::Status::unauthenticated("authentication needed"));
@@ -162,6 +182,7 @@ impl crate::proto::agent_server::Agent for Agent {
 
         if cacheable && let Some(cache) = session.credential_cache.get(&rolespec) {
             tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, assume_role = ?rolespec.assume_role, aws_access_key_id = ?cache.credentials.access_key_id, ext = ?cache.credentials.mairu, "Vending credentials from cache");
+            authorized.vended(Some(cache.credentials.expiration));
             return Ok(tonic::Response::new(cache.credentials.as_ref().into()));
         }
 
@@ -218,6 +239,7 @@ impl crate::proto::agent_server::Agent for Agent {
                     r
                 };
                 tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, assume_role = ?rolespec.assume_role, aws_access_key_id = ?final_credentials.access_key_id, ext = ?final_credentials.mairu, "Vending credentials");
+                authorized.vended(Some(final_credentials.expiration));
                 Ok(tonic::Response::new((&final_credentials).into()))
             }
             Err(crate::Error::RemoteError(crate::client::Error::InvalidArgument(message, _))) => {
@@ -604,6 +626,48 @@ impl crate::proto::agent_server::Agent for Agent {
                 ))
             }
         }
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn revoke_authorizations(
+        &self,
+        request: tonic::Request<RevokeAuthorizationsRequest>,
+    ) -> Result<tonic::Response<RevokeAuthorizationsResponse>, tonic::Status> {
+        Self::require_trusted(&request)?;
+        let req = request.get_ref();
+        let session = match req.scope() {
+            revoke_authorizations_request::Scope::All => None,
+            revoke_authorizations_request::Scope::CallerSession => Some(
+                request
+                    .extensions()
+                    .get::<std::sync::Arc<crate::platform::PeerIdentity>>()
+                    .and_then(|peer| crate::platform::process().session_identity(peer)),
+            ),
+            revoke_authorizations_request::Scope::Unspecified => {
+                return Err(tonic::Status::invalid_argument("scope is required"));
+            }
+        };
+        let (revoked_grants, revoked_leases) = self.authorizer.revoke(session, req.include_leases);
+        tracing::info!(scope = ?req.scope(), session = ?session, include_leases = req.include_leases, revoked_grants, revoked_leases, "Revoked authorizations");
+        Ok(tonic::Response::new(RevokeAuthorizationsResponse {
+            revoked_grants,
+            revoked_leases,
+        }))
+    }
+}
+
+/// `PeerView.session`, e.g. `tty sid=4242 /dev/pts/3`.
+fn describe_session(peer: &crate::platform::PeerIdentity) -> String {
+    let platform = crate::platform::process();
+    match platform.session_identity(peer) {
+        Some(s @ crate::platform::SessionIdentity::Tty { .. }) => {
+            match platform.controlling_tty(peer) {
+                Some(tty) => format!("{s} {tty}"),
+                None => s.to_string(),
+            }
+        }
+        Some(s) => s.to_string(),
+        None => "none".to_owned(),
     }
 }
 

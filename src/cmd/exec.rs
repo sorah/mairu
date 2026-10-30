@@ -63,10 +63,42 @@ pub struct ExecArgs {
     /// Command line to execute.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<std::ffi::OsString>,
+
+    /// The .mairu.json that resolved an 'auto' role.
+    #[arg(skip)]
+    auto_config_path: Option<std::path::PathBuf>,
 }
 
 impl ExecArgs {
-    fn to_assume_role_request(&self, cached: bool) -> crate::proto::AssumeRoleRequest {
+    /// `prefetch` marks the sidecar's auto-refresh, which the agent never prompts for.
+    fn client_context(&self, prefetch: bool) -> crate::proto::ClientContext {
+        use std::os::unix::ffi::OsStrExt;
+        crate::proto::ClientContext {
+            intent: Some(crate::proto::client_context::Intent::Exec(
+                crate::proto::ExecIntent {
+                    command: self.command.iter().map(|a| a.as_bytes().to_vec()).collect(),
+                    mode: match self.mode {
+                        crate::config::ProviderMode::Ecs => "ecs",
+                        crate::config::ProviderMode::Static => "static",
+                    }
+                    .to_owned(),
+                    prefetch,
+                },
+            )),
+            cwd: crate::cmd::authorization::cwd(),
+            auto_config_path: self
+                .auto_config_path
+                .as_ref()
+                .map(|p| p.as_os_str().as_bytes().to_vec())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn to_assume_role_request(
+        &self,
+        cached: bool,
+        prefetch: bool,
+    ) -> crate::proto::AssumeRoleRequest {
         let query = match self.assume_role {
             Some(ref assume_role) => Some(crate::proto::assume_role_request::Query::Rolespec(
                 crate::proto::Rolespec {
@@ -87,6 +119,7 @@ impl ExecArgs {
             server_id: self.server.as_ref().unwrap().to_owned(),
             query,
             cached,
+            client_context: Some(self.client_context(prefetch)),
         }
     }
 }
@@ -254,8 +287,10 @@ async fn do_sidecar_inner(mut args: ExecArgs) -> Result<SidecarHandler, anyhow::
         }
     }
 
-    let auto_refresh_shutdown_tx = auto_refresh::start(agent.clone(), args.clone(), initial_expiry); // keep running
-    let provider = provider::start(&mut agent, &args).await?; // keep provider running
+    let demand = std::sync::Arc::new(tokio::sync::Notify::new());
+    let auto_refresh_shutdown_tx =
+        auto_refresh::start(agent.clone(), args.clone(), initial_expiry, demand.clone()); // keep running
+    let provider = provider::start(&mut agent, &args, demand).await?; // keep provider running
 
     Ok(SidecarHandler {
         auto_refresh_shutdown_tx,
@@ -299,6 +334,7 @@ async fn resolve_auto(args: &mut ExecArgs) -> Result<(), anyhow::Error> {
     }
 
     // Resolve
+    args.auto_config_path = Some(auto.path.clone());
     args.server = Some(auto.inner.server.clone());
     args.role = auto.inner.role.clone();
     if args.assume_role.is_none()
@@ -438,14 +474,17 @@ async fn preflight_check(
     agent: &mut crate::agent::AgentConn,
     args: &ExecArgs,
 ) -> Result<Option<crate::proto::AssumeRoleResponse>, anyhow::Error> {
-    let req = args.to_assume_role_request(!args.no_cache);
-    let mut resp = assume_role_with_long_attempt_notice(agent, req.clone()).await;
+    let req = args.to_assume_role_request(!args.no_cache, false);
+    let mut resp =
+        crate::cmd::authorization::assume_role_with_notice(agent, req.clone(), true).await;
 
-    if let Err(ref e) = resp {
+    if let Err(ref e) = resp
+        && crate::cmd::authorization::refusal_message(e).is_none()
+    {
         if e.code() == tonic::Code::Unauthenticated {
             login(agent, args).await?;
         }
-        resp = assume_role_with_long_attempt_notice(agent, req.clone()).await;
+        resp = crate::cmd::authorization::assume_role_with_notice(agent, req.clone(), true).await;
     }
 
     match resp {
@@ -460,6 +499,13 @@ async fn preflight_check(
             let product = env!("CARGO_PKG_NAME");
             let server_id = args.server.as_ref().unwrap();
             let role = &args.role;
+            if let Some(refusal) = crate::cmd::authorization::refusal_message(&e) {
+                crate::terminal::send(&format!(
+                    ":: {product} :: Couldn't obtain AWS credentials for {role} from {server_id}: {refusal}\n"
+                ))
+                .await;
+                return Err(crate::Error::FailureButSilentlyExit.into());
+            }
             let code = e.code();
             let message = e.message();
             crate::terminal::send(&indoc::formatdoc! {"
@@ -474,31 +520,6 @@ async fn preflight_check(
                 .await;
             }
             Err(crate::Error::FailureButSilentlyExit.into())
-        }
-    }
-}
-
-const LONG_PREFLIGHT_CHECK_DURATION: tokio::time::Duration = tokio::time::Duration::from_secs(2);
-
-async fn assume_role_with_long_attempt_notice(
-    agent: &mut crate::agent::AgentConn,
-    req: crate::proto::AssumeRoleRequest,
-) -> tonic::Result<tonic::Response<crate::proto::AssumeRoleResponse>> {
-    let resp = agent.assume_role(req.clone());
-    let sleep = tokio::time::sleep(LONG_PREFLIGHT_CHECK_DURATION);
-    let mut elapsed = false;
-    tokio::pin!(resp);
-    tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            retval = &mut resp => {
-                return retval;
-            }
-            _ = &mut sleep, if !elapsed => {
-                elapsed = true;
-                let product = env!("CARGO_PKG_NAME");
-                crate::terminal::send(&format!(":: {product} :: Waiting for AWS credentials from your remote server...")).await;
-            }
         }
     }
 }
@@ -537,10 +558,11 @@ mod provider {
     pub(super) async fn start(
         agent: &mut crate::agent::AgentConn,
         args: &ExecArgs,
+        demand: std::sync::Arc<tokio::sync::Notify>,
     ) -> Result<ProviderHandle, anyhow::Error> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let environment = match args.mode {
-            crate::config::ProviderMode::Ecs => ecs_provider_start(rx, agent, args).await?,
+            crate::config::ProviderMode::Ecs => ecs_provider_start(rx, agent, args, demand).await?,
             crate::config::ProviderMode::Static => static_provider_set(agent, args).await?,
         };
         // SAFETY: Called during process initialization before any threads are spawned.
@@ -559,13 +581,15 @@ mod provider {
         shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         agent: &mut crate::agent::AgentConn,
         args: &ExecArgs,
+        demand: std::sync::Arc<tokio::sync::Notify>,
     ) -> Result<crate::proto::ExecEnvironment, anyhow::Error> {
         let (listener, url) = crate::ecs_server::bind_tcp(None).await?;
         let server = crate::ecs_server::EcsServer::new_with_agent(
             agent.clone(),
-            args.to_assume_role_request(!args.no_cache),
+            args.to_assume_role_request(!args.no_cache, false),
             ExecEcsUserFeedback::from(args),
-        );
+        )
+        .on_demand(demand);
         let environment = {
             use crate::proto::ExecEnvironmentAction;
             use secrecy::ExposeSecret;
@@ -612,6 +636,13 @@ mod provider {
             let server = &self.server;
             let role = &self.role;
             let e = err.ui_message();
+            if let Some(refusal) = err.refusal_message() {
+                crate::terminal::send(&format!(
+                    ":: {product} :: Couldn't obtain AWS credentials for {role} from {server}: {refusal}\n"
+                ))
+                .await;
+                return;
+            }
             crate::terminal::send(&(match &err {
             crate::ecs_server::BackendRequestError::Forbidden(_) => {
                 indoc::formatdoc! {"
@@ -638,10 +669,13 @@ mod provider {
         agent: &mut crate::agent::AgentConn,
         args: &ExecArgs,
     ) -> Result<crate::proto::ExecEnvironment, anyhow::Error> {
-        let resp = agent
-            .assume_role(args.to_assume_role_request(!args.no_cache))
-            .await?
-            .into_inner();
+        let resp = crate::cmd::authorization::assume_role_with_notice(
+            agent,
+            args.to_assume_role_request(!args.no_cache, false),
+            false,
+        )
+        .await?
+        .into_inner();
         let creds = resp
             .credentials
             .ok_or_else(|| anyhow::anyhow!("agent sent empty credentials"))?;
@@ -673,12 +707,13 @@ mod auto_refresh {
         agent: crate::agent::AgentConn,
         args: ExecArgs,
         initial_expiry: Option<chrono::DateTime<chrono::Utc>>,
+        demand: std::sync::Arc<tokio::sync::Notify>,
     ) -> Option<tokio::sync::oneshot::Sender<()>> {
         match initial_expiry {
             None => None,
             Some(id) => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                tokio::spawn(auto_refresh(rx, agent, args, id));
+                tokio::spawn(auto_refresh(rx, agent, args, id, demand));
                 Some(tx)
             }
         }
@@ -693,6 +728,7 @@ mod auto_refresh {
         mut agent: crate::agent::AgentConn,
         args: ExecArgs,
         initial_expiry: chrono::DateTime<chrono::Utc>,
+        demand: std::sync::Arc<tokio::sync::Notify>,
     ) {
         let mut expiry = initial_expiry;
         //let mut expiry = chrono::Utc::now() + chrono::TimeDelta::seconds(60);
@@ -729,6 +765,22 @@ mod auto_refresh {
                             "auto_refresh shutting down due to missing expiration after renewal"
                         );
                         return;
+                    }
+                    Err(crate::Error::TonicStatusError(ref e))
+                        if crate::cmd::authorization::is_presence_required(e) =>
+                    {
+                        tracing::info!(
+                            "auto_refresh paused until the command asks for credentials"
+                        );
+                        tokio::select! {
+                            _ = &mut shutdown_rx => {
+                                tracing::debug!("auto_refresh shutting down");
+                                return;
+                            },
+                            _ = demand.notified() => {},
+                        }
+                        retries = 0;
+                        continue;
                     }
                     Err(_) => {
                         retries += 1;
@@ -789,7 +841,7 @@ mod auto_refresh {
         agent: &mut crate::agent::AgentConn,
         args: &ExecArgs,
     ) -> crate::Result<Option<chrono::DateTime<chrono::Utc>>> {
-        let req = args.to_assume_role_request(true);
+        let req = args.to_assume_role_request(true, true);
         let resp = match agent.assume_role(req.clone()).await {
             Ok(r) => r.into_inner(),
             Err(e) => {
@@ -797,7 +849,9 @@ mod auto_refresh {
                 // to max_backoff (120s). At this moment, taking the process opportunistic - let
                 // the process resume in max_backoff (at latest) after mairu agent gains a
                 // fresh access_token.
-                if e.code() != tonic::Code::Unauthenticated {
+                if e.code() != tonic::Code::Unauthenticated
+                    && !crate::cmd::authorization::is_presence_required(&e)
+                {
                     tracing::warn!(req = ?req, err = ?e, "auto_refresh failing");
                 }
                 return Err(e.into());

@@ -97,14 +97,29 @@ fn print_agent_status(
         path.display()
     );
     match &status.caller {
-        Some(c) => println!(
-            "caller   {}  pid {} start_time {}",
-            if c.verified { "verified" } else { "unverified" },
-            c.pid,
-            c.start_time
-        ),
+        Some(c) => {
+            println!(
+                "caller   {}  pid {} start_time {}",
+                if c.verified { "verified" } else { "unverified" },
+                c.pid,
+                c.start_time
+            );
+            if !c.session.is_empty() {
+                println!("session  {}", c.session);
+            }
+        }
         None => println!("caller   unknown"),
     }
+    println!(
+        "authorization  grants={} leases={} methods={}",
+        status.grants,
+        status.leases,
+        if status.authorization_methods.is_empty() {
+            "-".to_owned()
+        } else {
+            status.authorization_methods.join(",")
+        }
+    );
     if !status.platform_helper.is_empty() {
         println!("helper   {}", status.platform_helper);
     }

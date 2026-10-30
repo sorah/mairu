@@ -34,6 +34,22 @@ impl Stat {
     }
 }
 
+/// The device path of a `tty_nr` from `/proc/<pid>/stat`, for display.
+pub fn tty_path(tty_nr: i32) -> Option<String> {
+    if tty_nr == 0 {
+        return None;
+    }
+    let nr = tty_nr as u32;
+    let major = (nr >> 8) & 0xfff;
+    let minor = (nr & 0xff) | ((nr >> 12) & 0xfff00);
+    Some(match major {
+        136..=143 => format!("/dev/pts/{}", (major - 136) * 256 + minor),
+        4 if minor < 64 => format!("/dev/tty{minor}"),
+        4 => format!("/dev/ttyS{}", minor - 64),
+        _ => format!("tty {major}:{minor}"),
+    })
+}
+
 /// The real gid from the `Gid:` line of `/proc/<pid>/status`. Readable even for a non-dumpable process.
 pub fn read_real_gid(pid: u32) -> std::io::Result<u32> {
     let content = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
@@ -118,6 +134,19 @@ mod tests {
             "ppid of this process"
         );
         assert!(stat.start_time > 0);
+    }
+
+    #[test]
+    fn test_tty_path() {
+        assert_eq!(tty_path(0), None);
+        assert_eq!(tty_path(34816 + 3), Some("/dev/pts/3".to_owned()));
+        // major 136, minor 300
+        assert_eq!(
+            tty_path((136 << 8) | (300 & 0xff) | ((300 & 0xfff00) << 12)),
+            Some("/dev/pts/300".to_owned())
+        );
+        assert_eq!(tty_path((4 << 8) | 2), Some("/dev/tty2".to_owned()));
+        assert_eq!(tty_path((4 << 8) | 65), Some("/dev/ttyS1".to_owned()));
     }
 
     #[test]

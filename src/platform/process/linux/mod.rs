@@ -115,6 +115,45 @@ impl LinuxProcess {
     fn pidfd_supported() -> bool {
         peer::pidfd_open(std::process::id()).is_ok()
     }
+
+    /// Reads the peer's stat, and confirms afterwards that it was the peer's: same start time, pidfd still alive.
+    fn peer_stat(peer: &crate::platform::PeerIdentity) -> Option<procfs::Stat> {
+        use std::os::fd::AsFd;
+        let stat = procfs::Stat::read(peer.pid).ok()?;
+        if peer.start_time != 0 && stat.start_time != peer.start_time {
+            return None;
+        }
+        match &peer.pidfd {
+            Some(pidfd) if !peer::pidfd_alive(pidfd.as_fd()) => None,
+            _ => Some(stat),
+        }
+    }
+}
+
+/// The session rule over `/proc/<pid>/stat` contents; `read` looks up another pid.
+fn session_identity_from(
+    stat: &procfs::Stat,
+    read: impl Fn(i32) -> Option<procfs::Stat>,
+) -> Option<crate::platform::SessionIdentity> {
+    if stat.tty_nr != 0
+        && stat.session > 0
+        && let Some(leader) = read(stat.session)
+        && leader.session == stat.session
+    {
+        return Some(crate::platform::SessionIdentity::Tty {
+            sid: stat.session,
+            leader_start_time: leader.start_time,
+        });
+    }
+    if stat.ppid > 1
+        && let Some(parent) = read(stat.ppid)
+    {
+        return Some(crate::platform::SessionIdentity::Parent {
+            ppid: stat.ppid,
+            start_time: parent.start_time,
+        });
+    }
+    None
 }
 
 impl crate::platform::ProcessPlatform for LinuxProcess {
@@ -182,6 +221,22 @@ impl crate::platform::ProcessPlatform for LinuxProcess {
         }
         .verify(nix::unistd::geteuid().as_raw(), ppid, state)?;
         Ok(cred.pid)
+    }
+
+    fn session_identity(
+        &self,
+        peer: &crate::platform::PeerIdentity,
+    ) -> Option<crate::platform::SessionIdentity> {
+        let stat = Self::peer_stat(peer)?;
+        session_identity_from(&stat, |pid| {
+            u32::try_from(pid)
+                .ok()
+                .and_then(|p| procfs::Stat::read(p).ok())
+        })
+    }
+
+    fn controlling_tty(&self, peer: &crate::platform::PeerIdentity) -> Option<String> {
+        procfs::tty_path(Self::peer_stat(peer)?.tty_nr)
     }
 
     fn notes(&self) -> Vec<String> {
@@ -272,6 +327,79 @@ mod tests {
         // The pid now names another process, as after pid reuse.
         let err = Pinned::read(std::process::id(), pidfd).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    fn stat(session: i32, tty_nr: i32, ppid: i32, start_time: u64) -> procfs::Stat {
+        procfs::Stat {
+            ppid,
+            pgrp: session,
+            session,
+            tty_nr,
+            start_time,
+        }
+    }
+
+    #[test]
+    fn test_session_identity_tty() {
+        let peer = stat(4242, 34819, 4300, 900);
+        let id = session_identity_from(&peer, |pid| match pid {
+            4242 => Some(stat(4242, 34819, 1, 500)),
+            4300 => Some(stat(4242, 34819, 4242, 800)),
+            _ => None,
+        });
+        assert_eq!(
+            id,
+            Some(crate::platform::SessionIdentity::Tty {
+                sid: 4242,
+                leader_start_time: 500
+            })
+        );
+    }
+
+    #[test]
+    fn test_session_identity_dead_leader_falls_back_to_parent() {
+        let peer = stat(4242, 34819, 4300, 900);
+        let id = session_identity_from(&peer, |pid| match pid {
+            // A reused pid that leads another session.
+            4242 => Some(stat(5000, 0, 1, 1000)),
+            4300 => Some(stat(4242, 34819, 1, 800)),
+            _ => None,
+        });
+        assert_eq!(
+            id,
+            Some(crate::platform::SessionIdentity::Parent {
+                ppid: 4300,
+                start_time: 800
+            })
+        );
+    }
+
+    #[test]
+    fn test_session_identity_no_tty() {
+        let peer = stat(4400, 0, 777, 900);
+        let id = session_identity_from(&peer, |pid| (pid == 777).then(|| stat(4400, 0, 1, 700)));
+        assert_eq!(
+            id,
+            Some(crate::platform::SessionIdentity::Parent {
+                ppid: 777,
+                start_time: 700
+            })
+        );
+    }
+
+    #[test]
+    fn test_session_identity_none() {
+        let peer = stat(4400, 0, 1, 900);
+        assert_eq!(session_identity_from(&peer, |_| None), None);
+        let orphan = stat(4400, 0, 777, 900);
+        assert_eq!(session_identity_from(&orphan, |_| None), None);
+    }
+
+    #[test]
+    fn test_session_identity_self() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let peer = LinuxProcess::inspect(a.as_fd(), &unhardened(), euid()).unwrap();
+        assert!(LinuxProcess.session_identity(&peer).is_some());
     }
 
     #[test]

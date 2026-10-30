@@ -234,7 +234,7 @@ Debug builds (`cargo build`) use a separate `dev` profile, so a development buil
 
 The agent runs platform services (desktop prompts, notifications and the like) in a child process, `mairu platform-helper`, which holds no tokens. The two check each other, the helper exits with the agent, and the agent restarts a helper that died within 30 seconds; until then those services fail closed.
 
-`mairu doctor` shows how the client and the agent see each other, the state of the platform helper, and warns about setups that weaken them.
+`mairu doctor` shows how the client and the agent see each other, the state of the platform helper and of authorization, and warns about setups that weaken them.
 
 ## Hardening
 
@@ -251,9 +251,32 @@ sudo ./mairu harden
 
 The Debian package from the releases page is hardened on install, and needs no `harden`.
 
-`harden` creates the `mairu` system group (it must have no members), installs `/usr/local/libexec/mairu/mairu` as `root:mairu 2755` with `cap_ipc_lock`, along with the helpers shipped next to it, and creates `/var/lib/mairu`, which only hardened mairu can open. It is safe to run again. The next mairu command replaces an agent started before hardening; `mairu kill-agent` does it right away.
+`harden` creates the `mairu` system group (it must have no members), installs `/usr/local/libexec/mairu/mairu` as `root:mairu 2755` with `cap_ipc_lock`, along with the helpers shipped next to it, creates `/var/lib/mairu`, which only hardened mairu can open, and installs the polkit actions at `/usr/share/polkit-1/actions/co.0w0.mairu.policy`. It is safe to run again. The next mairu command replaces an agent started before hardening; `mairu kill-agent` does it right away.
 
 Other installations (mise, cargo, aqua, tarballs) keep working: they run the hardened copy instead of themselves, and say so when its version differs. `MAIRU_NO_HARDENED_REEXEC=1` turns this off, for development; debug builds never do it unless `MAIRU_PROFILE=default` is set. `mairu doctor` shows which mairu ran and which hardened copies exist.
+
+### Authorization
+
+A hardened agent asks a human before it hands out credentials, through polkit: the first `mairu exec` or `credential-process` for a role in a terminal shows a polkit authentication dialog, and the terminal prints what is being approved:
+
+```
+:: mairu :: Authorization may be required: 123456789012/Admin on contoso
+:: mairu ::   command: terraform apply
+:: mairu ::   cwd:     /home/u/src/infra
+:: mairu ::   from:    /dev/pts/3 (zsh, tmux pane)
+:: mairu :: Approve in the system dialog if one appears.
+```
+
+The approval is remembered in memory only, and only for that server and role:
+
+- per terminal session (a terminal tab, an SSH login, a tmux pane), for 5 minutes since its last use and 12 hours at most;
+- per running `mairu exec`, for as long as it runs, until it goes an hour without asking for credentials. Its background refresh never prompts.
+
+Callers without a terminal, such as an IDE running `credential-process`, are remembered per parent process. A new terminal asks again, and so does every request after the agent restarts.
+
+`mairu lock` makes the agent forget every approval; `--session` forgets only those of the current terminal session, and `--running` also those of running `mairu exec`, which then ask again on their next refresh.
+
+Without a polkit authentication agent for the requesting process, as in tmux over SSH without a desktop session, prompts cannot be shown and requests that need one fail. An unhardened agent never asks. `mairu doctor` shows the remembered approvals and whether polkit can be used.
 
 ### Harden home
 
@@ -293,7 +316,7 @@ Root can replace the hardened copy and read the agent's memory, so hardening pro
 
 `cargo build --release --no-default-features --features platform-helper --bin mairu-platform-helper` builds the platform helper as a standalone `mairu-platform-helper` binary, without the client and agent, for packagers that ship it separately. On Linux the agent always runs `mairu platform-helper`.
 
-Packages install `/usr/bin/mairu` as `root:mairu 2755` with `cap_ipc_lock` (setcap after chgrp, which clears file capabilities), and create `/var/lib/mairu` and `/var/lib/mairu/users` as `root:mairu 2770`. [pkg/debian/postinst](./pkg/debian/postinst) does this for the Debian package; [pkg/sysusers.d](./pkg/sysusers.d/mairu.conf) and [pkg/tmpfiles.d](./pkg/tmpfiles.d/mairu.conf) declare the group and directories for systemd distributions.
+Packages install `/usr/bin/mairu` as `root:mairu 2755` with `cap_ipc_lock` (setcap after chgrp, which clears file capabilities), create `/var/lib/mairu` and `/var/lib/mairu/users` as `root:mairu 2770`, and install [pkg/polkit/co.0w0.mairu.policy](./pkg/polkit/co.0w0.mairu.policy) into `/usr/share/polkit-1/actions/`. [pkg/debian/postinst](./pkg/debian/postinst) does this for the Debian package; [pkg/sysusers.d](./pkg/sysusers.d/mairu.conf) and [pkg/tmpfiles.d](./pkg/tmpfiles.d/mairu.conf) declare the group and directories for systemd distributions.
 
 ## Credential Server API
 

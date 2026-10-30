@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>mairu</vendor>
+  <vendor_url>https://github.com/sorah/mairu</vendor_url>
+  <action id="co.0w0.mairu.assume-role">
+    <description>Provide AWS credentials</description>
+    <message>Authentication is required to provide AWS credentials to a mairu command</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+  <action id="co.0w0.mairu.approve-policy">
+    <description>Approve mairu authorization policy</description>
+    <message>Authentication is required to approve the mairu authorization policy</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

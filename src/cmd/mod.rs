@@ -1,6 +1,8 @@
 #[cfg(feature = "cli")]
 pub mod agent;
 #[cfg(feature = "cli")]
+pub mod authorization;
+#[cfg(feature = "cli")]
 pub mod credential_process;
 #[cfg(feature = "cli")]
 pub mod doctor;
@@ -14,6 +16,8 @@ pub mod kill_agent;
 pub mod list_roles;
 #[cfg(feature = "cli")]
 pub mod list_sessions;
+#[cfg(feature = "cli")]
+pub mod lock;
 #[cfg(feature = "cli")]
 pub mod login;
 #[cfg(feature = "platform-services")]
