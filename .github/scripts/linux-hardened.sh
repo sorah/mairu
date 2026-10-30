@@ -12,7 +12,8 @@ capture() { local f; f="$(mktemp)"; "$@" >"$f" 2>&1; rc=$?; out="$(cat "$f")"; r
 
 dev=./target/debug/mairu
 hardened=/usr/local/libexec/mairu/mairu
-scratch=/opt/mairu-ci
+# /opt is world-writable on GitHub runners, which harden refuses.
+scratch=/usr/local/mairu-ci
 
 echo "--- harden"
 capture sudo "$dev" harden
