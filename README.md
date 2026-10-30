@@ -19,6 +19,9 @@ Mairu can retrieve credentials from __AWS SSO (AWS IAM Identity Center),__ or a 
 * __Homebrew Tap:__ `brew install sorah/sorah/mairu` <sup>[[tap](https://github.com/sorah/homebrew-sorah)]</sup>
 * __Arch Linux AUR:__ [mairu](https://aur.archlinux.org/packages/mairu), [mairu-bin](https://aur.archlinux.org/packages/mairu-bin)
 * __Binary:__ Binaries for Linux and macOS are available at https://github.com/sorah/mairu/releases
+  * `mairu-{x86_64,aarch64}-unknown-linux-musl.tar.gz` for Linux, `mairu-{x86_64,aarch64}-apple-darwin.tar.gz` for macOS
+  * Keep every file of the archive next to `mairu`, as it may ship helpers.
+  * Each `mairu` binary carries a GitHub artifact attestation. Verify a download with `gh attestation verify mairu --repo sorah/mairu`.
 
 ## Get started
 

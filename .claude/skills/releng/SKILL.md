@@ -40,9 +40,11 @@ If signing fails with `Inappropriate ioctl for device`, ask the user to unlock t
 
 ## 4. Release workflow
 
-The tag triggers `.github/workflows/release.yml`: test -> create-release (DRAFT, checks the tag matches `Cargo.toml`) -> upload-binaries (linux musl x86_64/aarch64 with rustls, aarch64/universal apple-darwin) and upload-debs -> publish-crate (crates.io trusted publishing, runs last).
+The tag triggers `.github/workflows/release.yml`: test -> create-release (DRAFT, checks the tag matches `Cargo.toml`) -> upload-binaries (linux musl x86_64/aarch64 with rustls, x86_64/aarch64 apple-darwin; each archive holds `mairu` and its attestation `mairu.sigstore.json`) and upload-debs (attested too) -> publish-crate (crates.io trusted publishing, runs last).
 
 Watch it (`gh run watch`). (user) The user publishes the draft release.
+
+The universal apple-darwin archive is no longer published (since the release after 0.12.0). Until done once, check that the Homebrew tap and the aqua registry (`pkgs/sorah/mairu` in aquaproj/aqua-registry) select `mairu-{x86_64,aarch64}-apple-darwin.tar.gz` instead of `mairu-universal-apple-darwin.tar.gz`, and propose updates there if not.
 
 ## 5. Homebrew (`~/git/github.com/sorah/homebrew-sorah`)
 

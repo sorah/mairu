@@ -1,7 +1,7 @@
 name: release
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   push:
@@ -20,6 +20,8 @@ jobs:
   create-release:
     needs: [test]
     runs-on: ubuntu-slim
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: extract version
@@ -53,11 +55,15 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             features: rustls
+          - target: x86_64-apple-darwin
+            os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: universal-apple-darwin
-            os: macos-latest
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -65,14 +71,25 @@ jobs:
       - uses: taiki-e/setup-cross-toolchain-action@v1
         with:
           target: "${{ matrix.target }}"
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - run: "cargo build --release --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features || 'default' }}"
+      - uses: actions/attest-build-provenance@v4
+        id: attest
         with:
-          bin: mairu
-          target: '${{ matrix.target }}'
-          tar: unix
-          no-default-features: true
-          features: ${{ matrix.features || 'default' }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          subject-path: "target/${{ matrix.target }}/release/mairu"
+      - name: create archive
+        shell: bash
+        env:
+          TARGET: "${{ matrix.target }}"
+          BUNDLE_PATH: "${{ steps.attest.outputs.bundle-path }}"
+        run: |
+          mkdir -p dist
+          cp "target/${TARGET}/release/mairu" dist/
+          cp "$BUNDLE_PATH" dist/mairu.sigstore.json
+          tar -C dist -czf "mairu-${TARGET}.tar.gz" mairu mairu.sigstore.json
+      - run: 'gh release upload "${{ github.ref_name }}" "mairu-${{ matrix.target }}.tar.gz"'
+        shell: bash
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
 
   upload-debs:
     needs: create-release
@@ -84,6 +101,10 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -101,6 +122,9 @@ jobs:
           echo 'objcopy = { path = "${{ matrix.target }}-objcopy" }' >> .cargo/config
       - run: 'cargo install cargo-deb --locked'
       - run: 'cargo deb --target=${{ matrix.target }}'
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "target/${{ matrix.target }}/debian/*.deb"
       - run: 'gh release upload "${{ github.ref_name }}" target/${{ matrix.target }}/debian/*.deb'
         shell: bash
         env:

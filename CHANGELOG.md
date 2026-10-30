@@ -1,5 +1,15 @@
 ## [not yet released]
 
+### Enhancements
+
+- Release binaries are built with link-time optimization and stripped, shrinking them by about 40%.
+- Release archives carry a GitHub artifact attestation of `mairu` as `mairu.sigstore.json`; verify with `gh attestation verify mairu --repo sorah/mairu`. Debian packages are attested too.
+
+### Miscellaneous
+
+- macOS binaries are now published per architecture as `mairu-x86_64-apple-darwin.tar.gz` and `mairu-aarch64-apple-darwin.tar.gz`. The universal binary `mairu-universal-apple-darwin.tar.gz` is no longer published.
+- The client and agent are behind a new default `cli` Cargo feature. `native-tls` and `rustls` imply it, so existing build commands such as `--no-default-features --features rustls` still build the full CLI.
+
 ## 0.12.0
 
 ### Enhancements
