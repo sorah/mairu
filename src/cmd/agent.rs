@@ -90,7 +90,7 @@ fn daemonize_reexec(
 
     tracing::debug!(arg0 = ?arg0, args = ?args, "Re-exec(2)-ing");
 
-    let err = std::process::Command::new(arg0).args(args).exec();
+    let err = crate::hardening::command(arg0).args(args).exec();
     panic!("exec(2) failed to re-exec itself after daemonize: {err}");
 }
 
@@ -192,7 +192,7 @@ async fn try_bind_or_check_liveness(
     path: &std::path::PathBuf,
     retry: bool,
 ) -> Result<tokio::net::UnixListener, anyhow::Error> {
-    match tokio::net::UnixListener::bind(path) {
+    match crate::hardening::with_privileged_gid(|| tokio::net::UnixListener::bind(path)) {
         Ok(s) => Ok(s),
         Err(e) => {
             if retry || e.kind() != std::io::ErrorKind::AddrInUse {
@@ -209,7 +209,7 @@ async fn try_bind_or_check_liveness(
 fn try_bind_or_check_liveness_std(
     path: &std::path::PathBuf,
 ) -> Result<std::os::unix::net::UnixListener, anyhow::Error> {
-    match std::os::unix::net::UnixListener::bind(path) {
+    match crate::hardening::with_privileged_gid(|| std::os::unix::net::UnixListener::bind(path)) {
         Ok(s) => Ok(s),
         Err(e) => {
             if e.kind() != std::io::ErrorKind::AddrInUse {
@@ -222,7 +222,9 @@ fn try_bind_or_check_liveness_std(
                 .unwrap();
             rt.block_on(check_liveness(path))?;
 
-            Ok(std::os::unix::net::UnixListener::bind(path)?)
+            Ok(crate::hardening::with_privileged_gid(|| {
+                std::os::unix::net::UnixListener::bind(path)
+            })?)
         }
     }
 }
@@ -285,7 +287,7 @@ async fn attempt_connect_to_agent_loop() -> Result<crate::agent::AgentConn, anyh
 
 pub async fn spawn_agent() -> Result<(), anyhow::Error> {
     let arg0 = process_path::get_executable_path().expect("Can't get executable path");
-    tokio::process::Command::new(arg0)
+    tokio::process::Command::from(crate::hardening::command(arg0))
         .args(["agent", "--log-to-file", "--daemonize"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
