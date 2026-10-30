@@ -251,20 +251,25 @@ Stack layer: `hardening/build-layout`.
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented on `hardening/build-layout`, except the follow-ups in other repositories. Implementors MUST keep this section updated as they work.
 
 ### Checklist
 
-- [ ] Release profile: LTO, one codegen unit, strip
-- [ ] `cli` feature: optional dependencies, gated modules and `Error` variants, `required-features` on `mairu`
-- [ ] CI: core library check without default features
-- [ ] Shipped helpers: `crate::helpers::locate` with its tests
-- [ ] CI: size reports with ceilings
-- [ ] Release: `x86_64-apple-darwin` and `aarch64-apple-darwin`, no universal binary
-- [ ] Release: artifact attestations; `mairu.sigstore.json` in every archive
-- [ ] README, CHANGELOG and the releng skill updated
+- [x] Release profile: LTO, one codegen unit, strip
+- [x] `cli` feature: optional dependencies, gated modules and `Error` variants, `required-features` on `mairu`
+- [x] CI: core library check without default features
+- [x] Shipped helpers: `crate::helpers::locate` with its tests
+- [x] CI: size reports with ceilings
+- [x] Release: `x86_64-apple-darwin` and `aarch64-apple-darwin`, no universal binary
+- [x] Release: artifact attestations; `mairu.sigstore.json` in every archive
+- [x] README, CHANGELOG and the releng skill updated
 - [ ] Follow-ups: release asset names in the Homebrew tap and the aqua registry
 
 ### Updates
 
 - 2026-10-29: Drafted. Sizes measured on Linux x86_64; the universal macOS binary is dropped.
+- 2026-10-31: Implemented. Release `mairu` on Linux x86_64 is 18.2 MB. Choices where the plan left room:
+  - The exec IPC helpers in `src/proto.rs` and `crate::os::set_cloexec` are only used by client code, so they are gated behind `cli` as well. `helpers` is a core module.
+  - The release workflow builds and packs archives itself instead of through `taiki-e/upload-rust-binary-action`, to attest the binary before packing. Archives hold `mairu` and `mairu.sigstore.json` at the top level, as before.
+  - Each size job writes its own table to its job summary; there is no combined table across targets.
+  - Workflows now default to `contents: read`, with write permissions granted per job.
