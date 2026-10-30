@@ -1,36 +1,61 @@
 mod error;
 pub use error::{Error, Result};
 
-pub mod ext_awssso;
-pub mod ext_axum;
-pub mod ext_oauth2;
-pub mod git;
 pub mod os;
 pub mod ppid;
+pub mod proto;
+
+#[cfg(feature = "cli")]
+pub mod ext_awssso;
+#[cfg(feature = "cli")]
+pub mod ext_axum;
+#[cfg(feature = "cli")]
+pub mod ext_oauth2;
+#[cfg(feature = "cli")]
+pub mod git;
+#[cfg(feature = "cli")]
 pub mod singleflight;
+#[cfg(feature = "cli")]
 pub mod terminal;
 
+#[cfg(feature = "cli")]
 pub mod auto;
+#[cfg(feature = "cli")]
 pub mod config;
-pub mod proto;
+#[cfg(feature = "cli")]
 pub mod token;
+#[cfg(feature = "cli")]
 pub mod utils;
 
+#[cfg(feature = "cli")]
 pub mod oauth_awssso_code;
+#[cfg(feature = "cli")]
 pub mod oauth_awssso_device_code;
+#[cfg(feature = "cli")]
 pub mod oauth_code;
+#[cfg(feature = "cli")]
 pub mod oauth_device_code;
+#[cfg(feature = "cli")]
 pub mod oauth_refresh_token;
 
+#[cfg(feature = "cli")]
 pub mod api_client;
+#[cfg(feature = "cli")]
 pub mod awssso_client;
+#[cfg(feature = "cli")]
 pub mod client;
 
+#[cfg(feature = "cli")]
 pub mod auth_flow_manager;
+#[cfg(feature = "cli")]
 pub mod credential_cache;
+#[cfg(feature = "cli")]
 pub mod session_manager;
 
+#[cfg(feature = "cli")]
 pub mod agent;
+#[cfg(feature = "cli")]
 pub mod ecs_server;
 
+#[cfg(feature = "cli")]
 pub mod cmd;

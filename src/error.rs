@@ -27,6 +27,7 @@ pub enum Error {
     #[error("AuthNotReadyError: flow not yet ready")]
     AuthNotReadyError { slow_down: bool },
 
+    #[cfg(feature = "cli")]
     #[error(transparent)]
     OAuth2RequestTokenError(
         #[from]
@@ -36,6 +37,7 @@ pub enum Error {
         >,
     ),
 
+    #[cfg(feature = "cli")]
     #[error(transparent)]
     HyperError(#[from] hyper::Error),
 
@@ -45,12 +47,15 @@ pub enum Error {
     #[error(transparent)]
     TonicStatusError(#[from] tonic::Status),
 
+    #[cfg(feature = "cli")]
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
 
+    #[cfg(feature = "cli")]
     #[error(transparent)]
     AwsSsooidcError(#[from] Box<aws_sdk_ssooidc::Error>),
 
+    #[cfg(feature = "cli")]
     #[error(transparent)]
     RemoteError(#[from] crate::client::Error),
 
