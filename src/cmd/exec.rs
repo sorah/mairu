@@ -30,6 +30,10 @@ pub struct ExecArgs {
     #[arg(long)]
     oauth_grant_type: Option<crate::config::OAuthGrantType>,
 
+    /// Print the authorize URL of a login without opening it in a browser.
+    #[arg(long, default_value_t = false)]
+    no_browser: bool,
+
     /// Skip obtaining credentials before executing a command to verify valid configuration is given.
     /// Implies --no-auto-refresh.
     #[arg(long, default_value_t = false)]
@@ -129,6 +133,7 @@ impl ExecArgs {
 #[cfg(unix)]
 pub fn run(args: &ExecArgs) -> Result<(), anyhow::Error> {
     crate::config::trust_dir_mkpath()?;
+    crate::convenience::Settings::init(args.no_browser);
 
     // mairu-exec spawns a credential provider in a child process; we call it 'sidecar'.
     // The specified command will be execvp(2)'d in a parent process; we call it 'executor'.
@@ -531,6 +536,7 @@ async fn login(agent: &mut crate::agent::AgentConn, args: &ExecArgs) -> Result<(
     if !args.no_login {
         let login_args = crate::cmd::login::LoginArgs {
             oauth_grant_type: args.oauth_grant_type,
+            no_browser: args.no_browser,
             server_name: args.server.as_ref().unwrap().to_owned(),
         };
         crate::cmd::login::login(agent, &login_args).await
@@ -589,7 +595,11 @@ mod provider {
         let server = crate::ecs_server::EcsServer::new_with_agent(
             agent.clone(),
             args.to_assume_role_request(!args.no_cache, false),
-            ExecEcsUserFeedback::from(args),
+            ExecEcsUserFeedback {
+                role: args.role.clone(),
+                server: args.server.as_ref().unwrap().to_owned(),
+                agent: agent.clone(),
+            },
         )
         .on_demand(demand);
         let environment = {
@@ -621,15 +631,7 @@ mod provider {
     struct ExecEcsUserFeedback {
         role: String,
         server: String,
-    }
-
-    impl From<&ExecArgs> for ExecEcsUserFeedback {
-        fn from(a: &ExecArgs) -> Self {
-            Self {
-                role: a.role.clone(),
-                server: a.server.as_ref().unwrap().to_owned(),
-            }
-        }
+        agent: crate::agent::AgentConn,
     }
 
     impl crate::ecs_server::UserFeedbackDelegate for ExecEcsUserFeedback {
@@ -644,6 +646,13 @@ mod provider {
                 ))
                 .await;
                 return;
+            }
+            if let crate::ecs_server::BackendRequestError::Unauthorized(_) = err {
+                crate::convenience::notify(
+                    &self.agent,
+                    crate::convenience::Notification::login_required(server),
+                )
+                .await;
             }
             crate::terminal::send(&(match &err {
             crate::ecs_server::BackendRequestError::Forbidden(_) => {
@@ -847,6 +856,15 @@ mod auto_refresh {
         let resp = match agent.assume_role(req.clone()).await {
             Ok(r) => r.into_inner(),
             Err(e) => {
+                if e.code() == tonic::Code::Unauthenticated {
+                    crate::convenience::notify(
+                        agent,
+                        crate::convenience::Notification::login_required(&req.server_id),
+                    )
+                    .await;
+                } else {
+                    crate::convenience::notify_refusal(agent, &req, &e).await;
+                }
                 // When remote access_token is expired, it would lead auto_refresh process backoff
                 // to max_backoff (120s). At this moment, taking the process opportunistic - let
                 // the process resume in max_backoff (at latest) after mairu agent gains a

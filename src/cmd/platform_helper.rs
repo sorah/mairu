@@ -191,9 +191,11 @@ impl HelperService {
 impl crate::proto::platform::platform_helper_server::PlatformHelper for HelperService {
     async fn get_capabilities(
         &self,
-        _request: tonic::Request<crate::proto::platform::GetCapabilitiesRequest>,
+        request: tonic::Request<crate::proto::platform::GetCapabilitiesRequest>,
     ) -> Result<tonic::Response<crate::proto::platform::Capabilities>, tonic::Status> {
-        Ok(tonic::Response::new(self.services.capabilities().await))
+        Ok(tonic::Response::new(
+            self.services.capabilities(request.into_inner()).await,
+        ))
     }
 
     async fn authorize(

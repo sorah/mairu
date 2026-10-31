@@ -175,6 +175,46 @@ pub struct UserConfig {
     /// Prefix of the hardened copy, `<harden_home>/libexec/mairu/mairu`. `MAIRU_HARDEN_HOME` overrides it.
     #[serde(default)]
     pub harden_home: Option<std::path::PathBuf>,
+    /// How this client opens URLs, such as the authorize URL of `mairu login`.
+    #[serde(default)]
+    pub open_url: ConvenienceConfig,
+    /// How this client posts desktop notifications.
+    #[serde(default)]
+    pub notify: ConvenienceConfig,
+}
+
+/// `open_url` and `notify` in config.json. `command` is an argv, required when `mode` is `command`.
+#[derive(serde::Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct ConvenienceConfig {
+    #[serde(default)]
+    pub mode: Option<ConvenienceMode>,
+    #[serde(default)]
+    pub command: Vec<String>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConvenienceMode {
+    Auto,
+    Agent,
+    Command,
+    None,
+}
+
+impl std::str::FromStr for ConvenienceMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "agent" => Ok(Self::Agent),
+            "command" => Ok(Self::Command),
+            "none" => Ok(Self::None),
+            _ => Err(format!(
+                "unknown mode {s:?}; expected auto, agent, command or none"
+            )),
+        }
+    }
 }
 
 #[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -853,6 +893,24 @@ mod tests {
             serde_json::from_str(r#"{"harden_suggestion": {"enabled": false}}"#).unwrap();
         assert!(!config.harden_suggestion.enabled);
         assert_eq!(config.harden_suggestion.interval_secs, 3600);
+    }
+
+    #[test]
+    fn test_convenience_settings() {
+        let config: UserConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.open_url, ConvenienceConfig::default());
+        assert_eq!(config.notify.mode, None);
+
+        let config: UserConfig = serde_json::from_str(
+            r#"{"open_url": {"mode": "command", "command": ["my-open-url", "--new"]}, "notify": {"mode": "none"}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.open_url.mode, Some(ConvenienceMode::Command));
+        assert_eq!(config.open_url.command, vec!["my-open-url", "--new"]);
+        assert_eq!(config.notify.mode, Some(ConvenienceMode::None));
+        assert!(serde_json::from_str::<UserConfig>(r#"{"notify": {"mode": "bogus"}}"#).is_err());
+        assert_eq!("agent".parse(), Ok(ConvenienceMode::Agent));
+        assert!("Agent".parse::<ConvenienceMode>().is_err());
     }
 
     #[test]

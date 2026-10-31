@@ -236,6 +236,51 @@ The agent runs platform services (desktop prompts, notifications and the like) i
 
 `mairu doctor` shows how the client and the agent see each other, the state of the platform helper and of authorization, and warns about setups that weaken them.
 
+### Browser and notifications
+
+`mairu login` (and the login inside `mairu exec`) opens the authorize URL in your browser, and clients post a desktop notification when a `mairu exec` needs a login (once per server per 10 minutes), when a request from an AI agent is refused (once per role per minute), and when the policy is in lockdown (once per agent). The URL and messages are printed on the terminal either way.
+
+Each client chooses how, separately for `open_url` and `notify`:
+
+| Mode | Behavior |
+|---|---|
+| `auto` (default) | `open_url`: `$BROWSER` when set, otherwise `agent`. `notify`: `agent`. |
+| `agent` | The agent's platform helper opens the URL through the desktop portal (or `xdg-open`) and posts through `org.freedesktop.Notifications`, on the desktop session of the requesting client. Over SSH without a display, nothing happens. |
+| `command` | Runs your own program. |
+| `none` | Disabled. |
+
+`--no-browser` on `mairu login` and `mairu exec`, then `MAIRU_OPEN_URL` / `MAIRU_NOTIFY`, then `config.json`, choose the mode:
+
+```jsonc
+{
+    "open_url": {"mode": "command", "command": ["my-open-url"]},
+    "notify": {"mode": "none"}
+}
+```
+
+`MAIRU_OPEN_URL_COMMAND` / `MAIRU_NOTIFY_COMMAND` hold a shell command line and imply `command` mode. A program receives the URL as its last argument, or a notification's title and body as its last two, with `MAIRU_NOTIFY_URGENCY` (`low`, `normal`, `critical`) and `MAIRU_NOTIFY_EVENT` (`login-required`, `ai-agent-denied`, `policy-lockdown`) set. Only `http` and `https` URLs are ever opened. Programs run without the `mairu` group and are not waited on for more than 5 seconds.
+
+```sh
+# A notify-send wrapper
+export MAIRU_NOTIFY_COMMAND='notify-send --app-name=mairu --urgency="$MAIRU_NOTIFY_URGENCY"'
+
+# tmux over SSH: show notifications in the status line
+export MAIRU_NOTIFY_COMMAND='tmux display-message -d 10000'
+
+# tmux over SSH: open URLs on your laptop, which listens with
+#   socat UNIX-LISTEN:$HOME/.open-url.sock,fork EXEC:'xargs -n1 open'
+# and connects with `ssh -R /home/you/.open-url.sock:$HOME/.open-url.sock host`
+export MAIRU_OPEN_URL_COMMAND='~/bin/open-url-remote'
+```
+
+```sh
+#!/bin/sh
+# ~/bin/open-url-remote
+printf '%s\n' "$1" | socat - "UNIX-CONNECT:$HOME/.open-url.sock"
+```
+
+`mairu doctor` shows the mode of each and whether the agent can deliver to your session.
+
 ## Hardening
 
 On Linux, `mairu harden` lets the agent tell genuine mairu clients apart from other programs running as you. It installs a root-owned copy of mairu, setgid to a dedicated `mairu` group, and every mairu command then runs through that copy. Root is needed once per host, and again for upgrades.

@@ -213,11 +213,14 @@ fn status_failure(status: tonic::Status) -> Failure {
 
 #[async_trait::async_trait]
 impl crate::platform::PlatformServices for HelperClient {
-    async fn capabilities(&self) -> crate::proto::platform::Capabilities {
+    async fn capabilities(
+        &self,
+        req: crate::proto::platform::GetCapabilitiesRequest,
+    ) -> crate::proto::platform::Capabilities {
         let Ok((_, mut client)) = self.client() else {
             return crate::proto::platform::Capabilities::default();
         };
-        let call = client.get_capabilities(crate::proto::platform::GetCapabilitiesRequest {});
+        let call = client.get_capabilities(req);
         match tokio::time::timeout(CAPABILITIES_TIMEOUT, call).await {
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
@@ -487,7 +490,7 @@ async fn handshake(stream: std::os::unix::net::UnixStream) -> Result<HelperRpc, 
         .await?;
     let mut client = HelperRpc::new(channel);
     client
-        .get_capabilities(crate::proto::platform::GetCapabilitiesRequest {})
+        .get_capabilities(crate::proto::platform::GetCapabilitiesRequest::default())
         .await?;
     Ok(client)
 }
@@ -549,7 +552,7 @@ mod tests {
         );
         assert_eq!(resp.reason, reason, "{}", resp.detail);
         assert_eq!(
-            helper.capabilities().await,
+            helper.capabilities(Default::default()).await,
             crate::proto::platform::Capabilities::default()
         );
         let verify = helper

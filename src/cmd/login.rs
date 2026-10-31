@@ -4,12 +4,17 @@ pub struct LoginArgs {
     #[arg(long)]
     pub oauth_grant_type: Option<crate::config::OAuthGrantType>,
 
+    /// Print the authorize URL without opening it in a browser.
+    #[arg(long, default_value_t = false)]
+    pub no_browser: bool,
+
     /// Credential server ID or URL to use.
     pub server_name: String,
 }
 
 #[tokio::main]
 pub async fn run(args: &LoginArgs) -> Result<(), anyhow::Error> {
+    crate::convenience::Settings::init(args.no_browser);
     let mut agent = crate::cmd::agent::connect_or_start().await?;
     login(&mut agent, args).await
 }
@@ -55,14 +60,17 @@ pub async fn login(
     tracing::debug!(oauth_grant_type = ?oauth_grant_type, server = ?server, "Using OAuth");
 
     match oauth_grant_type {
-        crate::config::OAuthGrantType::Code => do_oauth_code(agent, server).await,
-        crate::config::OAuthGrantType::DeviceCode => do_oauth_device_code(agent, server).await,
+        crate::config::OAuthGrantType::Code => do_oauth_code(agent, server, args.no_browser).await,
+        crate::config::OAuthGrantType::DeviceCode => {
+            do_oauth_device_code(agent, server, args.no_browser).await
+        }
     }
 }
 
 pub async fn do_oauth_code(
     agent: &mut crate::agent::AgentConn,
     server: crate::config::Server,
+    no_browser: bool,
 ) -> Result<(), anyhow::Error> {
     let (path, mut local_port, use_localhost) = if let Some(ref aws_sso) = server.aws_sso {
         ("/oauth/callback", aws_sso.local_port, false)
@@ -121,6 +129,7 @@ pub async fn do_oauth_code(
         :: {product} ::
     "})
     .await;
+    open_in_browser(agent, short_authorize_url.as_str(), no_browser);
 
     crate::oauth_code::listen_for_callback(listener, session, agent, auth_route).await?;
     tracing::info!("Logged in");
@@ -130,6 +139,7 @@ pub async fn do_oauth_code(
 pub async fn do_oauth_device_code(
     agent: &mut crate::agent::AgentConn,
     server: crate::config::Server,
+    no_browser: bool,
 ) -> Result<(), anyhow::Error> {
     if server.aws_sso.is_none() {
         server.try_oauth_device_code_grant()?;
@@ -160,6 +170,7 @@ pub async fn do_oauth_device_code(
         :: {product} ::
     "})
     .await;
+    open_in_browser(agent, authorize_url, no_browser);
 
     let mut interval = session.interval as u64;
     loop {
@@ -187,6 +198,16 @@ pub async fn do_oauth_device_code(
 
     tracing::info!("Logged in");
     Ok(())
+}
+
+/// Opens the authorize URL alongside the login, which never waits for it.
+fn open_in_browser(agent: &crate::agent::AgentConn, url: &str, no_browser: bool) {
+    if no_browser {
+        return;
+    }
+    let agent = agent.clone();
+    let url = url.to_owned();
+    tokio::spawn(async move { crate::convenience::open_url(&agent, &url).await });
 }
 
 async fn get_server(

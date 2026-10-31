@@ -12,6 +12,143 @@ pub mod platform {
             }
         }
     }
+
+    /// Bytes a notification title is cut to.
+    pub const MAX_NOTIFICATION_TITLE: usize = 256;
+    /// Bytes a notification body is cut to.
+    pub const MAX_NOTIFICATION_BODY: usize = 1024;
+
+    impl OpenUrlRequest {
+        /// Only http(s) URLs are opened, so a URL cannot name a local file or an application.
+        pub fn checked_url(&self) -> Result<url::Url, String> {
+            let parsed = url::Url::parse(&self.url).map_err(|e| format!("invalid URL: {e}"))?;
+            match parsed.scheme() {
+                "http" | "https" => Ok(parsed),
+                scheme => Err(format!("refusing to open a {scheme}: URL")),
+            }
+        }
+    }
+
+    impl OpenUrlResponse {
+        pub fn failed(detail: impl Into<String>) -> Self {
+            Self {
+                opened: false,
+                detail: detail.into(),
+            }
+        }
+    }
+
+    impl NotifyRequest {
+        /// Cuts the title and body to [`MAX_NOTIFICATION_TITLE`] and [`MAX_NOTIFICATION_BODY`] bytes.
+        pub fn truncate(&mut self) {
+            truncate_utf8(&mut self.title, MAX_NOTIFICATION_TITLE);
+            truncate_utf8(&mut self.body, MAX_NOTIFICATION_BODY);
+        }
+    }
+
+    impl SessionHint {
+        /// This process's desktop session, from its environment.
+        pub fn current() -> Self {
+            let var = |name: &str| std::env::var(name).unwrap_or_default();
+            Self {
+                display: var("DISPLAY"),
+                wayland_display: var("WAYLAND_DISPLAY"),
+                dbus_session_bus_address: var("DBUS_SESSION_BUS_ADDRESS"),
+                ssh: ["SSH_CONNECTION", "SSH_TTY"]
+                    .into_iter()
+                    .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty())),
+            }
+        }
+
+        /// Why nothing should be shown in this session: SSH without a display, or no display at all.
+        pub fn refusal(&self) -> Option<&'static str> {
+            if !self.display.is_empty() || !self.wayland_display.is_empty() {
+                None
+            } else if self.ssh {
+                Some("the client is in an SSH session without a display")
+            } else {
+                Some("the client has no display")
+            }
+        }
+    }
+
+    fn truncate_utf8(s: &mut String, max: usize) {
+        if s.len() <= max {
+            return;
+        }
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_checked_url() {
+            let req = |url: &str| OpenUrlRequest {
+                url: url.to_owned(),
+                session: None,
+            };
+            assert!(
+                req("https://example.com/device?code=ABCD")
+                    .checked_url()
+                    .is_ok()
+            );
+            assert!(req("http://localhost:8080/").checked_url().is_ok());
+            assert!(req("file:///etc/passwd").checked_url().is_err());
+            assert!(req("x-apple.systempreferences:").checked_url().is_err());
+            assert!(req("javascript:alert(1)").checked_url().is_err());
+            assert!(req("not a url").checked_url().is_err());
+        }
+
+        #[test]
+        fn test_notify_truncate() {
+            let mut req = NotifyRequest {
+                title: "t".repeat(300),
+                body: "\u{3042}".repeat(400),
+                ..Default::default()
+            };
+            req.truncate();
+            assert_eq!(req.title.len(), MAX_NOTIFICATION_TITLE);
+            // 3-byte characters: cut at the last boundary below the limit.
+            assert_eq!(req.body.len(), 1023);
+            assert!(req.body.chars().all(|c| c == '\u{3042}'));
+            let mut short = NotifyRequest {
+                title: "hello".to_owned(),
+                body: "world".to_owned(),
+                ..Default::default()
+            };
+            short.truncate();
+            assert_eq!(
+                (short.title.as_str(), short.body.as_str()),
+                ("hello", "world")
+            );
+        }
+
+        #[test]
+        fn test_session_hint_refusal() {
+            let hint = |display: &str, wayland: &str, ssh: bool| SessionHint {
+                display: display.to_owned(),
+                wayland_display: wayland.to_owned(),
+                dbus_session_bus_address: String::new(),
+                ssh,
+            };
+            assert_eq!(hint(":0", "", false).refusal(), None);
+            assert_eq!(hint("", "wayland-0", true).refusal(), None);
+            assert_eq!(hint(":10", "", true).refusal(), None);
+            assert!(hint("", "", true).refusal().unwrap().contains("SSH"));
+            assert!(
+                hint("", "", false)
+                    .refusal()
+                    .unwrap()
+                    .contains("no display")
+            );
+        }
+    }
 }
 
 impl Credentials {

@@ -83,7 +83,11 @@ impl std::fmt::Display for SessionIdentity {
 /// run inside the platform helper.
 #[async_trait::async_trait]
 pub trait PlatformServices: Send + Sync + std::fmt::Debug {
-    async fn capabilities(&self) -> crate::proto::platform::Capabilities;
+    /// `req.session` is the requesting client's session, which notifications and open_url depend on.
+    async fn capabilities(
+        &self,
+        req: crate::proto::platform::GetCapabilitiesRequest,
+    ) -> crate::proto::platform::Capabilities;
 
     async fn authorize(
         &self,

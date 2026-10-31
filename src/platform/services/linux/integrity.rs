@@ -285,7 +285,7 @@ struct Keyring {
 
 impl Keyring {
     async fn open() -> Result<Self, String> {
-        let address = session_bus_address()?;
+        let address = crate::platform::services::session_bus::default_address()?;
         let conn = zbus::connection::Builder::address(address.as_str())
             .build()
             .await
@@ -428,30 +428,6 @@ impl Attributes {
     fn label(&self) -> String {
         format!("mairu {} record (uid {})", self.name, self.uid)
     }
-}
-
-/// `$DBUS_SESSION_BUS_ADDRESS` on an unhardened helper, otherwise `$XDG_RUNTIME_DIR/bus`.
-fn session_bus_address() -> Result<String, String> {
-    session_bus_address_for(
-        crate::hardening::Hardening::marker().is_some(),
-        std::env::var("DBUS_SESSION_BUS_ADDRESS").ok(),
-        std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from),
-    )
-}
-
-fn session_bus_address_for(
-    hardened: bool,
-    env: Option<String>,
-    runtime_dir: Option<std::path::PathBuf>,
-) -> Result<String, String> {
-    if !hardened && let Some(address) = env.filter(|a| !a.is_empty()) {
-        return Ok(address);
-    }
-    let socket = runtime_dir.ok_or("XDG_RUNTIME_DIR is not set")?.join("bus");
-    if !socket.exists() {
-        return Err(format!("no session bus at {}", socket.display()));
-    }
-    Ok(format!("unix:path={}", socket.display()))
 }
 
 /// The item in the default Secret Service collection. Same-user code can read and rewrite it.
@@ -694,22 +670,5 @@ mod tests {
             S::Unavailable
         );
         assert_eq!(store.record(1000, "policy", "{}").status(), S::Unavailable);
-    }
-
-    #[test]
-    fn test_session_bus_address() {
-        let root = TempDir::new("bus");
-        let env = Some("unix:path=/tmp/fake".to_owned());
-        assert_eq!(
-            session_bus_address_for(false, env.clone(), None).unwrap(),
-            "unix:path=/tmp/fake"
-        );
-        assert!(session_bus_address_for(true, env.clone(), Some(root.0.clone())).is_err());
-        std::fs::write(root.0.join("bus"), b"").unwrap();
-        assert_eq!(
-            session_bus_address_for(true, env, Some(root.0.clone())).unwrap(),
-            format!("unix:path={}/bus", root.0.display())
-        );
-        assert!(session_bus_address_for(true, None, None).is_err());
     }
 }

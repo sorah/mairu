@@ -27,11 +27,17 @@ impl Agent {
         })
     }
 
-    /// What the helper reports, with this agent's own peer verification and notes.
-    async fn capabilities(&self) -> crate::proto::platform::Capabilities {
+    /// What the helper reports for the client's `session`, with this agent's own peer verification and notes.
+    async fn capabilities(
+        &self,
+        session: Option<crate::proto::platform::SessionHint>,
+    ) -> crate::proto::platform::Capabilities {
         use crate::platform::PlatformServices;
         let platform = crate::platform::process();
-        let mut capabilities = self.platform_helper.capabilities().await;
+        let mut capabilities = self
+            .platform_helper
+            .capabilities(crate::proto::platform::GetCapabilitiesRequest { session })
+            .await;
         capabilities.peer_verification = platform.peer_verification().into();
         let mut notes = platform.notes();
         notes.append(&mut capabilities.notes);
@@ -161,7 +167,7 @@ impl crate::proto::agent_server::Agent for Agent {
             version: crate::version::VERSION.to_owned(),
             agent_hardening: agent_hardening.into(),
             caller,
-            capabilities: Some(self.capabilities().await),
+            capabilities: Some(self.capabilities(request.get_ref().session.clone()).await),
             grants,
             leases,
             platform_helper: self.platform_helper.describe(),
@@ -801,6 +807,47 @@ impl crate::proto::agent_server::Agent for Agent {
     }
 
     #[tracing::instrument(skip_all)]
+    async fn open_url(
+        &self,
+        request: tonic::Request<crate::proto::platform::OpenUrlRequest>,
+    ) -> Result<tonic::Response<crate::proto::platform::OpenUrlResponse>, tonic::Status> {
+        use crate::platform::PlatformServices;
+        Self::require_trusted(&request)?;
+        let req = request.into_inner();
+        if let Err(detail) = req.checked_url() {
+            return Ok(tonic::Response::new(
+                crate::proto::platform::OpenUrlResponse::failed(detail),
+            ));
+        }
+        let resp = self.platform_helper.open_url(req).await;
+        tracing::debug!(
+            opened = resp.opened,
+            detail = resp.detail,
+            "Asked the platform helper to open a URL"
+        );
+        Ok(tonic::Response::new(resp))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn notify(
+        &self,
+        request: tonic::Request<crate::proto::platform::NotifyRequest>,
+    ) -> Result<tonic::Response<crate::proto::platform::NotifyResponse>, tonic::Status> {
+        use crate::platform::PlatformServices;
+        Self::require_trusted(&request)?;
+        let mut req = request.into_inner();
+        req.truncate();
+        let event = req.event.clone();
+        let resp = self.platform_helper.notify(req).await;
+        tracing::debug!(
+            event,
+            delivered = resp.delivered,
+            "Asked the platform helper to post a notification"
+        );
+        Ok(tonic::Response::new(resp))
+    }
+
+    #[tracing::instrument(skip_all)]
     async fn unmark_tools(
         &self,
         request: tonic::Request<UnmarkToolsRequest>,
@@ -1373,6 +1420,7 @@ pub async fn connect_to_agent_with_path(
             crate::policy::files::LOCKDOWN_WARNING
         ))
         .await;
+        crate::convenience::notify_lockdown(&conn).await;
     }
 
     Ok(conn)

@@ -877,7 +877,7 @@ impl Shared {
     }
 
     async fn platform_usable(&self) -> Result<(), String> {
-        let caps = self.services.capabilities().await;
+        let caps = self.services.capabilities(Default::default()).await;
         match caps.authorization() {
             crate::proto::platform::AuthorizationFacility::None
             | crate::proto::platform::AuthorizationFacility::Unspecified => {
@@ -2044,7 +2044,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::platform::PlatformServices for MockServices {
-        async fn capabilities(&self) -> crate::proto::platform::Capabilities {
+        async fn capabilities(
+            &self,
+            _req: crate::proto::platform::GetCapabilitiesRequest,
+        ) -> crate::proto::platform::Capabilities {
             crate::proto::platform::Capabilities {
                 authorization: self.facility.into(),
                 ..Default::default()

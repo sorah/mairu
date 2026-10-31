@@ -28,7 +28,7 @@ async fn test_helper_starts_verified_and_serves() {
         "{description}"
     );
     // Polkit or not depends on the host.
-    let caps = helper.capabilities().await;
+    let caps = helper.capabilities(Default::default()).await;
     assert_ne!(
         caps.authorization(),
         mairu::proto::platform::AuthorizationFacility::Unspecified

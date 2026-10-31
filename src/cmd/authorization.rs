@@ -169,7 +169,7 @@ pub async fn assume_role_with_notice(
 ) -> tonic::Result<tonic::Response<crate::proto::AssumeRoleResponse>> {
     let relay = crate::ssh_agent_presence::Relay::from_env();
     let notice = |refusal: &crate::proto::AuthorizationError| password_notice(&req, refusal);
-    crate::polkit_tty_agent::with_fallback(notice, |attempt| {
+    let resp = crate::polkit_tty_agent::with_fallback(notice, |attempt| {
         let agent = agent.clone();
         let req = req.clone();
         let relay = relay.clone();
@@ -196,7 +196,11 @@ pub async fn assume_role_with_notice(
                 .await
         }
     })
-    .await
+    .await;
+    if let Err(e) = &resp {
+        crate::convenience::notify_refusal(agent, &req, e).await;
+    }
+    resp
 }
 
 /// Calls `AssumeRole` printing nothing unless it falls back to a password prompt on this terminal. Challenges are
@@ -207,7 +211,7 @@ pub async fn assume_role_quietly(
 ) -> tonic::Result<tonic::Response<crate::proto::AssumeRoleResponse>> {
     let relay = crate::ssh_agent_presence::Relay::from_env();
     let notice = |refusal: &crate::proto::AuthorizationError| password_notice(&req, refusal);
-    crate::polkit_tty_agent::with_fallback(notice, |_| {
+    let resp = crate::polkit_tty_agent::with_fallback(notice, |_| {
         let agent = agent.clone();
         let req = req.clone();
         let relay = relay.clone();
@@ -225,7 +229,11 @@ pub async fn assume_role_quietly(
                 .await
         }
     })
-    .await
+    .await;
+    if let Err(e) = &resp {
+        crate::convenience::notify_refusal(agent, &req, e).await;
+    }
+    resp
 }
 
 fn ssh_agent_notice(
