@@ -69,6 +69,8 @@ cli = [
   "dep:sigstore-trust-root",
   "dep:sigstore-verify",
   "dep:snap",
+  "dep:ssh-encoding",
+  "dep:ssh-key",
   "dep:tracing-appender",
   "platform-services",
   "tokio/full",
@@ -148,6 +150,9 @@ tracing-subscriber = { version = "0.3.22", features = ["fmt", "env-filter"] }
 url = { version = "2.5.7", features = ["serde"] }
 zeroize = { version = "1.8.2", features = ["std", "aarch64", "zeroize_derive", "serde", "derive"] }
 shadow-rs = { version = "2", default-features = false }
+# ssh-agent presence: SSHSIG verification and the agent protocol.
+ssh-encoding = { version = "0.2.0", features = ["std"], optional = true }
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519", "p256", "p384", "p521", "rsa"], optional = true }
 
 # `mairu harden --from` verifies release attestations.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -160,3 +165,9 @@ zbus_polkit = { version = "6.0.0", default-features = false, features = ["tokio"
 
 [target.'cfg(any(target_os = "freebsd", target_os = "dragonfly"))'.dependencies]
 rustix = { version = "1.1.2", default-features = false, features = ["std", "process"] }
+
+[dev-dependencies]
+# Signature fixtures for sk- keys, which no SSH agent library signs without hardware.
+ed25519-dalek = "2.2.0"
+p256 = { version = "0.13.2", features = ["ecdsa"] }
+signature = "2.2.0"

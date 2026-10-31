@@ -109,10 +109,26 @@ pub async fn run_unlock(args: &UnlockArgs) -> Result<(), anyhow::Error> {
             ":: {product} :: Approve removing the tool marks of {tty} ({labels}).\n:: {product} :: Enter your password below.\n"
         )
     };
+    let relay = crate::ssh_agent_presence::Relay::from_env();
+    let signature_notice = |_: &crate::proto::AuthorizationError, comment: &str| {
+        format!(
+            ":: {product} :: Approve the signature on your SSH agent ({comment}) to remove the tool marks of {tty} ({labels})\n"
+        )
+    };
     let resp = crate::polkit_tty_agent::with_fallback(notice, |_| {
-        let mut agent = agent.clone();
+        let agent = agent.clone();
         let req = req.clone();
-        async move { agent.unmark_tools(req).await }
+        let relay = relay.clone();
+        async move {
+            relay
+                .with_challenges(signature_notice, |response| {
+                    let mut agent = agent.clone();
+                    let mut req = req.clone();
+                    crate::ssh_agent_presence::set_response(&mut req.client_context, response);
+                    async move { agent.unmark_tools(req).await }
+                })
+                .await
+        }
     })
     .await;
     let remaining = match resp {

@@ -105,6 +105,8 @@ message ClientContext {
   bytes cwd = 3;
   bytes auto_config_path = 4;      // .mairu.json path when role = auto
   repeated string env_names = 5;   // names only, never values; used for tool detection
+  // The answer to a challenge of the previous attempt; excluded from the request digest.
+  AuthorizationResponse authorization_response = 6;
 }
 
 message ExecIntent {
@@ -311,16 +313,49 @@ message AuthorizationError {
     REASON_FORBIDDEN = 3;                // PERMISSION_DENIED: a forbid policy, or disallow_roles
     REASON_NOT_PERMITTED = 4;            // PERMISSION_DENIED: no permit applies, even after a human check
     REASON_UNAVAILABLE = 5;              // FAILED_PRECONDITION: no method could ask the human
+    REASON_CHALLENGE = 6;                // FAILED_PRECONDITION: sign `challenge` and retry with the same request
     REASON_NO_AUTHENTICATION_AGENT = 7;  // FAILED_PRECONDITION: polkit has no agent for the requesting process
+    REASON_INVALID_RESPONSE = 8;         // PERMISSION_DENIED: a bad, expired or replayed challenge response
     REASON_PRESENCE_REQUIRED = 9;        // FAILED_PRECONDITION: pre-fetch needs a fresh check; nobody was asked
     REASON_CHECK_PENDING = 10;           // FAILED_PRECONDITION: a policy approval waits for its check; the detail names its terminal
   }
   Reason reason = 1;
   string detail = 2;
+  AuthorizationChallenge challenge = 3;  // for REASON_CHALLENGE
   repeated string policy_ids = 4;        // @id of the determining forbid policies, for REASON_FORBIDDEN
   repeated string tools = 5;             // tool labels detected
   string gate = 6;                       // "assume-role" (gate 1) or "use-credentials" (gate 2)
   string caller_arn = 7;                 // gate 2: the identity the credentials carry
+}
+
+message AuthorizationChallenge {
+  bytes challenge_id = 1;          // 16 random bytes
+  bytes statement = 2;             // serialized AuthorizationStatement; signed byte-for-byte
+  // Acceptable registered keys: OpenSSH "SHA256:..." fingerprints for ssh-agent.
+  repeated string key_fingerprints = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  string method = 5;               // "ssh-agent"
+}
+
+// What a challenge's signature approves.
+message AuthorizationStatement {
+  bytes nonce = 1;                 // 32 random bytes
+  bytes agent_instance_id = 2;     // 16 random bytes chosen at agent start
+  uint32 peer_pid = 3;
+  uint64 peer_start_time = 4;
+  string action = 5;               // "assume-role" | "use-credentials" | "approve-policy" | "unmark-tools"
+  string server_id = 6;
+  Rolespec rolespec = 7;
+  bytes request_digest = 8;
+  google.protobuf.Timestamp expires_at = 9;
+}
+
+message AuthorizationResponse {
+  bytes challenge_id = 1;
+  oneof result {
+    bytes sshsig = 2;              // binary SSHSIG blob
+    string declined = 3;           // why the client could not sign: "no-ssh-agent", "no-registered-key", "sign-failed"
+  }
 }
 
 //----- The following is used for mairu-exec subprocess IPC

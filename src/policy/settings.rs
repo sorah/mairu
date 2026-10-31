@@ -13,6 +13,31 @@ pub struct AuthorizationSettings {
     pub grant_retention_secs: Option<u64>,
     pub sts: Option<StsSettings>,
     pub network: Option<NetworkSettings>,
+    pub ssh_agent_keys: Option<Vec<SshAgentKeyEntry>>,
+}
+
+/// A key registered for the `ssh-agent` method.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshAgentKeyEntry {
+    /// An OpenSSH public key line.
+    pub key: String,
+    /// `sk-` keys only: also require the user-verified flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_user_verification: bool,
+}
+
+impl SshAgentKeyEntry {
+    pub fn parse(&self) -> Result<crate::ssh_agent_presence::RegisteredKey, String> {
+        crate::ssh_agent_presence::RegisteredKey::parse(&self.key, self.require_user_verification)
+    }
+
+    fn from_key(key: &crate::ssh_agent_presence::RegisteredKey) -> Self {
+        Self {
+            key: key.to_openssh(),
+            require_user_verification: key.require_user_verification,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -75,6 +100,24 @@ impl AuthorizationSettings {
                 }
             }
         }
+        for (i, entry) in self.ssh_agent_keys.iter().flatten().enumerate() {
+            entry
+                .parse()
+                .map_err(|e| format!("ssh_agent_keys[{i}]: {e}"))?;
+        }
+        // An anchor naming a method without keys could approve nothing until an administrator resets it.
+        if !self.has_keys()
+            && self
+                .approval_methods
+                .iter()
+                .flatten()
+                .any(|m| m == crate::ssh_agent_presence::METHOD)
+        {
+            return Err(format!(
+                "approval_methods: {:?} needs at least one key in ssh_agent_keys",
+                crate::ssh_agent_presence::METHOD
+            ));
+        }
         for label in self.tool_detection.iter().flat_map(|t| t.keys()) {
             if !crate::tool_detection::ToolLabel::is_valid_name(label) {
                 return Err(format!(
@@ -99,10 +142,47 @@ impl AuthorizationSettings {
         }
         Ok(())
     }
+
+    fn has_keys(&self) -> bool {
+        self.ssh_agent_keys.as_ref().is_some_and(|k| !k.is_empty())
+    }
+
+    /// The registered keys; entries that do not parse are skipped, as validation refuses them.
+    pub fn registered_keys(&self) -> Vec<crate::ssh_agent_presence::RegisteredKey> {
+        self.ssh_agent_keys
+            .iter()
+            .flatten()
+            .filter_map(|e| e.parse().ok())
+            .collect()
+    }
+
+    /// `approval_methods` as approving these settings would anchor them.
+    pub fn approval_methods_or_default(&self) -> Vec<String> {
+        self.approval_methods
+            .clone()
+            .unwrap_or_else(|| default_approval_methods(self.has_keys()))
+    }
+
+    /// What `mairu policy check` warns about beyond validation.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = vec![];
+        if self.has_keys()
+            && self
+                .approval_methods_or_default()
+                .iter()
+                .any(|m| m == crate::authorization::METHOD_PLATFORM)
+        {
+            warnings.push(format!("approval_methods allows {:?} while keys are registered, so a captured password could approve a policy that registers someone else's key", crate::authorization::METHOD_PLATFORM));
+        }
+        warnings
+    }
 }
 
 /// The presence methods this binary knows.
-const KNOWN_METHODS: &[&str] = &[crate::authorization::METHOD_PLATFORM];
+const KNOWN_METHODS: &[&str] = &[
+    crate::ssh_agent_presence::METHOD,
+    crate::authorization::METHOD_PLATFORM,
+];
 
 const PEM_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
 const PEM_END: &str = "-----END CERTIFICATE-----";
@@ -181,9 +261,22 @@ impl PolicyState {
 }
 
 /// `approval_methods` when the file has none: the key-based methods with registered keys, else `["platform"]`.
-/// No key-based method exists yet.
-pub fn default_approval_methods() -> Vec<String> {
-    vec![crate::authorization::METHOD_PLATFORM.to_owned()]
+pub fn default_approval_methods(keys_registered: bool) -> Vec<String> {
+    if keys_registered {
+        vec![crate::ssh_agent_presence::METHOD.to_owned()]
+    } else {
+        vec![crate::authorization::METHOD_PLATFORM.to_owned()]
+    }
+}
+
+/// `methods` when the file has none: the key-based methods with registered keys, then `"platform"`.
+pub fn default_methods(keys_registered: bool) -> Vec<String> {
+    let mut methods = vec![];
+    if keys_registered {
+        methods.push(crate::ssh_agent_presence::METHOD.to_owned());
+    }
+    methods.push(crate::authorization::METHOD_PLATFORM.to_owned());
+    methods
 }
 
 /// The settings in force.
@@ -204,41 +297,55 @@ pub struct EffectiveSettings {
     /// The agent's proxy and extra TLS roots; only set from an approved file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkSettings>,
+    /// From an approved file; otherwise the keys of the approval anchor in force.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ssh_agent_keys: Vec<SshAgentKeyEntry>,
 }
 
 impl Default for EffectiveSettings {
     fn default() -> Self {
         Self {
             version: 1,
-            methods: vec![crate::authorization::METHOD_PLATFORM.to_owned()],
+            methods: default_methods(false),
             approval_methods: vec![],
             tool_detection: Default::default(),
             grant_retention_secs: DEFAULT_GRANT_RETENTION_SECS,
             sts: None,
             network: None,
+            ssh_agent_keys: vec![],
         }
     }
 }
 
 impl EffectiveSettings {
-    /// An approved file as it is. Otherwise the defaults, plus what can only tighten: label additions and a
-    /// shorter grant retention. `methods`, `approval_methods`, `sts` and `network` are never taken from a file that
-    /// is not approved.
-    pub fn effective(state: PolicyState, file: Option<&AuthorizationSettings>) -> Self {
+    /// An approved file as it is. Otherwise the defaults with the keys of the approval anchor in force, plus what
+    /// can only tighten: label additions and a shorter grant retention. `methods`, `approval_methods`,
+    /// `ssh_agent_keys`, `sts` and `network` are never taken from a file that is not approved.
+    pub fn effective(
+        state: PolicyState,
+        file: Option<&AuthorizationSettings>,
+        anchor: &crate::proto::platform::ApprovalAnchor,
+    ) -> Self {
         let mut settings = Self::default();
+        if matches!(state, PolicyState::Unapproved | PolicyState::Tampered) {
+            settings.ssh_agent_keys = Self::anchored_keys(anchor)
+                .iter()
+                .map(SshAgentKeyEntry::from_key)
+                .collect();
+            settings.methods = default_methods(!settings.ssh_agent_keys.is_empty());
+        }
         let Some(file) = file else {
             return settings;
         };
         match state {
             PolicyState::Absent => {}
             PolicyState::Approved => {
-                if let Some(methods) = &file.methods {
-                    settings.methods = methods.clone();
-                }
-                settings.approval_methods = file
-                    .approval_methods
+                settings.ssh_agent_keys = file.ssh_agent_keys.clone().unwrap_or_default();
+                settings.methods = file
+                    .methods
                     .clone()
-                    .unwrap_or_else(default_approval_methods);
+                    .unwrap_or_else(|| default_methods(file.has_keys()));
+                settings.approval_methods = file.approval_methods_or_default();
                 if let Some(tool_detection) = &file.tool_detection {
                     settings.tool_detection = tool_detection.clone();
                 }
@@ -260,15 +367,59 @@ impl EffectiveSettings {
         settings
     }
 
-    /// The approval anchor an approval of a file with these settings records.
+    /// The approval anchor an approval of a file with these settings records: its `approval_methods`, and the keys
+    /// of those methods.
     pub fn anchor(file: Option<&AuthorizationSettings>) -> crate::proto::platform::ApprovalAnchor {
+        let methods = file.map_or_else(
+            || default_approval_methods(false),
+            AuthorizationSettings::approval_methods_or_default,
+        );
+        let ssh_agent_keys = if methods
+            .iter()
+            .any(|m| m == crate::ssh_agent_presence::METHOD)
+        {
+            file.map(|f| f.registered_keys())
+                .unwrap_or_default()
+                .iter()
+                .map(crate::ssh_agent_presence::RegisteredKey::to_anchor_line)
+                .collect()
+        } else {
+            vec![]
+        };
         crate::proto::platform::ApprovalAnchor {
-            methods: file
-                .and_then(|f| f.approval_methods.clone())
-                .unwrap_or_else(default_approval_methods),
-            ssh_agent_keys: vec![],
+            methods,
+            ssh_agent_keys,
             windows_hello_keys: vec![],
         }
+    }
+
+    /// The anchor's keys; lines that do not parse are skipped.
+    pub fn anchored_keys(
+        anchor: &crate::proto::platform::ApprovalAnchor,
+    ) -> Vec<crate::ssh_agent_presence::RegisteredKey> {
+        anchor
+            .ssh_agent_keys
+            .iter()
+            .filter_map(|line| {
+                match crate::ssh_agent_presence::RegisteredKey::from_anchor_line(line) {
+                    Ok(key) => Some(key),
+                    Err(e) => {
+                        tracing::warn!(
+                            err = e,
+                            "Ignoring an approval anchor key that does not parse"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
+    pub fn registered_keys(&self) -> Vec<crate::ssh_agent_presence::RegisteredKey> {
+        self.ssh_agent_keys
+            .iter()
+            .filter_map(|e| e.parse().ok())
+            .collect()
     }
 
     pub fn labels(&self) -> Vec<crate::tool_detection::ToolLabel> {
@@ -300,6 +451,10 @@ MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgDkKdwrVsjQ7oXxRX
 7SdlxC6KrKdcXWRfueK/7wFLo8sCIQDC7L0+2uBLGfjI8ojTSlcg24kSsNzjKSxG
 XLz4KNOFkg==
 -----END CERTIFICATE-----";
+
+    fn anchor() -> crate::proto::platform::ApprovalAnchor {
+        crate::policy::integrity_state::default_anchor()
+    }
 
     fn full() -> serde_json::Value {
         serde_json::json!({
@@ -346,7 +501,77 @@ XLz4KNOFkg==
                 grant_retention_secs: None,
                 sts: None,
                 network: None,
+                ssh_agent_keys: None,
             }
+        );
+    }
+
+    const ED25519: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOWa7b0Z3/uOq8RHg/VxxWmWBz0ux4Gc2Z0jLXGx+7mT me@laptop";
+    const SK_ED25519: &str = "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIOWa7b0Z3/uOq8RHg/VxxWmWBz0ux4Gc2Z0jLXGx+7mTAAAABHNzaDo= yubikey";
+
+    #[test]
+    fn test_ssh_agent_keys() {
+        let keys = serde_json::json!([
+            {"key": ED25519},
+            {"key": SK_ED25519, "require_user_verification": true}
+        ]);
+        let file = parse(serde_json::json!({"version": 1, "ssh_agent_keys": keys})).unwrap();
+        assert_eq!(file.registered_keys().len(), 2);
+        assert!(file.registered_keys()[1].require_user_verification);
+        assert!(file.warnings().is_empty());
+
+        let s = EffectiveSettings::effective(PolicyState::Approved, Some(&file), &anchor());
+        assert_eq!(s.methods, vec!["ssh-agent", "platform"]);
+        assert_eq!(s.approval_methods, vec!["ssh-agent"]);
+        assert_eq!(s.registered_keys(), file.registered_keys());
+        let anchored = EffectiveSettings::anchor(Some(&file));
+        assert_eq!(anchored.methods, vec!["ssh-agent"]);
+        assert_eq!(anchored.ssh_agent_keys.len(), 2);
+        assert!(
+            anchored.ssh_agent_keys[1].starts_with("verify-required sk-ssh-ed25519@openssh.com ")
+        );
+        assert_eq!(
+            EffectiveSettings::anchored_keys(&anchored),
+            file.registered_keys()
+        );
+
+        // Not approved: the keys in the file are ignored, and those of the anchor in force count.
+        let s = EffectiveSettings::effective(PolicyState::Tampered, Some(&file), &anchor());
+        assert_eq!(s.methods, vec!["platform"]);
+        assert!(s.ssh_agent_keys.is_empty());
+        let s = EffectiveSettings::effective(PolicyState::Unapproved, None, &anchored);
+        assert_eq!(s.methods, vec!["ssh-agent", "platform"]);
+        assert_eq!(s.registered_keys(), file.registered_keys());
+        assert!(s.approval_methods.is_empty());
+        let s = EffectiveSettings::effective(PolicyState::Absent, None, &anchored);
+        assert!(s.ssh_agent_keys.is_empty());
+
+        let file = parse(serde_json::json!({"version": 1, "approval_methods": ["ssh-agent", "platform"], "ssh_agent_keys": [{"key": ED25519}]})).unwrap();
+        assert!(
+            file.warnings()[0].contains("captured password"),
+            "{:?}",
+            file.warnings()
+        );
+        // Keys of methods the anchor does not name are not anchored.
+        let file = parse(serde_json::json!({"version": 1, "approval_methods": ["platform"], "ssh_agent_keys": [{"key": ED25519}]})).unwrap();
+        assert!(
+            EffectiveSettings::anchor(Some(&file))
+                .ssh_agent_keys
+                .is_empty()
+        );
+
+        let rejects = |v: serde_json::Value| parse(v).unwrap_err();
+        assert!(
+            rejects(
+                serde_json::json!({"version": 1, "ssh_agent_keys": [{"key": "ssh-ed25519 junk"}]})
+            )
+            .contains("ssh_agent_keys[0]")
+        );
+        assert!(rejects(serde_json::json!({"version": 1, "ssh_agent_keys": [{"key": ED25519, "require_user_verification": true}]})).contains("sk- keys only"));
+        assert!(rejects(serde_json::json!({"version": 1, "ssh_agent_keys": [{"key": ED25519, "comment": "x"}]})).contains("unknown field"));
+        assert!(
+            rejects(serde_json::json!({"version": 1, "approval_methods": ["ssh-agent"]}))
+                .contains("needs at least one key")
         );
     }
 
@@ -410,7 +635,7 @@ XLz4KNOFkg==
     #[test]
     fn test_effective_absent() {
         assert_eq!(
-            EffectiveSettings::effective(PolicyState::Absent, None),
+            EffectiveSettings::effective(PolicyState::Absent, None, &anchor()),
             EffectiveSettings::default()
         );
     }
@@ -418,7 +643,7 @@ XLz4KNOFkg==
     #[test]
     fn test_effective_unapproved_tightens_only() {
         let file = parse(full()).unwrap();
-        let s = EffectiveSettings::effective(PolicyState::Unapproved, Some(&file));
+        let s = EffectiveSettings::effective(PolicyState::Unapproved, Some(&file), &anchor());
         assert_eq!(s.methods, vec!["platform"]);
         // Capped at the default.
         assert_eq!(s.grant_retention_secs, DEFAULT_GRANT_RETENTION_SECS);
@@ -431,7 +656,7 @@ XLz4KNOFkg==
         v["grant_retention_secs"] = 600.into();
         v["methods"] = serde_json::json!([]);
         let file = parse(v).unwrap();
-        let s = EffectiveSettings::effective(PolicyState::Unapproved, Some(&file));
+        let s = EffectiveSettings::effective(PolicyState::Unapproved, Some(&file), &anchor());
         assert_eq!(s.grant_retention_secs, 600);
         assert_eq!(s.methods, vec!["platform"]);
     }
@@ -442,7 +667,7 @@ XLz4KNOFkg==
         v["grant_retention_secs"] = 86400.into();
         v["approval_methods"] = serde_json::json!(["platform"]);
         let file = parse(v).unwrap();
-        let s = EffectiveSettings::effective(PolicyState::Approved, Some(&file));
+        let s = EffectiveSettings::effective(PolicyState::Approved, Some(&file), &anchor());
         assert_eq!(s.grant_retention_secs, 86400);
         assert_eq!(s.approval_methods, vec!["platform"]);
         assert_eq!(s.sts.as_ref().unwrap().region.as_deref(), Some("us-east-1"));
@@ -454,7 +679,7 @@ XLz4KNOFkg==
         );
 
         // Lockdown takes only what tightens, as unapproved files do.
-        let s = EffectiveSettings::effective(PolicyState::Tampered, Some(&file));
+        let s = EffectiveSettings::effective(PolicyState::Tampered, Some(&file), &anchor());
         assert_eq!(s.grant_retention_secs, DEFAULT_GRANT_RETENTION_SECS);
         assert!(s.sts.is_none());
         assert!(s.network.is_none());
@@ -486,7 +711,8 @@ XLz4KNOFkg==
     #[test]
     fn test_effective_labels() {
         let file = parse(full()).unwrap();
-        let labels = EffectiveSettings::effective(PolicyState::Unapproved, Some(&file)).labels();
+        let labels =
+            EffectiveSettings::effective(PolicyState::Unapproved, Some(&file), &anchor()).labels();
         let ai = labels.iter().find(|l| l.name == "ai-agent").unwrap();
         assert!(ai.process_names.contains(&"claude".to_owned()));
         assert!(ai.process_names.contains(&"my-agent".to_owned()));

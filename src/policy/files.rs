@@ -13,6 +13,8 @@ pub struct Effective {
     pub engine: super::Engine,
     pub settings: super::settings::EffectiveSettings,
     pub labels: Vec<crate::tool_detection::ToolLabel>,
+    /// `settings.ssh_agent_keys`, parsed.
+    pub ssh_agent_keys: Vec<crate::ssh_agent_presence::RegisteredKey>,
     pub state: super::settings::PolicyState,
     /// Content that is ignored, such as dropped policies.
     pub notes: Vec<String>,
@@ -37,6 +39,7 @@ impl Effective {
         Self {
             engine,
             labels: settings.labels(),
+            ssh_agent_keys: settings.registered_keys(),
             settings,
             state: super::settings::PolicyState::Absent,
             notes: vec![],
@@ -55,16 +58,23 @@ impl Effective {
         } else {
             PolicyState::Unapproved
         };
-        Self::build_for(state, hardened, policy, settings)
+        Self::build_for(
+            state,
+            hardened,
+            policy,
+            settings,
+            &super::integrity_state::default_anchor(),
+        )
     }
 
-    /// What is in force for `state`. An approved policy that no longer validates, for example after an upgrade,
-    /// is treated as `UNAPPROVED`, with a note.
+    /// What is in force for `state`, with `anchor` the approval anchor in force. An approved policy that no longer
+    /// validates, for example after an upgrade, is treated as `UNAPPROVED`, with a note.
     pub fn build_for(
         state: super::settings::PolicyState,
         hardened: bool,
         policy: &Content,
         settings: &Content,
+        anchor: &crate::proto::platform::ApprovalAnchor,
     ) -> Result<Self, super::PolicyError> {
         use super::settings::PolicyState;
         match state {
@@ -72,8 +82,13 @@ impl Effective {
             PolicyState::Approved => match Self::approved(hardened, policy, settings)? {
                 Ok(effective) => Ok(effective),
                 Err(e) => {
-                    let mut effective =
-                        Self::restricted(PolicyState::Unapproved, hardened, policy, settings)?;
+                    let mut effective = Self::restricted(
+                        PolicyState::Unapproved,
+                        hardened,
+                        policy,
+                        settings,
+                        anchor,
+                    )?;
                     effective.notes.insert(
                         0,
                         format!(
@@ -84,7 +99,7 @@ impl Effective {
                 }
             },
             PolicyState::Unapproved | PolicyState::Tampered => {
-                Self::restricted(state, hardened, policy, settings)
+                Self::restricted(state, hardened, policy, settings, anchor)
             }
         }
     }
@@ -128,10 +143,12 @@ impl Effective {
         let settings = super::settings::EffectiveSettings::effective(
             PolicyState::Approved,
             file_settings.as_ref(),
+            &super::integrity_state::default_anchor(),
         );
         Ok(Ok(Self {
             engine,
             labels: settings.labels(),
+            ssh_agent_keys: settings.registered_keys(),
             settings,
             state: PolicyState::Approved,
             notes,
@@ -145,6 +162,7 @@ impl Effective {
         hardened: bool,
         policy: &Content,
         settings: &Content,
+        anchor: &crate::proto::platform::ApprovalAnchor,
     ) -> Result<Self, super::PolicyError> {
         use super::settings::PolicyState;
         let schema = super::schema()?;
@@ -183,6 +201,7 @@ impl Effective {
             let ignored: Vec<&str> = [
                 ("methods", s.methods.is_some()),
                 ("approval_methods", s.approval_methods.is_some()),
+                ("ssh_agent_keys", s.ssh_agent_keys.is_some()),
                 ("sts", s.sts.is_some()),
                 ("network", s.network.is_some()),
             ]
@@ -200,10 +219,12 @@ impl Effective {
             PolicyState::Tampered => super::Base::Lockdown,
             _ => super::Base::Builtin { hardened },
         };
-        let settings = super::settings::EffectiveSettings::effective(state, file_settings.as_ref());
+        let settings =
+            super::settings::EffectiveSettings::effective(state, file_settings.as_ref(), anchor);
         Ok(Self {
             engine: super::Engine::with_user_policies(base, &forbids)?,
             labels: settings.labels(),
+            ssh_agent_keys: settings.registered_keys(),
             settings,
             state,
             notes,
@@ -572,7 +593,8 @@ async fn verify(
             .record(record.clone(), decision.backfill.clone())
             .await;
     }
-    let effective = Effective::build_for(decision.state, hardened, policy, settings)?;
+    let effective =
+        Effective::build_for(decision.state, hardened, policy, settings, &decision.anchor)?;
     let state = effective.state;
     let unapproved = if state == PolicyState::Approved {
         Some(std::sync::Arc::new(Effective::build_for(
@@ -580,6 +602,7 @@ async fn verify(
             hardened,
             policy,
             settings,
+            &decision.anchor,
         )?))
     } else {
         None

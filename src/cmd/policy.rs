@@ -182,12 +182,26 @@ fn check() -> Result<(), anyhow::Error> {
                     let relaxing: Vec<&str> = [
                         ("methods", s.methods.is_some()),
                         ("approval_methods", s.approval_methods.is_some()),
+                        ("ssh_agent_keys", s.ssh_agent_keys.is_some()),
                         ("sts", s.sts.is_some()),
                         ("network", s.network.is_some()),
                     ]
                     .into_iter()
                     .filter_map(|(name, set)| set.then_some(name))
                     .collect();
+                    for key in s.registered_keys() {
+                        let uv = if key.require_user_verification {
+                            ", user verification required"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "  ssh-agent key  {} {} ({}{uv})",
+                            key.fingerprint(),
+                            key.public.comment(),
+                            key.public.algorithm().as_str()
+                        );
+                    }
                     if !relaxing.is_empty() {
                         warnings.push(format!(
                             "{} in {} apply only once approved",
@@ -195,6 +209,7 @@ fn check() -> Result<(), anyhow::Error> {
                             crate::policy::files::SETTINGS_FILE_NAME
                         ));
                     }
+                    warnings.extend(s.warnings());
                 }
             }
         }
@@ -416,16 +431,33 @@ async fn approve(confirm: Option<&str>) -> Result<(), anyhow::Error> {
             ":: {product} :: Policy approval required: {approval_digest}\n:: {product} :: Enter your password below.\n"
         )
     };
+    let relay = crate::ssh_agent_presence::Relay::from_env();
+    let signature_notice = |_: &crate::proto::AuthorizationError, comment: &str| {
+        format!(
+            ":: {product} :: Policy approval required: {approval_digest}\n:: {product} :: Approve the signature on your SSH agent ({comment}) to approve this policy (not for AWS credentials)\n"
+        )
+    };
     let resp = crate::polkit_tty_agent::with_fallback(notice, |attempt| {
-        let mut agent = agent.clone();
+        let agent = agent.clone();
         let req = req.clone();
+        let relay = relay.clone();
         async move {
-            match attempt {
-                crate::polkit_tty_agent::Attempt::First => {
-                    approve_while_waiting(&mut agent, req).await
-                }
-                crate::polkit_tty_agent::Attempt::Retry => agent.approve_policy(req).await,
-            }
+            relay
+                .with_challenges(signature_notice, |response| {
+                    let mut agent = agent.clone();
+                    let mut req = req.clone();
+                    let signed = crate::ssh_agent_presence::is_signed(response.as_ref());
+                    crate::ssh_agent_presence::set_response(&mut req.client_context, response);
+                    async move {
+                        match attempt {
+                            crate::polkit_tty_agent::Attempt::First if !signed => {
+                                approve_while_waiting(&mut agent, req).await
+                            }
+                            _ => agent.approve_policy(req).await,
+                        }
+                    }
+                })
+                .await
         }
     })
     .await;

@@ -54,6 +54,15 @@ impl AuthorizationError {
             tools: vec![],
             gate: String::new(),
             caller_arn: String::new(),
+            challenge: None,
+        }
+    }
+
+    /// `REASON_CHALLENGE`: the client signs `challenge` and retries the same request.
+    pub fn challenge(challenge: AuthorizationChallenge) -> Self {
+        Self {
+            challenge: Some(challenge),
+            ..Self::new(authorization_error::Reason::Challenge, "")
         }
     }
 
@@ -70,12 +79,14 @@ impl AuthorizationError {
             Reason::Unavailable
             | Reason::NoAuthenticationAgent
             | Reason::PresenceRequired
-            | Reason::CheckPending => tonic::Code::FailedPrecondition,
+            | Reason::CheckPending
+            | Reason::Challenge => tonic::Code::FailedPrecondition,
             Reason::Unspecified
             | Reason::UnverifiedPeer
             | Reason::Denied
             | Reason::Forbidden
-            | Reason::NotPermitted => tonic::Code::PermissionDenied,
+            | Reason::NotPermitted
+            | Reason::InvalidResponse => tonic::Code::PermissionDenied,
         };
         let message = if self.detail.is_empty() {
             self.user_message()
@@ -105,6 +116,8 @@ impl AuthorizationError {
             }
             Reason::PresenceRequired => "a fresh approval is required",
             Reason::CheckPending => "another human check is pending",
+            Reason::Challenge => "a signature from your SSH agent is required",
+            Reason::InvalidResponse => "the signature was refused",
         };
         let mut message = summary.to_owned();
         if !self.policy_ids.is_empty() {
