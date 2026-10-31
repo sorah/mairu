@@ -206,17 +206,27 @@ Only one `pkttyagent` runs per client process at a time; concurrent requests in 
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented on `hardening/headless`. Verified in Docker (debian:trixie, polkit 126) with tmux panes and `ssh localhost`, without logind; a real host with logind and a desktop session is not verified (see Updates).
 
 ### Checklist
 
-- [ ] `pkttyagent` fallback: fixed-path check, registration for the requesting process, retry once
-- [ ] Retry paths in `exec` (preflight, ECS backend) and `credential-process`
-- [ ] `doctor` headless capability report
-- [ ] README: tmux over SSH, password-capture risk, PAM guidance
-- [ ] pty integration test in the hardened CI job
-- [ ] Manual verification over SSH + tmux
+- [x] `pkttyagent` fallback: fixed-path check, registration for the requesting process, retry once
+- [x] Retry paths in `exec` (preflight, ECS backend) and `credential-process`
+- [x] `doctor` headless capability report
+- [x] README: tmux over SSH, password-capture risk, PAM guidance
+- [x] pty integration test in the hardened CI job
+- [ ] Manual verification over SSH + tmux: covered in Docker (tmux panes, `ssh localhost`) but not on a host with logind and a desktop session
 
 ### Updates
 
 - 2026-10-29: Split out of hardening.md, policy.md and platform-helper.md.
+- 2026-10-31: Implemented. Decisions and deviations:
+  - **No `--fallback`.** polkit 126 consults an agent registered with `fallback` for a `unix-process` scope only when the subject also has a logind session (`get_authentication_agent_for_subject` jumps out when the session lookup fails), so in a container, and for any process outside a logind session, the registered agent is never asked and the retry fails again with `REASON_NO_AUTHENTICATION_AGENT`. Confirmed in Docker: with `--fallback` every check found no agent; without it the prompt works. The client spawns `pkttyagent` only after polkit answered that no agent covers the process or its session, so without `--fallback` it replaces nothing: a process-scope registration never displaces a session (desktop) agent, and polkit refuses a second registration for the same process. The command is `/usr/bin/pkttyagent --process <pid>,<start_time> --notify-fd 3`.
+  - `pkttyagent` runs with the hardened agent's sanitized environment (allowlist plus fixed `PATH`) and `TERM`, so variables such as `LD_PRELOAD` or `DBUS_SYSTEM_BUS_ADDRESS` from the client's environment cannot redirect the password. It is spawned through `hardening::command()`, with stdin/stdout/stderr on `/dev/tty` and the notify pipe dup'ed to fd 3.
+  - `polkit_tty_agent::with_fallback(notice, rpc)` runs the RPC; on `REASON_NO_AUTHENTICATION_AGENT` it takes a per-process lock (one `pkttyagent` at a time), registers, prints the context lines headed "Authorization required" and ending "Enter your password below.", retries once without the "may be required" notice (the prompt owns the terminal), and sends `SIGTERM` when the RPC returns. A `pkttyagent` that exits instead of registering (it prints its own error on the terminal), or does not answer within 5 s, is a failure.
+  - Failures keep `REASON_NO_AUTHENTICATION_AGENT` and add the cause as its detail: no tty ("there is no terminal to ask for a password on; run the command in a terminal"), an untrusted or missing `pkttyagent` (owner, mode, symlink or missing component), or a failed registration. The client prints them through the existing refusal messages. The tty check comes first, so without a tty nothing is spawned.
+  - `credential-process` without a terminal also goes through the fallback (`assume_role_quietly`), so it is refused with the same guidance.
+  - `doctor`'s headless section shows the tty with its origin (`/dev/pts/3 (zsh, tmux pane)`), SSH (`$SSH_CONNECTION` or `$SSH_TTY`), polkit from `Capabilities.authorization` (or "not used" for an unhardened agent), and the `pkttyagent` check. It warns about a missing tty, unavailable polkit and an unusable `pkttyagent` only when the agent may ask (hardened or unknown).
+  - The linux-hardened CI job installs `expect`, sets a random password for the runner user, and with polkit's defaults checks that `credential-process` in a pty prompts through `pkttyagent` (right password approves, wrong denies) and that a `setsid` call without a tty is refused with guidance.
+  - Verified in Docker as root (scenario `008-headless`, 65 checks): `doctor` reports tty, SSH, polkit and `pkttyagent`, and warns without a tty; `credential-process` with no agent registers `pkttyagent` as its own child for its own pid and start time from `/usr/bin/pkttyagent` (a fake one earlier in `PATH` is never run) with a sanitized environment, prints the context, approves with the right password and denies a wrong one, and `pkttyagent` is gone afterwards; two requests in one terminal prompt once; `exec` prompts in its preflight and, with `--no-preflight-check`, from the sidecar serving the ECS request (403 on a wrong password); `setsid -w mairu exec … </dev/null` and tty-less `credential-process` are refused with guidance after one polkit check and spawn nothing; a `pkttyagent` owned by the user, writable by others or missing is refused with the reason and shown as ✗ in `doctor`; an agent already registered for the process is used and the client spawns none; in tmux the prompt appears in the pane, a reattach keeps the pane's approval, and a new window asks again; over `ssh -tt localhost` the prompt works and `doctor` reports `ssh yes ($SSH_CONNECTION)`. Scenarios 003, 004 (its "no warnings" doctor check now ignores the two headless warnings, since that container has neither a tty nor polkitd), 005-install, 005-ci-script (with the new CI section) and 006, 007 still pass.
+  - Not verified: a host with logind (the tmux server's session after its SSH login ended), a desktop session keeping its GUI dialog, and `pkttyagent` competing for the terminal with a foreground command during an on-demand `exec` prompt.
