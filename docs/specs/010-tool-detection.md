@@ -363,17 +363,29 @@ The client fills `env_names` in every `ClientContext`: `exec` (preflight, the EC
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented on `hardening/tool-detection`. Verified in Docker with fake `claude`/`codex` processes, environment markers and session marks under polkit test rules (see Updates); real AI agents were not run.
 
 ### Checklist
 
-- [ ] Labels and signals: ancestry (`comm`, `exe`, `argv[0]`, `argv[1]`), env names, built-in `ai-agent` lists rechecked against current agents
-- [ ] `context.tools` and `context.tool_matches` in the schema and every Cedar request
-- [ ] Built-in policies: `builtin-human` with the label condition, `builtin-ai-agent-per-request`; README relaxation updated
-- [ ] Session marks: `mairu lock --tool`, sweep on session end
-- [ ] `mairu unlock --tool` (`UnmarkTools`), always asking the human
-- [ ] `ClientContext.env_names` from every client path; `AuthorizationError.tools`; labels in prompts and `doctor`
+- [x] Labels and signals: ancestry (`comm`, `exe`, `argv[0]`, `argv[1]`), env names, built-in `ai-agent` lists rechecked against current agents
+- [x] `context.tools` and `context.tool_matches` in the schema and every Cedar request
+- [x] Built-in policies: `builtin-human` with the label condition, `builtin-ai-agent-per-request`; README relaxation updated
+- [x] Session marks: `mairu lock --tool`, sweep on session end
+- [x] `mairu unlock --tool` (`UnmarkTools`), always asking the human
+- [x] `ClientContext.env_names` from every client path; `AuthorizationError.tools`; labels in prompts and `doctor`
 
 ### Updates
 
 - 2026-10-29: Split out of hardening.md, policy.md and platform-helper.md.
+- 2026-10-31: Implemented. Decisions and deviations:
+  - The built-in `env_names` list is extended after checking the variables current agents set (as collected by the `is-ai-agent` crate and similar detectors): `AI_AGENT`, `CLAUDECODE`, `GEMINI_CLI`, `CODEX_SANDBOX`, `CODEX_THREAD_ID`, `CURSOR_AGENT`, `QWEN_CODE`, `OPENCODE`, `GOOSE_TERMINAL`, `AMP_CURRENT_THREAD_ID`, `COPILOT_CLI`, `CRUSH`. Generic names such as `AGENT` are left out. The `process_names` list is unchanged.
+  - The ancestry walk is `ProcessPlatform::ancestry(pid, start_time, uid)`, so `Detection::detect` takes the ancestry rather than the peer, and `ProcessPlatform::session_alive` backs the mark sweep. `FallbackProcess` (macOS) returns no ancestry and no live sessions. The walk excludes pid 1, stops at the first process whose real or effective uid differs, and pins each ancestor with a pidfd while reading `stat`, `status`, `comm`, `exe` and `cmdline`; it also re-reads the child's `ppid` afterwards, so an ancestor whose pid was reused mid-walk ends the walk.
+  - Each ancestor carries its session as `SessionIdentity::Tty` with its leader's current start time, whether or not it has a tty, so a mark matches only the session it was made in, and a reused session id never does. Marks live in the `Authorizer` state and are swept with leases.
+  - `GetAgentStatusRequest` gains `ClientContext client_context = 1`, so that `doctor` can show env matches; `doctor` sends it only to an agent it does not consider unverified. `PeerView` also gains `marks = 7`, the labels on the caller's own terminal session, which `doctor` prints with a hint to `unlock`.
+  - `mairu lock --tool` starts the agent when none runs, so the mark exists. Labels are validated by the client and by the agent (`INVALID_ARGUMENT`). `UnmarkTools` needs a `Tty` session like marking (`FAILED_PRECONDITION`), is not coalesced, and asks with `ACTION_APPROVE_POLICY` and the message `Remove the tool mark "ai-agent" from /dev/pts/7`. `mairu unlock` goes through the `pkttyagent` fallback of 008 like other requests and prints the labels still marked.
+  - `AuthorizationError.tools` is set on every refusal, `disallow_roles` included, and the shared refusal wording appends `(tools: …)`. Decisions are logged with the matches.
+  - The terminal lines: the client cannot know the agent's detection while a request is pending, so the `tools:` part of the `from:` line shows what the client detects for itself (ancestry and environment, not marks), plus the labels of the refusal in the `pkttyagent` password notice. The polkit `details` gain `tools` (labels and matches), which, like the other details, reach polkit only when the helper runs as root (007).
+  - An approval of an `ai-agent` request still records the session grant, as in 007: an unlabelled request from that session may reuse it, since a human gave it. Labelled requests never do.
+  - `AuthorizationError` grew past clippy's `result_large_err` threshold; `src/authorization.rs` allows that lint, since refusals are the protocol message itself.
+  - Verified in Docker as root (scenario `010-tool-detection`, 35 checks; polkit 126 with a YES/NO rules file, the `harden`ed copy, a credential server that is never reached): a human terminal makes one polkit check for two requests and `doctor` shows `tools none`; under a binary named `claude` (comm and exe), under `bash /opt/agents/codex` (argv[1]), with `CLAUDECODE` set, and for `setsid -w` children without a tty under `claude`, every request asks, and the agent log names `process:claude`/`process:codex`; `doctor` shows `ai-agent (process:claude)` and `ai-agent (env:AI_AGENT)` and the log holds no values; a refusal names `(tools: ai-agent)`; a human terminal is unaffected afterwards; `mairu exec` under `claude` asks once and its lease covers the second ECS request; `lock --tool` without a tty fails with guidance and rejects an invalid label; `lock --tool ai-agent` prints the mark, labels the pane's requests and its `setsid` child (`mark:ai-agent`, a marks line in `doctor`), and another pane is unaffected; `unlock --tool` asks through `co.0w0.mairu.approve-policy` every time, removes the mark on YES, keeps it on NO, and fails without a tty. Scenarios 003, 004, 005-install, 005-ci-script, 006, 007, 008 and 009 still pass.
+  - Not verified: real agents (Claude Code, Codex, …) and their process titles; the 60 s sweep dropping the mark of an ended session, and a reused session id (unit-tested with a fake process platform); macOS, where the fallback detects nothing but environment names.

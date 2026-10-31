@@ -34,8 +34,18 @@ pub async fn run(_args: &DoctorArgs) -> Result<(), anyhow::Error> {
                 crate::platform::AgentTrust::Unverified => "NOT VERIFIED",
                 crate::platform::AgentTrust::Unverifiable => "not checked (client not hardened)",
             };
+            // Environment names go only to an agent this mairu trusts.
+            let client_context =
+                (conn.trust() != crate::platform::AgentTrust::Unverified).then(|| {
+                    crate::proto::ClientContext {
+                        env_names: crate::tool_detection::env_names(),
+                        ..Default::default()
+                    }
+                });
             let status = conn
-                .get_agent_status(tonic::Request::new(crate::proto::GetAgentStatusRequest {}))
+                .get_agent_status(tonic::Request::new(crate::proto::GetAgentStatusRequest {
+                    client_context,
+                }))
                 .await;
             match status {
                 Ok(status) => {
@@ -113,6 +123,20 @@ fn print_agent_status(
             );
             if !c.session.is_empty() {
                 println!("session  {}", c.session);
+            }
+            println!(
+                "tools    {}",
+                if c.tools.is_empty() {
+                    "none".to_owned()
+                } else {
+                    format!("{} ({})", c.tools.join(", "), c.tool_matches.join(", "))
+                }
+            );
+            if !c.marks.is_empty() {
+                println!(
+                    "marks    {} on this terminal session; `mairu unlock --tool <label>` removes one",
+                    c.marks.join(", ")
+                );
             }
         }
         None => println!("caller   unknown"),

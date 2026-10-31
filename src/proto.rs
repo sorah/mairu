@@ -51,6 +51,7 @@ impl AuthorizationError {
             reason: reason.into(),
             detail: detail.into(),
             policy_ids: vec![],
+            tools: vec![],
             gate: String::new(),
             caller_arn: String::new(),
         }
@@ -109,6 +110,9 @@ impl AuthorizationError {
         }
         if !self.detail.is_empty() {
             message.push_str(&format!(": {}", self.detail));
+        }
+        if !self.tools.is_empty() {
+            message.push_str(&format!(" (tools: {})", self.tools.join(", ")));
         }
         if self.gate == GATE_USE_CREDENTIALS {
             if !self.caller_arn.is_empty() && !message.contains(&self.caller_arn) {

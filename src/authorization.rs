@@ -2,6 +2,9 @@
 //! credentials' caller identity is known (gate 2), asks through the platform helper, and remembers the answer as
 //! grants (per terminal session) and leases (per running `mairu exec`).
 
+// A refusal is the protocol's own AuthorizationError, returned once per request.
+#![allow(clippy::result_large_err)]
+
 /// Grants are dropped after this to bound memory; freshness itself is up to the policy.
 const GRANT_RETENTION: std::time::Duration = std::time::Duration::from_secs(43200);
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -98,11 +101,13 @@ struct State {
     grants: std::collections::HashMap<GrantKey, Grant>,
     leases: std::collections::HashMap<LeaseKey, Lease>,
     held: std::collections::HashMap<FlightKey, Held>,
+    marks: crate::tool_detection::Marks,
 }
 
 impl State {
-    fn sweep(&mut self, now: std::time::Duration) {
+    fn sweep(&mut self, now: std::time::Duration, process: &dyn crate::platform::ProcessPlatform) {
         self.leases.retain(|_, l| pidfd_alive(&l.pidfd));
+        self.marks.sweep(|s| process.session_alive(s));
         self.grants
             .retain(|_, g| now.saturating_sub(g.created) <= GRANT_RETENTION);
         self.held.retain(|_, h| now < h.until);
@@ -118,6 +123,8 @@ struct Shared {
     engine: crate::policy::Engine,
     services: std::sync::Arc<dyn crate::platform::PlatformServices>,
     identifier: std::sync::Arc<dyn crate::caller_identity::Identify>,
+    process: &'static dyn crate::platform::ProcessPlatform,
+    labels: Vec<crate::tool_detection::ToolLabel>,
     clock: std::sync::Arc<dyn Clock>,
     hardened: bool,
     state: parking_lot::Mutex<State>,
@@ -178,6 +185,7 @@ struct Pending {
     facts: crate::policy::Facts,
     command_detail: Option<String>,
     digest: [u8; 32],
+    detection: crate::tool_detection::Detection,
 }
 
 /// A permitted request. Report what was vended through [`Authorized::vended`].
@@ -238,6 +246,7 @@ impl Authorizer {
             engine,
             services,
             std::sync::Arc::new(crate::caller_identity::Sts::default()),
+            crate::platform::process(),
             hardened,
             std::sync::Arc::new(BootClock),
         );
@@ -251,7 +260,7 @@ impl Authorizer {
                     return;
                 };
                 let now = shared.clock.now();
-                shared.state.lock().sweep(now);
+                shared.state.lock().sweep(now, shared.process);
             }
         });
         this
@@ -261,6 +270,7 @@ impl Authorizer {
         engine: crate::policy::Engine,
         services: std::sync::Arc<dyn crate::platform::PlatformServices>,
         identifier: std::sync::Arc<dyn crate::caller_identity::Identify>,
+        process: &'static dyn crate::platform::ProcessPlatform,
         hardened: bool,
         clock: std::sync::Arc<dyn Clock>,
     ) -> Self {
@@ -269,6 +279,8 @@ impl Authorizer {
                 engine,
                 services,
                 identifier,
+                process,
+                labels: crate::tool_detection::ToolLabel::builtin(),
                 clock,
                 hardened,
                 state: Default::default(),
@@ -293,7 +305,7 @@ impl Authorizer {
     pub fn counts(&self) -> (u32, u32) {
         let now = self.shared.clock.now();
         let mut state = self.shared.state.lock();
-        state.sweep(now);
+        state.sweep(now, self.shared.process);
         (
             u32::try_from(state.grants.len()).unwrap_or(u32::MAX),
             u32::try_from(state.leases.len()).unwrap_or(u32::MAX),
@@ -345,9 +357,102 @@ impl Authorizer {
         )
     }
 
+    /// Marks a terminal session with tool labels until the session ends.
+    pub fn mark_tools(&self, session: crate::platform::SessionIdentity, labels: &[String]) {
+        self.shared.state.lock().marks.add(session, labels);
+    }
+
+    /// The labels the agent detects for `peer`, and those marked on its own terminal session.
+    pub fn tools_of(
+        &self,
+        peer: &crate::platform::PeerIdentity,
+        env_names: &[String],
+    ) -> (crate::tool_detection::Detection, Vec<String>) {
+        let detection = self.shared.detect(Some(peer), env_names);
+        let marks = self
+            .shared
+            .process
+            .session_identity(peer)
+            .map(|s| self.shared.state.lock().marks.get(&s).cloned().collect())
+            .unwrap_or_default();
+        (detection, marks)
+    }
+
+    /// Removes marks from the caller's terminal session. The marked tool could ask for this itself, so it always
+    /// asks the human and never counts a grant or lease. Returns the labels still marked.
+    pub async fn unmark_tools(
+        &self,
+        peer: Option<&crate::platform::PeerIdentity>,
+        labels: &[String],
+    ) -> Result<Vec<String>, tonic::Status> {
+        use crate::proto::authorization_error::Reason;
+        use crate::proto::platform::authorize_response::Result as R;
+        let shared = &self.shared;
+        let (peer, session) = match peer.map(|p| (p, shared.process.session_identity(p))) {
+            Some((peer, Some(session @ crate::platform::SessionIdentity::Tty { .. }))) => {
+                (peer, session)
+            }
+            _ => return Err(tonic::Status::failed_precondition(NO_TERMINAL_SESSION)),
+        };
+        let tty = shared
+            .process
+            .controlling_tty(peer)
+            .unwrap_or_else(|| session.to_string());
+        let quoted = labels
+            .iter()
+            .map(|l| format!("\"{l}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let noun = if labels.len() == 1 { "mark" } else { "marks" };
+        let mut details = std::collections::HashMap::new();
+        details.insert("tty".to_owned(), tty.clone());
+        details.insert("tools".to_owned(), labels.join(", "));
+        let request = crate::proto::platform::AuthorizeRequest {
+            action: crate::proto::platform::authorize_request::Action::ApprovePolicy.into(),
+            subject: Some(subject(
+                peer.pid,
+                peer.start_time,
+                peer.uid,
+                peer.exe.as_deref(),
+            )),
+            message: format!("Remove the tool {noun} {quoted} from {tty}"),
+            details,
+        };
+        let refuse = |reason: Reason, detail: String| {
+            tracing::info!(pid = peer.pid, session = ?session, tools = ?labels, reason = ?reason, detail, "Tool marks kept");
+            Err(Refusal::new(reason, detail).into_status())
+        };
+        if let Err(e) = shared.platform_usable().await {
+            return refuse(
+                Reason::Unavailable,
+                format!("no method could ask for approval; tried {METHOD_PLATFORM}: {e}"),
+            );
+        }
+        let resp = shared.services.authorize(request).await;
+        match resp.result() {
+            R::Allowed => {
+                let remaining = shared.state.lock().marks.remove(&session, labels);
+                tracing::info!(pid = peer.pid, session = ?session, tools = ?labels, remaining = ?remaining, "Removed tool marks");
+                Ok(remaining)
+            }
+            R::Denied | R::Cancelled => refuse(Reason::Denied, resp.reason),
+            R::Unavailable if resp.reason == REASON_NO_AUTHENTICATION_AGENT => {
+                refuse(Reason::NoAuthenticationAgent, String::new())
+            }
+            R::Unavailable | R::Unspecified => refuse(
+                Reason::Unavailable,
+                format!(
+                    "no method could ask for approval; tried {METHOD_PLATFORM}: {}: {}",
+                    resp.reason, resp.detail
+                ),
+            ),
+        }
+    }
+
     /// Gate 1. Decides; asks a human when the policy would permit the request after a check and nothing
     /// remembered does.
     pub async fn authorize_assume_role(&self, req: Request<'_>) -> Result<Authorized, Refusal> {
+        let pending = self.shared.pending(&req);
         if req
             .user_config
             .is_role_disallowed(req.server, &req.rolespec.role)
@@ -366,9 +471,10 @@ impl Authorizer {
                 ),
             );
             refusal.gate = crate::proto::GATE_ASSUME_ROLE.to_owned();
+            refusal.tools = pending.detection.tools.iter().cloned().collect();
             return Err(refusal);
         }
-        self.gate1(self.shared.pending(&req)).await
+        self.gate1(pending).await
     }
 
     async fn gate1(&self, pending: Pending) -> Result<Authorized, Refusal> {
@@ -535,6 +641,7 @@ fn log_decision(
             server_id = pending.server_id,
             rolespec = ?pending.role_key,
             intent = pending.facts.intent,
+            tools = ?pending.detection.tool_matches,
             caller_arn,
             presence = a.presence.scope.as_str(),
             "Authorization permitted"
@@ -546,6 +653,7 @@ fn log_decision(
             server_id = pending.server_id,
             rolespec = ?pending.role_key,
             intent = pending.facts.intent,
+            tools = ?pending.detection.tool_matches,
             caller_arn,
             reason = ?e.reason(),
             detail = e.detail,
@@ -556,7 +664,12 @@ fn log_decision(
 
 impl Shared {
     fn pending(&self, req: &Request<'_>) -> Pending {
-        let platform = crate::platform::process();
+        let platform = self.process;
+        let env_names = req
+            .client_context
+            .map(|c| c.env_names.as_slice())
+            .unwrap_or_default();
+        let detection = self.detect(req.peer, env_names);
         let session = req.peer.and_then(|p| platform.session_identity(p));
         let tty = req.peer.and_then(|p| platform.controlling_tty(p));
         let uid = req
@@ -578,9 +691,27 @@ impl Shared {
                 None
             },
             self.hardened,
+            detection,
         );
         pending.pidfd = pidfd;
         pending
+    }
+
+    /// Detection runs once per request, and its result serves every candidate at both gates.
+    fn detect(
+        &self,
+        peer: Option<&crate::platform::PeerIdentity>,
+        env_names: &[String],
+    ) -> crate::tool_detection::Detection {
+        let ancestry = peer
+            .map(|p| self.process.ancestry(p.pid, p.start_time, p.uid))
+            .unwrap_or_default();
+        crate::tool_detection::Detection::detect(
+            &ancestry,
+            env_names,
+            &self.state.lock().marks,
+            &self.labels,
+        )
     }
 
     async fn platform_usable(&self) -> Result<(), String> {
@@ -610,9 +741,11 @@ impl Shared {
             crate::policy::Action::AssumeRole => None,
             crate::policy::Action::UseCredentials(caller) => Some(caller),
         };
+        let pending_tools = pending.detection.tools.iter().cloned().collect();
         self.decide_at(pending, action, extra)
             .await
             .map_err(|mut refusal| {
+                refusal.tools = pending_tools;
                 match caller {
                     None => refusal.gate = crate::proto::GATE_ASSUME_ROLE.to_owned(),
                     Some(caller) => {
@@ -864,6 +997,9 @@ impl Shared {
     }
 }
 
+/// Tool marks belong to a terminal session.
+pub const NO_TERMINAL_SESSION: &str = "tool marks need a terminal session, and this process has none; run `mairu lock --tool` in the terminal that starts the tool";
+
 /// `AuthorizeResponse.reason` when polkit has no authentication agent for the subject.
 pub const REASON_NO_AUTHENTICATION_AGENT: &str = "no-authentication-agent";
 
@@ -878,6 +1014,7 @@ impl Pending {
         session: Option<crate::platform::SessionIdentity>,
         tty: Option<String>,
         hardened: bool,
+        detection: crate::tool_detection::Detection,
     ) -> Self {
         let context = req.client_context.cloned().unwrap_or_default();
         let exec = match &context.intent {
@@ -921,6 +1058,8 @@ impl Pending {
                 .assume_role
                 .as_ref()
                 .map(|a| a.role_arn.clone()),
+            tools: detection.tools.clone(),
+            tool_matches: detection.tool_matches.clone(),
         };
         Self {
             pid: req.peer.map_or(0, |p| p.pid),
@@ -936,6 +1075,7 @@ impl Pending {
             command_detail: command_line.map(|l| truncate(&l, COMMAND_DETAIL_LIMIT).to_owned()),
             digest: request_digest(req.server.id(), req.rolespec, &context),
             facts,
+            detection,
         }
     }
 
@@ -971,6 +1111,9 @@ impl Pending {
             .map_or_else(|| "(unknown)".to_owned(), |e| e.display().to_string());
         details.insert("requester".to_owned(), format!("{exe} pid {}", self.pid));
         details.insert("intent".to_owned(), f.intent.to_owned());
+        if !self.detection.is_empty() {
+            details.insert("tools".to_owned(), self.detection.summary());
+        }
         let mut message = format!("Provide AWS credentials for {} on {}", f.role, f.server_id);
         if let Some(caller) = caller {
             details.insert(
@@ -981,24 +1124,34 @@ impl Pending {
         }
         crate::proto::platform::AuthorizeRequest {
             action: crate::proto::platform::authorize_request::Action::AssumeRole.into(),
-            subject: Some(crate::proto::platform::Process {
-                pid: self.pid,
-                start_time: self.start_time,
-                uid: self.uid,
-                executable: self
-                    .exe
-                    .as_ref()
-                    .map(|e| {
-                        use std::os::unix::ffi::OsStrExt;
-                        e.as_os_str().as_bytes().to_vec()
-                    })
-                    .unwrap_or_default(),
-                argv: vec![],
-                name: String::new(),
-            }),
+            subject: Some(subject(
+                self.pid,
+                self.start_time,
+                self.uid,
+                self.exe.as_deref(),
+            )),
             message,
             details,
         }
+    }
+}
+
+fn subject(
+    pid: u32,
+    start_time: u64,
+    uid: u32,
+    exe: Option<&std::path::Path>,
+) -> crate::proto::platform::Process {
+    use std::os::unix::ffi::OsStrExt;
+    crate::proto::platform::Process {
+        pid,
+        start_time,
+        uid,
+        executable: exe
+            .map(|e| e.as_os_str().as_bytes().to_vec())
+            .unwrap_or_default(),
+        argv: vec![],
+        name: String::new(),
     }
 }
 
@@ -1203,12 +1356,65 @@ mod tests {
         )
     }
 
+    /// Reports a fixed session and ancestry for every peer.
+    #[derive(Debug, Default)]
+    struct FakeProcess {
+        session: parking_lot::Mutex<Option<crate::platform::SessionIdentity>>,
+        ancestry: parking_lot::Mutex<Vec<crate::platform::Ancestor>>,
+        ended: parking_lot::Mutex<Vec<crate::platform::SessionIdentity>>,
+    }
+
+    impl crate::platform::ProcessPlatform for FakeProcess {
+        fn inspect_peer(
+            &self,
+            _stream: &tokio::net::UnixStream,
+        ) -> crate::Result<crate::platform::PeerIdentity> {
+            unimplemented!()
+        }
+        fn verify_agent(
+            &self,
+            _stream: &std::os::unix::net::UnixStream,
+        ) -> crate::Result<crate::platform::AgentIdentity> {
+            unimplemented!()
+        }
+        fn peer_verification(&self) -> crate::proto::platform::PeerVerification {
+            crate::proto::platform::PeerVerification::Setgid
+        }
+        fn notes(&self) -> Vec<String> {
+            vec![]
+        }
+        fn verify_parent(&self, _fd: std::os::fd::BorrowedFd<'_>) -> crate::Result<u32> {
+            unimplemented!()
+        }
+        fn session_identity(
+            &self,
+            _peer: &crate::platform::PeerIdentity,
+        ) -> Option<crate::platform::SessionIdentity> {
+            *self.session.lock()
+        }
+        fn controlling_tty(&self, _peer: &crate::platform::PeerIdentity) -> Option<String> {
+            Some("/dev/pts/7".to_owned())
+        }
+        fn ancestry(
+            &self,
+            _pid: u32,
+            _start_time: u64,
+            _uid: u32,
+        ) -> Vec<crate::platform::Ancestor> {
+            self.ancestry.lock().clone()
+        }
+        fn session_alive(&self, session: &crate::platform::SessionIdentity) -> bool {
+            !self.ended.lock().contains(session)
+        }
+    }
+
     struct Fixture {
         authorizer: Authorizer,
         services: std::sync::Arc<MockServices>,
         sts: std::sync::Arc<FakeSts>,
         clock: std::sync::Arc<TestClock>,
         pidfd: std::sync::Arc<std::os::fd::OwnedFd>,
+        process: &'static FakeProcess,
     }
 
     const TTY: crate::platform::SessionIdentity = crate::platform::SessionIdentity::Tty {
@@ -1230,11 +1436,13 @@ mod tests {
         let pidfd = std::sync::Arc::new(pidfd);
         let sts = std::sync::Arc::new(FakeSts::default());
         sts.answer(Some("123456789012"));
+        let process: &'static FakeProcess = Box::leak(Box::default());
         Fixture {
             authorizer: Authorizer::with_clock(
                 engine,
                 services.clone(),
                 sts.clone(),
+                process,
                 true,
                 clock.clone(),
             ),
@@ -1242,6 +1450,7 @@ mod tests {
             sts,
             clock,
             pidfd,
+            process,
         }
     }
 
@@ -1275,6 +1484,7 @@ mod tests {
             )),
             cwd: b"/home/alice".to_vec(),
             auto_config_path: vec![],
+            env_names: vec![],
         }
     }
 
@@ -1296,9 +1506,39 @@ mod tests {
                 rolespec: &rs,
                 client_context: context.as_ref(),
             };
-            let mut p = Pending::new(&req, 1000, session, None, true);
+            let mut p = Pending::new(
+                &req,
+                1000,
+                session,
+                None,
+                true,
+                crate::tool_detection::Detection::default(),
+            );
             p.pid = pid;
             p.start_time = 1;
+            p.pidfd = Some(self.pidfd.clone());
+            p
+        }
+
+        /// A request from a peer, with its tool labels detected through the fake process platform.
+        fn peer_pending(
+            &self,
+            pid: u32,
+            role: &str,
+            context: Option<crate::proto::ClientContext>,
+        ) -> Pending {
+            let server = server();
+            let rs = rolespec(role);
+            let user_config = crate::config::UserConfig::default();
+            let peer = peer(pid);
+            let req = Request {
+                peer: Some(&peer),
+                server: &server,
+                user_config: &user_config,
+                rolespec: &rs,
+                client_context: context.as_ref(),
+            };
+            let mut p = self.authorizer.shared.pending(&req);
             p.pidfd = Some(self.pidfd.clone());
             p
         }
@@ -1309,6 +1549,172 @@ mod tests {
                 .decide(pending, crate::policy::Action::AssumeRole, None)
                 .await
         }
+    }
+
+    fn peer(pid: u32) -> crate::platform::PeerIdentity {
+        crate::platform::PeerIdentity {
+            uid: 1000,
+            gid: 973,
+            real_gid: Some(1000),
+            pid,
+            pidfd: None,
+            start_time: 1,
+            exe: Some("/usr/bin/mairu".into()),
+            trust: crate::platform::PeerTrust::Verified,
+        }
+    }
+
+    fn ancestor(
+        comm: &str,
+        session: Option<crate::platform::SessionIdentity>,
+    ) -> crate::platform::Ancestor {
+        crate::platform::Ancestor {
+            pid: 100,
+            comm: Some(comm.to_owned()),
+            exe: None,
+            argv: vec![comm.into()],
+            session,
+        }
+    }
+
+    fn with_env(
+        mut context: crate::proto::ClientContext,
+        names: &[&str],
+    ) -> crate::proto::ClientContext {
+        context.env_names = names.iter().map(|&n| n.to_owned()).collect();
+        context
+    }
+
+    #[tokio::test]
+    async fn test_ai_agent_never_reuses_session_grant() {
+        let f = fixture(MockServices::answering(R::Allowed, ""));
+        *f.process.session.lock() = Some(TTY);
+        let human = Some(crate::proto::ClientContext {
+            intent: Some(crate::proto::client_context::Intent::CredentialProcess(
+                crate::proto::CredentialProcessIntent {},
+            )),
+            ..Default::default()
+        });
+        let agent = human.clone().map(|c| with_env(c, &["CLAUDECODE"]));
+        f.decide(f.peer_pending(10, "r", human.clone()))
+            .await
+            .unwrap();
+        assert_eq!(f.services.prompts(), 1);
+        // The human's grant is in place, and the AI agent's request still asks.
+        let pending = f.peer_pending(11, "r", agent.clone());
+        assert_eq!(
+            pending.facts.tools,
+            ["ai-agent".to_owned()].into_iter().collect()
+        );
+        f.decide(pending).await.unwrap();
+        assert_eq!(f.services.prompts(), 2);
+        f.decide(f.peer_pending(11, "r", agent)).await.unwrap();
+        assert_eq!(f.services.prompts(), 3, "every new request asks");
+        f.decide(f.peer_pending(12, "r", human)).await.unwrap();
+        assert_eq!(f.services.prompts(), 3, "the human keeps the grant");
+    }
+
+    #[tokio::test]
+    async fn test_ai_agent_within_lease() {
+        let f = fixture(MockServices::answering(R::Allowed, ""));
+        *f.process.ancestry.lock() = vec![ancestor("mairu", None), ancestor("claude", None)];
+        let ctx = Some(exec_context("terraform plan", false));
+        let pending = f.peer_pending(10, "r", ctx.clone());
+        assert_eq!(
+            pending.facts.tool_matches,
+            ["process:claude".to_owned()].into_iter().collect()
+        );
+        f.decide(pending).await.unwrap();
+        f.clock.advance(3000);
+        f.decide(f.peer_pending(10, "r", ctx.clone()))
+            .await
+            .unwrap();
+        assert_eq!(f.services.prompts(), 1, "the lease covers it");
+        f.clock.advance(3601);
+        f.decide(f.peer_pending(10, "r", ctx)).await.unwrap();
+        assert_eq!(f.services.prompts(), 2, "an idle lease asks");
+    }
+
+    #[tokio::test]
+    async fn test_refusal_carries_tools() {
+        let f = fixture(MockServices::answering(R::Denied, ""));
+        let ctx = Some(with_env(exec_context("aws", false), &["AI_AGENT"]));
+        let refusal = f
+            .decide(f.peer_pending(10, "r", ctx))
+            .await
+            .expect_err("denied");
+        assert_eq!(refusal.reason(), Reason::Denied);
+        assert_eq!(refusal.tools, vec!["ai-agent"]);
+    }
+
+    #[tokio::test]
+    async fn test_marks_label_descendants_until_the_session_ends() {
+        let f = fixture(MockServices::answering(R::Allowed, ""));
+        f.authorizer.mark_tools(TTY, &["ai-agent".to_owned()]);
+        // A setsid child with no tty whose ancestry passes through the marked pane.
+        *f.process.ancestry.lock() = vec![ancestor("aws", None), ancestor("zsh", Some(TTY))];
+        let pending = f.peer_pending(10, "r", None);
+        assert_eq!(
+            pending.facts.tool_matches,
+            ["mark:ai-agent".to_owned()].into_iter().collect()
+        );
+        // From another pane.
+        let other = crate::platform::SessionIdentity::Tty {
+            sid: 5000,
+            leader_start_time: 7,
+        };
+        *f.process.ancestry.lock() = vec![ancestor("aws", None), ancestor("zsh", Some(other))];
+        assert!(f.peer_pending(10, "r", None).facts.tools.is_empty());
+        // The pane's leader exits: the sweep drops the mark.
+        f.process.ended.lock().push(TTY);
+        f.authorizer.counts();
+        *f.process.ancestry.lock() = vec![ancestor("aws", None), ancestor("zsh", Some(TTY))];
+        assert!(f.peer_pending(10, "r", None).facts.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unmark_always_asks() {
+        let f = fixture(MockServices::answering(R::Allowed, ""));
+        *f.process.session.lock() = Some(TTY);
+        let labels = ["ai-agent".to_owned(), "ci".to_owned()];
+        f.authorizer.mark_tools(TTY, &labels);
+        // A fresh grant in this session does not count.
+        f.decide(f.peer_pending(10, "r", None)).await.unwrap();
+        assert_eq!(f.services.prompts(), 1);
+        let remaining = f
+            .authorizer
+            .unmark_tools(Some(&peer(10)), &labels[..1])
+            .await
+            .unwrap();
+        assert_eq!(remaining, vec!["ci"]);
+        assert_eq!(f.services.prompts(), 2);
+        *f.services.answer.lock() = crate::proto::platform::AuthorizeResponse {
+            result: R::Denied.into(),
+            ..Default::default()
+        };
+        let status = f
+            .authorizer
+            .unmark_tools(Some(&peer(10)), &labels[1..])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::proto::AuthorizationError::from_status(&status)
+                .unwrap()
+                .reason(),
+            Reason::Denied
+        );
+        assert_eq!(f.services.prompts(), 3);
+        let (_, marks) = f.authorizer.tools_of(&peer(10), &[]);
+        assert_eq!(marks, vec!["ci"], "a denied unmark keeps the mark");
+        // Without a terminal session there is nothing to unmark.
+        *f.process.session.lock() = None;
+        let status = f
+            .authorizer
+            .unmark_tools(Some(&peer(10)), &labels[1..])
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(f.services.prompts(), 3);
     }
 
     fn reason(r: Result<Authorized, Refusal>) -> Reason {
@@ -1868,10 +2274,12 @@ mod tests {
         let services = MockServices::answering(R::Denied, "");
         let clock = std::sync::Arc::new(TestClock::default());
         let sts = std::sync::Arc::new(FakeSts::default());
+        let process: &'static FakeProcess = Box::leak(Box::default());
         let authorizer = Authorizer::with_clock(
             crate::policy::Engine::builtin(false).unwrap(),
             services.clone(),
             sts.clone(),
+            process,
             false,
             clock,
         );
@@ -1881,6 +2289,7 @@ mod tests {
             sts,
             clock: Default::default(),
             pidfd: fixture(MockServices::answering(R::Allowed, "")).pidfd,
+            process,
         };
         let flow = Flow::new();
         let obtained = flow

@@ -286,6 +286,26 @@ Error: refused at use-credentials: refused by policy (policies: builtin-caller-a
 
 If STS cannot be reached, a hardened agent vends nothing. Roles outside the `aws` partition, and networks that reach STS only through a VPC endpoint, cannot be served by a hardened agent for now.
 
+### AI coding tools
+
+AI coding agents run commands in your terminal session, as you. A remembered approval would let them ride on yours, so a hardened agent labels requests that come from such a tool `ai-agent` and asks for every new one; a running `mairu exec` still keeps its approval while it runs. Your own commands in the same terminal keep their approval as above.
+
+A request is labelled when any of these match:
+
+- a process among its ancestors (up to 64, while they run as you) whose name, executable, or first two arguments is one of `claude`, `codex`, `gemini`, `cursor-agent`, `aider`, `opencode`, `goose`, `amp`, `crush`, `qwen` or `copilot`;
+- an environment variable set by such a tool, such as `AI_AGENT`, `CLAUDECODE`, `GEMINI_CLI` or `CODEX_SANDBOX`; mairu sends the agent only the names of its environment variables, never their values;
+- a mark you put on the terminal session before starting a tool that detection would miss:
+
+```console
+$ mairu lock --tool ai-agent
+:: mairu :: Marked this terminal session (/dev/pts/7) as: ai-agent
+$ my-agent
+```
+
+The mark covers every command started from that terminal, including those a tool runs without a terminal, until the session ends. `mairu unlock --tool ai-agent` removes it, and always asks for approval, since the marked tool could run it too. `mairu doctor` shows the labels of the current terminal and its marks.
+
+Labels are a guardrail, not a security boundary: a renamed binary, a double fork or `systemd-run --user` escapes detection, and any program can claim to be a tool.
+
 ### Tmux over SSH
 
 Without a desktop session, as over SSH or in tmux, polkit has no authentication agent to show a dialog. mairu then runs polkit's own text agent, `/usr/bin/pkttyagent`, for itself on its terminal, and polkit asks for your login password right there:

@@ -91,6 +91,7 @@ impl ExecArgs {
                 .as_ref()
                 .map(|p| p.as_os_str().as_bytes().to_vec())
                 .unwrap_or_default(),
+            env_names: crate::tool_detection::env_names(),
         }
     }
 

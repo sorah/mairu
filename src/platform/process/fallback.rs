@@ -107,6 +107,14 @@ impl crate::platform::ProcessPlatform for FallbackProcess {
         None
     }
 
+    fn ancestry(&self, _pid: u32, _start_time: u64, _uid: u32) -> Vec<crate::platform::Ancestor> {
+        vec![]
+    }
+
+    fn session_alive(&self, _session: &crate::platform::SessionIdentity) -> bool {
+        false
+    }
+
     fn notes(&self) -> Vec<String> {
         vec!["peer verification is not implemented on this platform".to_owned()]
     }
