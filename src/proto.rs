@@ -67,9 +67,10 @@ impl AuthorizationError {
         use authorization_error::Reason;
         use prost::Message;
         let code = match self.reason() {
-            Reason::Unavailable | Reason::NoAuthenticationAgent | Reason::PresenceRequired => {
-                tonic::Code::FailedPrecondition
-            }
+            Reason::Unavailable
+            | Reason::NoAuthenticationAgent
+            | Reason::PresenceRequired
+            | Reason::CheckPending => tonic::Code::FailedPrecondition,
             Reason::Unspecified
             | Reason::UnverifiedPeer
             | Reason::Denied
@@ -103,6 +104,7 @@ impl AuthorizationError {
                 "polkit has no authentication agent for this process, for example outside a desktop session"
             }
             Reason::PresenceRequired => "a fresh approval is required",
+            Reason::CheckPending => "another human check is pending",
         };
         let mut message = summary.to_owned();
         if !self.policy_ids.is_empty() {

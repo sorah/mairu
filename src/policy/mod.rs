@@ -2,6 +2,7 @@
 //! closed.
 
 pub mod files;
+pub mod integrity_state;
 pub mod settings;
 pub mod user;
 
@@ -10,6 +11,7 @@ const BUILTIN_HUMAN: &str = include_str!("builtin/human.cedar");
 const BUILTIN_AI_AGENT: &str = include_str!("builtin/ai_agent.cedar");
 const BUILTIN_UNHARDENED: &str = include_str!("builtin/unhardened.cedar");
 const BUILTIN_ALWAYS_ON: &str = include_str!("builtin/always_on.cedar");
+const BUILTIN_LOCKDOWN: &str = include_str!("builtin/lockdown.cedar");
 
 /// Policy ids starting with this are reserved for the built-in policies.
 pub const BUILTIN_PREFIX: &str = "builtin-";
@@ -75,6 +77,27 @@ fn builtin_source(hardened: bool) -> String {
     }
 }
 
+/// What user policies join, besides the always-on built-ins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Base {
+    /// The built-ins for the hardening state.
+    Builtin { hardened: bool },
+    /// `builtin-lockdown` and `builtin-lockdown-no-ai`.
+    Lockdown,
+    /// Nothing: an approved `policy.cedar` replaces the built-ins.
+    None,
+}
+
+impl Base {
+    fn source(self) -> String {
+        match self {
+            Base::Builtin { hardened } => builtin_source(hardened),
+            Base::Lockdown => BUILTIN_LOCKDOWN.to_owned(),
+            Base::None => String::new(),
+        }
+    }
+}
+
 /// The gate a request is decided at.
 #[derive(Debug, Clone, Copy)]
 pub enum Action<'a> {
@@ -98,13 +121,10 @@ impl Engine {
         Self::new(&builtin_source(hardened))
     }
 
-    /// The built-ins for the hardening state plus `user` policies, whose ids are already assigned.
-    pub fn with_user_policies(
-        hardened: bool,
-        user: &[user::UserPolicy],
-    ) -> Result<Self, PolicyError> {
-        let builtin = builtin_source(hardened);
-        let mut text = format!("{builtin}\n{BUILTIN_ALWAYS_ON}");
+    /// `base` and the always-on built-ins, plus `user` policies, whose ids are already assigned.
+    pub fn with_user_policies(base: Base, user: &[user::UserPolicy]) -> Result<Self, PolicyError> {
+        let base = base.source();
+        let mut text = format!("{base}\n{BUILTIN_ALWAYS_ON}");
         let mut policies = cedar_policy::PolicySet::new();
         Self::add_policies(&mut policies, &text)?;
         for p in user {
@@ -543,6 +563,41 @@ mod tests {
         let eval = engine.evaluate(&prepared, &presence);
         assert!(eval.errors.is_empty(), "{:?}", eval.errors);
         eval.allowed
+    }
+
+    #[test]
+    fn test_lockdown_builtins_validate() {
+        let engine = Engine::with_user_policies(Base::Lockdown, &[]).unwrap();
+        let mut ids = engine.policy_ids();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "builtin-caller-account-mismatch",
+                "builtin-lockdown",
+                "builtin-lockdown-no-ai",
+                "builtin-use-credentials",
+            ]
+        );
+        let session = Presence::remembered(Scope::Session, "platform", 10, 10);
+        assert!(!allowed(&engine, session));
+        assert!(allowed(&engine, Presence::fresh("platform")));
+        assert!(allowed(
+            &engine,
+            Presence::remembered(Scope::Process, "platform", 99999, 3600)
+        ));
+        assert!(!allowed(
+            &engine,
+            Presence::remembered(Scope::Process, "platform", 10, 3601)
+        ));
+        let prepared = engine
+            .prepare(&ai_agent_facts(), Action::AssumeRole)
+            .unwrap();
+        assert!(
+            !engine
+                .evaluate(&prepared, &Presence::fresh("platform"))
+                .allowed
+        );
     }
 
     #[test]

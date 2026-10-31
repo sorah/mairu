@@ -137,22 +137,5 @@ pub enum Error {
 }
 
 pub(crate) fn http() -> reqwest::Client {
-    static HTTP: once_cell::sync::OnceCell<reqwest::Client> = once_cell::sync::OnceCell::new();
-    HTTP.get_or_init(|| {
-        let builder = reqwest::ClientBuilder::new()
-            .user_agent(format!(
-                "{}/{}",
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION")
-            ))
-            .redirect(reqwest::redirect::Policy::none());
-        // A proxy is set by same-user code, which a hardened agent does not trust with session tokens.
-        let builder = if crate::hardening::Hardening::marker().is_some() {
-            builder.no_proxy()
-        } else {
-            builder
-        };
-        builder.build().unwrap()
-    })
-    .clone()
+    crate::network::http()
 }

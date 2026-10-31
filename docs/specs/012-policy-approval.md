@@ -445,22 +445,39 @@ message ApprovePolicyResponse {
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented on `hardening/policy-approval`. Implementors MUST keep this section updated as they work.
 
 ### Checklist
 
-- [ ] Integrity records: digest, server digests, generation, approval anchor
-- [ ] Linux stores in the platform helper: protected directory (strong), Secret Service (weak), used concurrently
-- [ ] Verify: strong record by generation, state table, backfill, anchor in force, schema drift
-- [ ] `APPROVED` and `TAMPERED` effective policies; lockdown built-ins; warnings in every client
-- [ ] Per-server digests: server states, the stricter-state rule, digests of the configs captured at login, `ServerIntegrity` in `GetPolicy`
-- [ ] `ApprovePolicy` and `mairu policy approve`; `approval_methods`; the confirmation question and `--confirm <approval digest>`
-- [ ] One approval at a time; approval and credential checks never pending together
-- [ ] `CHANGED` servers refused, with the server URL in prompts
-- [ ] `PingAgentResponse.policy_integrity`
-- [ ] Recovery through `harden --reset-policy-record`
-- [ ] `doctor`: policy state, per-store statuses, the `approval_methods` warning
+- [x] Integrity records: digest, server digests, generation, approval anchor
+- [x] Linux stores in the platform helper: protected directory (strong), Secret Service (weak), used concurrently
+- [x] Verify: strong record by generation, state table, backfill, anchor in force, schema drift
+- [x] `APPROVED` and `TAMPERED` effective policies; lockdown built-ins; warnings in every client
+- [x] Per-server digests: server states, the stricter-state rule, digests of the configs captured at login, `ServerIntegrity` in `GetPolicy`
+- [x] `ApprovePolicy` and `mairu policy approve`; `approval_methods`; the confirmation question and `--confirm <approval digest>`
+- [x] One approval at a time; approval and credential checks never pending together
+- [x] `CHANGED` servers refused, with the server URL in prompts
+- [x] `PingAgentResponse.policy_integrity`
+- [x] Recovery through `harden --reset-policy-record`
+- [x] `doctor`: policy state, per-store statuses, the `approval_methods` warning
 
 ### Updates
 
 - 2026-10-29: Split out of hardening.md, policy.md and platform-helper.md.
+- 2026-10-31: Implemented.
+  - Secret Service crate: neither `secret-service` (5.x) nor `oo7` (0.6) uses zbus 6, which the helper already uses for polkit, so the helper talks to `org.freedesktop.Secret.Service` through its own zbus proxies (`src/platform/services/linux/integrity.rs`): `NameHasOwner` first so that no keyring daemon is activated, `ReadAlias("default")`, the collection's `Locked` (locked → `UNAVAILABLE`), a `plain` session, `SearchItems`/`GetSecrets`, and `CreateItem` with `replace`; a returned prompt is never answered and counts as `UNAVAILABLE`. Every call has a 5 s timeout. The session bus is `$XDG_RUNTIME_DIR/bus`; an unhardened helper honors `DBUS_SESSION_BUS_ADDRESS` first. Items that disagree with each other read as `UNAVAILABLE`.
+  - Protected directory: available when the helper is hardened and `/var/lib/mairu` and `/var/lib/mairu/users` are directories `root:<marker>` with no "other" bits, and `/var/lib/mairu` is not on FUSE. Every access runs inside `with_privileged_gid`; records are opened with `O_NOFOLLOW`, the per-user directory must be a real directory owned by the uid, and it is created `0700` (the setgid bit inherited from `users` is cleared). A record that does not parse reads as `MISMATCHED`.
+  - The record JSON is the one above with `windows_hello_keys` as base64; `src/platform/integrity.rs` (core) holds the codec, record names and paths.
+  - `RecordIntegrityRequest` gained `repeated IntegrityStoreKind stores = 4` (empty = every available store) so that backfill and the generation repair write only the stores that need it; writing everywhere would have overwritten a tampered weak record and hidden it.
+  - `GetPolicyRequest` gained `server_id = 1`: `effective_policies`/`effective_settings_json` are then those for that server's roles, so `explain` evaluates what a request for that server gets (a server unknown to the agent counts as unapproved; a changed one answers `FAILED_PRECONDITION`). `GetPolicyResponse` also carries `approval_anchor = 8`, `ServerIntegrity` carries `logged_in = 4`, and `GetAgentStatusResponse` carries `policy_stores = 11` and `approval_anchor = 12` for `doctor`, which keeps to `PingAgent`/`GetAgentStatus`.
+  - A credential check refused while an approval waits answers the new `REASON_CHECK_PENDING` (`FAILED_PRECONDITION`) naming the approval's terminal. Prompts for `mairu unlock --tool` count as credential checks for this rule. An approval refused because another approval or a credential check is pending answers `FAILED_PRECONDITION` naming the other's terminal (or `pid N` without one).
+  - The approval digest is `SHA-256("mairu.approval.v1\0" || digest || server digests in server id order)`. The server digest's canonical JSON is `serde_json` of the parsed config with `id` set to the effective id, the four uncounted keys removed at any depth, sorted keys and no whitespace. The record keeps the digests of the `servers.d` files at approval time (what the client showed); a request compares the digest of the config captured in its session, or of the file when not logged in.
+  - Verification is cached with the files: store results, like the files, are re-read when a file's `(dev, ino, mtime, size)` changes and at least every 5 s, and immediately after `ApprovePolicy`. A store-only change (a deleted or altered Secret Service item) is therefore seen within 5 s.
+  - Approved settings: `methods`, `approval_methods`, `tool_detection`, `grant_retention_secs` (uncapped), `sts` and `network` apply. `sts` picks the region and endpoint of `GetCallerIdentity`: a server's own `servers.<id>.region` uses that region's endpoint, otherwise `endpoint`, otherwise the regional endpoint of `region`, otherwise the global endpoint.
+  - `network` ([011 Settings](011-user-policy.md#settings)) is wired in `src/network.rs`: an approved `proxy` carries every outbound connection of the agent and `extra_roots` are trusted beside the system roots, for the reqwest client of credential servers and OAuth and for the AWS SDK clients (SSO, SSO OIDC, and STS at gate 2) through an `aws-smithy-http-client` connector (rustls with the native roots). The clients are rebuilt whenever a policy load yields other network settings; without approved settings the agent keeps the defaults (no proxy on a hardened agent, system roots only, the SDK's own client). Verified in Docker with a CONNECT proxy tunnelling to a fake AWS whose CA is only in `extra_roots`.
+  - Key-based methods do not exist yet (013/016), so anchors carry no keys, `approval_methods` accepts only `"platform"`, and the default is `["platform"]`. `doctor`'s warning for `"platform"` in an anchor with keys is in place; `check` cannot warn yet, since no file can register a key.
+  - After `--reset-policy-record`, a Secret Service record of the last approval still matches unchanged files, so the state table gives `UNAPPROVED` (a strong store is available and none matched); it reads as `MISMATCHED`, and so lockdown, once the files change. The Recovery section's "a stale weak record then reads as `MISMATCHED`" holds for files edited since that approval; the state table was followed, and `harden` says so.
+  - `harden --reset-policy-record --user <name>` removes both `policy.record` and `policy-dev.record`, so that a development profile can be recovered too. It runs before anything else `harden` does and needs root like the rest.
+  - The approved `policy.cedar` replaces the hardening state's built-ins (the always-on gate-2 built-ins stay), also on an unhardened agent, which then runs gate 2. An approved `authorization.json` without `policy.cedar` keeps the built-ins.
+  - `mairu policy approve` runs `check`, prints both files, each server's counted JSON and digest, the policy and approval digests, the current state, and warns about sessions holding another config; then the `[y/N]` question on `/dev/tty` (anything but `y`/`yes` declines), `--confirm`, or, without a terminal, the `--confirm` command to run. While the agent waits it prints that it waits for the policy approval, not for credentials, and it falls back to `pkttyagent` like credential requests. The polkit message names the first 16 hex digits of the approval digest; `policy_digest` in the details holds the approval digest.
+  - Verified in Docker (`012-policy-approval` scenario: hardened install, polkit answering through a rules file, a session bus with an unlocked gnome-keyring per user, the fake credential server and STS): approval refused without a terminal, with a wrong `--confirm`, and on `N`, each without a polkit prompt; approval on `y` through one `approve-policy` check; records in both stores (`/var/lib/mairu` and `users` `root:mairu 2770`, the per-user directory `0700` and the record `0600`, owned by the user and unreachable by her, the Secret Service item holding the same JSON); `show`/`doctor` states, stores, anchor and servers; an approved permit vending without a prompt; a hand edit putting the agent in lockdown (client warning, fresh check, AI agent refused, forbid kept) and `--confirm` restoring it at generation 2; a deleted Secret Service item backfilled and an altered one meaning `TAMPERED`; a new server unapproved, an approved server whose config changed refused (naming its URL) until re-login; a credential check refused while an approval waits and a second approval refused, both naming `/dev/pts/N`, and an approval refused while a credential check waits; `reset-policy-record` with a stale weak record (unapproved while it matches, lockdown once the files change, then approval through `platform` at generation 1) and without one (unapproved); an unhardened agent approved through Secret Service alone, running gate 2 at the approved STS region; approved `network` sending login, credential server and STS traffic through a CONNECT proxy to a server trusted only through `extra_roots`, unapproved and tampered files connecting directly.

@@ -21,9 +21,11 @@ pub async fn sdk_config(region: Option<&str>) -> aws_config::SdkConfig {
         }
         builder
     };
-    builder
-        .identity_cache(aws_config::identity::IdentityCache::no_cache())
-        .build()
+    let mut builder = builder.identity_cache(aws_config::identity::IdentityCache::no_cache());
+    if let Some(http_client) = crate::network::sdk_http_client() {
+        builder.set_http_client(Some(http_client));
+    }
+    builder.build()
 }
 
 pub async fn sso_config_to_ssooidc(sso: &crate::config::ServerAwsSso) -> aws_sdk_ssooidc::Client {

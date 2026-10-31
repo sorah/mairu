@@ -293,6 +293,7 @@ mod tests {
                     name: "policy".to_owned(),
                     uid: 0,
                     record: None,
+                    stores: vec![],
                 },
             ))
             .await

@@ -24,6 +24,14 @@ pub struct HardenArgs {
     /// With --uninstall, also remove /var/lib/mairu
     #[arg(long, requires = "uninstall")]
     pub purge: bool,
+
+    /// Remove a user's policy approval record from /var/lib/mairu, for when every approval key is lost
+    #[arg(long, requires = "user", conflicts_with_all = ["uninstall", "from", "home"])]
+    pub reset_policy_record: bool,
+
+    /// With --reset-policy-record, the user whose record to remove
+    #[arg(long, value_name = "NAME", requires = "reset_policy_record")]
+    pub user: Option<String>,
 }
 
 fn absolute_path(s: &str) -> Result<std::path::PathBuf, String> {
@@ -148,6 +156,9 @@ mod linux {
             );
             return Err(crate::Error::FailureButSilentlyExit.into());
         }
+        if args.reset_policy_record {
+            return reset_policy_record(args.user.as_deref().unwrap_or_default());
+        }
         let invoker = invoking_user();
         let home = resolve_home(args.home.as_deref(), invoker.as_ref());
         println!("Harden home: {} ({})", home.path.display(), home.source);
@@ -188,6 +199,40 @@ mod linux {
         );
         println!(
             "Other mairu installations on this host now run it. The next mairu command replaces a running unhardened agent; or run `mairu kill-agent` now."
+        );
+        Ok(())
+    }
+
+    /// Deletes the strong record of both profiles. The user's Secret Service item stays; once it no longer
+    /// matches the files, it means lockdown until the next approval.
+    fn reset_policy_record(name: &str) -> Result<(), anyhow::Error> {
+        let user = nix::unistd::User::from_name(name)?
+            .ok_or_else(|| anyhow::anyhow!("no user named {name:?}"))?;
+        let uid = user.uid.as_raw();
+        let root = std::path::Path::new(crate::platform::integrity::PROTECTED_DIRECTORY);
+        let mut removed = 0;
+        for record in ["policy", "policy-dev"] {
+            let path = crate::platform::integrity::record_path(root, uid, record);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    println!("Removed {}", path.display());
+                    removed += 1;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("failed to remove {}", path.display()));
+                }
+            }
+        }
+        if removed == 0 {
+            println!(
+                "{name} (uid {uid}) has no policy record in {}",
+                root.display()
+            );
+            return Ok(());
+        }
+        println!(
+            "{name}'s policy is now unapproved, and the next approval asks through \"platform\". Until then, a Secret Service record of the old approval that no longer matches the files means lockdown."
         );
         Ok(())
     }

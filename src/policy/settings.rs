@@ -8,6 +8,7 @@ pub const DEFAULT_GRANT_RETENTION_SECS: u64 = 43200;
 pub struct AuthorizationSettings {
     pub version: u32,
     pub methods: Option<Vec<String>>,
+    pub approval_methods: Option<Vec<String>>,
     pub tool_detection: Option<std::collections::BTreeMap<String, ToolDetectionEntry>>,
     pub grant_retention_secs: Option<u64>,
     pub sts: Option<StsSettings>,
@@ -23,26 +24,29 @@ pub struct ToolDetectionEntry {
     pub env_names: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StsSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<url::Url>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub servers: std::collections::BTreeMap<String, StsServerSettings>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StsServerSettings {
     pub region: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy: Option<url::Url>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_roots: Vec<String>,
 }
 
@@ -58,12 +62,17 @@ impl AuthorizationSettings {
         if self.version != 1 {
             return Err(format!("unsupported version {}; expected 1", self.version));
         }
-        for method in self.methods.iter().flatten() {
-            if !KNOWN_METHODS.contains(&method.as_str()) {
-                return Err(format!(
-                    "methods: unknown method {method:?}; known: {}",
-                    KNOWN_METHODS.join(", ")
-                ));
+        for (field, methods) in [
+            ("methods", &self.methods),
+            ("approval_methods", &self.approval_methods),
+        ] {
+            for method in methods.iter().flatten() {
+                if !KNOWN_METHODS.contains(&method.as_str()) {
+                    return Err(format!(
+                        "{field}: unknown method {method:?}; known: {}",
+                        KNOWN_METHODS.join(", ")
+                    ));
+                }
             }
         }
         for label in self.tool_detection.iter().flat_map(|t| t.keys()) {
@@ -120,22 +129,61 @@ fn validate_certificate(pem: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the policy files carry an approval. Only the states without an approval record exist so far.
+/// Whether the policy files carry an approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyState {
-    /// Neither file exists.
+    /// Neither file exists, and no store holds a record.
     Absent,
+    /// A strong store, or on an unhardened agent a weak one, records the files as they are.
+    Approved,
     /// A file exists, and nothing records that a human approved it.
     Unapproved,
+    /// The files differ from a record: lockdown.
+    Tampered,
 }
 
 impl PolicyState {
     pub fn as_str(self) -> &'static str {
         match self {
             PolicyState::Absent => "absent",
+            PolicyState::Approved => "approved",
             PolicyState::Unapproved => "unapproved",
+            PolicyState::Tampered => "tampered",
         }
     }
+
+    /// `APPROVED` < `UNAPPROVED` < `TAMPERED`; `ABSENT` sits with `APPROVED`, as the built-ins apply anyway.
+    fn strictness(self) -> u8 {
+        match self {
+            PolicyState::Absent | PolicyState::Approved => 0,
+            PolicyState::Unapproved => 1,
+            PolicyState::Tampered => 2,
+        }
+    }
+
+    /// The stricter of two states.
+    pub fn max(self, other: Self) -> Self {
+        if other.strictness() > self.strictness() {
+            other
+        } else {
+            self
+        }
+    }
+
+    pub fn to_proto(self) -> crate::proto::PolicyIntegrity {
+        match self {
+            PolicyState::Absent => crate::proto::PolicyIntegrity::Absent,
+            PolicyState::Approved => crate::proto::PolicyIntegrity::Approved,
+            PolicyState::Unapproved => crate::proto::PolicyIntegrity::Unapproved,
+            PolicyState::Tampered => crate::proto::PolicyIntegrity::Tampered,
+        }
+    }
+}
+
+/// `approval_methods` when the file has none: the key-based methods with registered keys, else `["platform"]`.
+/// No key-based method exists yet.
+pub fn default_approval_methods() -> Vec<String> {
+    vec![crate::authorization::METHOD_PLATFORM.to_owned()]
 }
 
 /// The settings in force.
@@ -143,10 +191,19 @@ impl PolicyState {
 pub struct EffectiveSettings {
     pub version: u32,
     pub methods: Vec<String>,
+    /// Methods allowed to approve the next change, recorded in the anchor; only set from an approved file.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub approval_methods: Vec<String>,
     /// Additions to the built-in labels.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tool_detection: std::collections::BTreeMap<String, ToolDetectionEntry>,
     pub grant_retention_secs: u64,
+    /// How gate 2 reaches STS; only set from an approved file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sts: Option<StsSettings>,
+    /// The agent's proxy and extra TLS roots; only set from an approved file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkSettings>,
 }
 
 impl Default for EffectiveSettings {
@@ -154,15 +211,19 @@ impl Default for EffectiveSettings {
         Self {
             version: 1,
             methods: vec![crate::authorization::METHOD_PLATFORM.to_owned()],
+            approval_methods: vec![],
             tool_detection: Default::default(),
             grant_retention_secs: DEFAULT_GRANT_RETENTION_SECS,
+            sts: None,
+            network: None,
         }
     }
 }
 
 impl EffectiveSettings {
-    /// The defaults, plus what can only tighten from an unapproved file: label additions and a shorter grant
-    /// retention. `methods`, `sts` and `network` are never taken from an unapproved file.
+    /// An approved file as it is. Otherwise the defaults, plus what can only tighten: label additions and a
+    /// shorter grant retention. `methods`, `approval_methods`, `sts` and `network` are never taken from a file that
+    /// is not approved.
     pub fn effective(state: PolicyState, file: Option<&AuthorizationSettings>) -> Self {
         let mut settings = Self::default();
         let Some(file) = file else {
@@ -170,7 +231,24 @@ impl EffectiveSettings {
         };
         match state {
             PolicyState::Absent => {}
-            PolicyState::Unapproved => {
+            PolicyState::Approved => {
+                if let Some(methods) = &file.methods {
+                    settings.methods = methods.clone();
+                }
+                settings.approval_methods = file
+                    .approval_methods
+                    .clone()
+                    .unwrap_or_else(default_approval_methods);
+                if let Some(tool_detection) = &file.tool_detection {
+                    settings.tool_detection = tool_detection.clone();
+                }
+                if let Some(secs) = file.grant_retention_secs {
+                    settings.grant_retention_secs = secs;
+                }
+                settings.sts = file.sts.clone();
+                settings.network = file.network.clone();
+            }
+            PolicyState::Unapproved | PolicyState::Tampered => {
                 if let Some(tool_detection) = &file.tool_detection {
                     settings.tool_detection = tool_detection.clone();
                 }
@@ -180,6 +258,17 @@ impl EffectiveSettings {
             }
         }
         settings
+    }
+
+    /// The approval anchor an approval of a file with these settings records.
+    pub fn anchor(file: Option<&AuthorizationSettings>) -> crate::proto::platform::ApprovalAnchor {
+        crate::proto::platform::ApprovalAnchor {
+            methods: file
+                .and_then(|f| f.approval_methods.clone())
+                .unwrap_or_else(default_approval_methods),
+            ssh_agent_keys: vec![],
+            windows_hello_keys: vec![],
+        }
     }
 
     pub fn labels(&self) -> Vec<crate::tool_detection::ToolLabel> {
@@ -252,6 +341,7 @@ XLz4KNOFkg==
             AuthorizationSettings {
                 version: 1,
                 methods: None,
+                approval_methods: None,
                 tool_detection: None,
                 grant_retention_secs: None,
                 sts: None,
@@ -288,6 +378,10 @@ XLz4KNOFkg==
         );
         assert!(
             rejects(&|v| v["methods"] = serde_json::json!(["fido"])).contains("unknown method")
+        );
+        assert!(
+            rejects(&|v| v["approval_methods"] = serde_json::json!(["fido"]))
+                .contains("approval_methods: unknown method")
         );
         assert!(
             rejects(&|v| v["tool_detection"]["CI"] = serde_json::json!({}))
@@ -340,6 +434,53 @@ XLz4KNOFkg==
         let s = EffectiveSettings::effective(PolicyState::Unapproved, Some(&file));
         assert_eq!(s.grant_retention_secs, 600);
         assert_eq!(s.methods, vec!["platform"]);
+    }
+
+    #[test]
+    fn test_effective_approved() {
+        let mut v = full();
+        v["grant_retention_secs"] = 86400.into();
+        v["approval_methods"] = serde_json::json!(["platform"]);
+        let file = parse(v).unwrap();
+        let s = EffectiveSettings::effective(PolicyState::Approved, Some(&file));
+        assert_eq!(s.grant_retention_secs, 86400);
+        assert_eq!(s.approval_methods, vec!["platform"]);
+        assert_eq!(s.sts.as_ref().unwrap().region.as_deref(), Some("us-east-1"));
+        let json: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!(json["sts"]["servers"]["cn"]["region"], "cn-north-1");
+        assert_eq!(
+            s.network.as_ref().unwrap().proxy.as_ref().unwrap().as_str(),
+            "http://proxy.corp.example:3128/"
+        );
+
+        // Lockdown takes only what tightens, as unapproved files do.
+        let s = EffectiveSettings::effective(PolicyState::Tampered, Some(&file));
+        assert_eq!(s.grant_retention_secs, DEFAULT_GRANT_RETENTION_SECS);
+        assert!(s.sts.is_none());
+        assert!(s.network.is_none());
+        assert!(s.approval_methods.is_empty());
+        assert_eq!(s.tool_detection.len(), 3);
+    }
+
+    #[test]
+    fn test_anchor() {
+        assert_eq!(EffectiveSettings::anchor(None).methods, vec!["platform"]);
+        let file =
+            parse(serde_json::json!({"version": 1, "approval_methods": ["platform"]})).unwrap();
+        assert_eq!(
+            EffectiveSettings::anchor(Some(&file)).methods,
+            vec!["platform"]
+        );
+    }
+
+    #[test]
+    fn test_state_order() {
+        use PolicyState::*;
+        assert_eq!(Approved.max(Unapproved), Unapproved);
+        assert_eq!(Unapproved.max(Approved), Unapproved);
+        assert_eq!(Unapproved.max(Tampered), Tampered);
+        assert_eq!(Tampered.max(Approved), Tampered);
+        assert_eq!(Absent.max(Unapproved), Unapproved);
     }
 
     #[test]

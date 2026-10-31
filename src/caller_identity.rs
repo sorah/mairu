@@ -123,16 +123,67 @@ pub fn summary(arn: &str) -> String {
     format!("{account} {resource}")
 }
 
+/// Where `sts:GetCallerIdentity` is sent: the global endpoint unless an approved `authorization.json` says otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StsTarget {
+    pub region: String,
+    pub endpoint: String,
+}
+
+impl Default for StsTarget {
+    fn default() -> Self {
+        Self {
+            region: STS_REGION.to_owned(),
+            endpoint: STS_ENDPOINT.to_owned(),
+        }
+    }
+}
+
+impl StsTarget {
+    /// A server's own region takes its regional endpoint; otherwise the configured endpoint, or the regional
+    /// endpoint of the configured region.
+    pub fn from_settings(
+        sts: Option<&crate::policy::settings::StsSettings>,
+        server_id: &str,
+    ) -> Self {
+        let Some(sts) = sts else {
+            return Self::default();
+        };
+        if let Some(region) = sts.servers.get(server_id).and_then(|s| s.region.clone()) {
+            return Self {
+                endpoint: regional_endpoint(&region),
+                region,
+            };
+        }
+        let region = sts.region.clone().unwrap_or_else(|| STS_REGION.to_owned());
+        let endpoint = match (&sts.endpoint, &sts.region) {
+            (Some(e), _) => e.as_str().trim_end_matches('/').to_owned(),
+            (None, Some(r)) => regional_endpoint(r),
+            (None, None) => STS_ENDPOINT.to_owned(),
+        };
+        Self { region, endpoint }
+    }
+}
+
+fn regional_endpoint(region: &str) -> String {
+    if region.starts_with("cn-") {
+        format!("https://sts.{region}.amazonaws.com.cn")
+    } else {
+        format!("https://sts.{region}.amazonaws.com")
+    }
+}
+
 /// Asks who credentials belong to.
 #[async_trait::async_trait]
 pub trait Identify: Send + Sync + std::fmt::Debug {
     async fn identify(
         &self,
         credentials: &crate::client::AssumeRoleResponse,
+        target: &StsTarget,
     ) -> Result<Caller, String>;
 }
 
-/// `sts:GetCallerIdentity` against [`STS_ENDPOINT`], configured explicitly so that no `AWS_*` variable or shared
+/// `sts:GetCallerIdentity` against a [`StsTarget`], configured explicitly so that no `AWS_*` variable or shared
 /// config file can redirect it.
 #[derive(Debug, Default)]
 pub struct Sts {
@@ -149,7 +200,11 @@ impl Sts {
         }
     }
 
-    fn client(&self, credentials: &crate::client::AssumeRoleResponse) -> aws_sdk_sts::Client {
+    fn client(
+        &self,
+        credentials: &crate::client::AssumeRoleResponse,
+        target: &StsTarget,
+    ) -> aws_sdk_sts::Client {
         use secrecy::ExposeSecret;
         let credentials = aws_sdk_sts::config::Credentials::new(
             &credentials.access_key_id,
@@ -160,16 +215,20 @@ impl Sts {
         );
         let mut config = aws_sdk_sts::Config::builder()
             .behavior_version(aws_sdk_sts::config::BehaviorVersion::latest())
-            .region(aws_sdk_sts::config::Region::from_static(STS_REGION))
-            .endpoint_url(STS_ENDPOINT)
+            .region(aws_sdk_sts::config::Region::new(target.region.clone()))
+            .endpoint_url(&target.endpoint)
             .credentials_provider(credentials)
             .timeout_config(
                 aws_sdk_sts::config::timeout::TimeoutConfig::builder()
                     .operation_timeout(STS_OPERATION_TIMEOUT)
                     .build(),
             );
-        if let Some(http_client) = &self.http_client {
-            config = config.http_client(http_client.clone());
+        if let Some(http_client) = self
+            .http_client
+            .clone()
+            .or_else(crate::network::sdk_http_client)
+        {
+            config = config.http_client(http_client);
         }
         aws_sdk_sts::Client::from_conf(config.build())
     }
@@ -180,9 +239,10 @@ impl Identify for Sts {
     async fn identify(
         &self,
         credentials: &crate::client::AssumeRoleResponse,
+        target: &StsTarget,
     ) -> Result<Caller, String> {
         let resp = self
-            .client(credentials)
+            .client(credentials, target)
             .get_caller_identity()
             .send()
             .await
@@ -332,11 +392,15 @@ mod tests {
     }
 
     async fn identify_through_fake() -> (Caller, Vec<(String, String)>) {
+        identify_at(&StsTarget::default()).await
+    }
+
+    async fn identify_at(target: &StsTarget) -> (Caller, Vec<(String, String)>) {
         let fake = FakeSts::default();
         let sts = Sts::with_http_client(
             aws_smithy_runtime_api::client::http::SharedHttpClient::new(fake.clone()),
         );
-        let caller = sts.identify(&credentials()).await.unwrap();
+        let caller = sts.identify(&credentials(), target).await.unwrap();
         let requests = fake.requests.lock().clone();
         (caller, requests)
     }
@@ -358,6 +422,44 @@ mod tests {
     async fn test_sts_fixed_endpoint() {
         let (caller, requests) = identify_through_fake().await;
         assert_fixed_endpoint(&caller, &requests);
+    }
+
+    #[tokio::test]
+    async fn test_sts_target_from_settings() {
+        let sts: crate::policy::settings::StsSettings = serde_json::from_value(serde_json::json!({
+            "region": "eu-west-1",
+            "servers": {"cn": {"region": "cn-north-1"}},
+        }))
+        .unwrap();
+        assert_eq!(StsTarget::from_settings(None, "x"), StsTarget::default());
+        let t = StsTarget::from_settings(Some(&sts), "contoso");
+        assert_eq!(t.endpoint, "https://sts.eu-west-1.amazonaws.com");
+        assert_eq!(t.region, "eu-west-1");
+        let t = StsTarget::from_settings(Some(&sts), "cn");
+        assert_eq!(t.endpoint, "https://sts.cn-north-1.amazonaws.com.cn");
+        let sts: crate::policy::settings::StsSettings = serde_json::from_value(serde_json::json!({
+            "region": "us-east-1",
+            "endpoint": "https://vpce-0123.sts.us-east-1.vpce.amazonaws.com/",
+        }))
+        .unwrap();
+        let t = StsTarget::from_settings(Some(&sts), "contoso");
+        assert_eq!(
+            t.endpoint,
+            "https://vpce-0123.sts.us-east-1.vpce.amazonaws.com"
+        );
+
+        let (_, requests) = identify_at(&StsTarget::from_settings(
+            Some(&serde_json::from_value(serde_json::json!({"region": "eu-west-1"})).unwrap()),
+            "contoso",
+        ))
+        .await;
+        assert!(
+            requests[0]
+                .0
+                .starts_with("https://sts.eu-west-1.amazonaws.com/"),
+            "{requests:?}"
+        );
+        assert!(requests[0].1.contains("/eu-west-1/sts/aws4_request"));
     }
 
     const ENV_CHILD: &str = "MAIRU_TEST_CALLER_IDENTITY_ENV_CHILD";
