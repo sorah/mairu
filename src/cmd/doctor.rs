@@ -25,6 +25,7 @@ pub async fn run(_args: &DoctorArgs) -> Result<(), anyhow::Error> {
     }
 
     let path = crate::config::socket_path();
+    let mut agent_status = None;
     match crate::agent::connect_to_agent_with_path(&path).await {
         Err(e) => println!("agent    not running at {} ({e})", path.display()),
         Ok(mut conn) => {
@@ -40,6 +41,7 @@ pub async fn run(_args: &DoctorArgs) -> Result<(), anyhow::Error> {
                 Ok(status) => {
                     let status = status.into_inner();
                     print_agent_status(&status, &path, verification);
+                    agent_status = Some(status.clone());
                     let agent_hardened =
                         status.agent_hardening() == crate::proto::HardeningState::Hardened;
                     if agent_hardened && !status.caller.is_some_and(|c| c.verified) {
@@ -72,6 +74,11 @@ pub async fn run(_args: &DoctorArgs) -> Result<(), anyhow::Error> {
             }
         }
     }
+
+    #[cfg(target_os = "linux")]
+    warnings.extend(headless::report(agent_status.as_ref()));
+    #[cfg(not(target_os = "linux"))]
+    let _ = agent_status;
 
     for w in warnings {
         println!("warning  {w}");
@@ -328,6 +335,102 @@ mod install {
     pub(super) fn parse_version_output(output: &str) -> Option<String> {
         let version = output.split_whitespace().nth(1)?;
         crate::version::at_least(version, "0.0.0").then(|| version.to_owned())
+    }
+}
+
+/// Whether a password prompt can be shown here when no desktop authentication agent can ask.
+#[cfg(target_os = "linux")]
+mod headless {
+    /// Prints the headless section; returns warnings.
+    pub fn report(agent: Option<&crate::proto::GetAgentStatusResponse>) -> Vec<String> {
+        let mut warnings = vec![];
+        println!("headless");
+
+        let authorization = agent.map(|a| {
+            (
+                a.agent_hardening() == crate::proto::HardeningState::Hardened,
+                a.capabilities
+                    .as_ref()
+                    .map(|c| c.authorization())
+                    .unwrap_or_default(),
+            )
+        });
+        // An unhardened agent never asks, so nothing here matters to it.
+        let asks = !matches!(authorization, Some((false, _)));
+
+        let tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty");
+        match tty {
+            Ok(_) => println!(
+                "  tty           {}",
+                crate::cmd::authorization::terminal_origin()
+                    .unwrap_or_else(|| "/dev/tty".to_owned())
+            ),
+            Err(e) => {
+                println!("  tty           none ({e})");
+                if asks {
+                    warnings.push("there is no terminal here, so a password prompt cannot be shown when no desktop authentication agent can ask".to_owned());
+                }
+            }
+        }
+
+        let ssh = ["SSH_CONNECTION", "SSH_TTY"]
+            .into_iter()
+            .find(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()));
+        match ssh {
+            Some(var) => println!("  ssh           yes (${var})"),
+            None => println!("  ssh           no"),
+        }
+
+        match authorization {
+            None => println!("  polkit        unknown (no status from the agent)"),
+            Some((false, _)) => println!("  polkit        not used (the agent is not hardened)"),
+            Some((true, facility)) => {
+                let name = facility.as_str_name();
+                let name = name.strip_prefix("AUTHORIZATION_FACILITY_").unwrap_or(name);
+                if facility == crate::proto::platform::AuthorizationFacility::Polkit {
+                    println!("  polkit        available (authorization: {name})");
+                } else {
+                    println!("  polkit        unavailable (authorization: {name})");
+                    warnings.push("polkit is unavailable to the agent, so roles that need approval are refused".to_owned());
+                }
+            }
+        }
+
+        let pkttyagent = crate::polkit_tty_agent::PKTTYAGENT;
+        match crate::polkit_tty_agent::check_pkttyagent() {
+            Ok(facts) => println!(
+                "  pkttyagent    {pkttyagent} {}:{} {:04o} ✓",
+                user_name(facts.uid),
+                group_name(facts.gid),
+                facts.mode
+            ),
+            Err(e) => {
+                println!("  pkttyagent    {pkttyagent} ✗ {e}");
+                if asks {
+                    warnings.push(format!("{pkttyagent} cannot be used ({e}), so password prompts in a terminal are unavailable"));
+                }
+            }
+        }
+        warnings
+    }
+
+    fn user_name(uid: u32) -> String {
+        nix::unistd::User::from_uid(uid.into())
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+            .unwrap_or_else(|| uid.to_string())
+    }
+
+    fn group_name(gid: u32) -> String {
+        nix::unistd::Group::from_gid(gid.into())
+            .ok()
+            .flatten()
+            .map(|g| g.name)
+            .unwrap_or_else(|| gid.to_string())
     }
 }
 

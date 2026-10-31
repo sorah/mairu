@@ -13,6 +13,7 @@
 - A hardened agent asks for approval through polkit before vending credentials for a role, once per terminal session (5 minutes idle, 12 hours at most) and once per running `mairu exec`, whose background refresh never prompts. The decision is a built-in [Cedar](https://www.cedarpolicy.com/) policy; an unhardened agent never asks. Approvals are kept in memory only.
 - New `mairu lock` command makes the agent forget approvals: all of them, those of the current terminal session (`--session`), or also those of running `mairu exec` (`--running`).
 - `mairu harden` and the Debian package install the polkit actions `co.0w0.mairu.*` at `/usr/share/polkit-1/actions/co.0w0.mairu.policy`. The Debian package recommends `polkitd`.
+- Without a desktop session, as in tmux over SSH, mairu registers polkit's text agent `/usr/bin/pkttyagent` for itself on its terminal, so the approval prompt asks for your password in the pane that made the request. Commands without a terminal are refused with guidance. `mairu doctor` gains a headless section (terminal, SSH, polkit, `pkttyagent`).
 - The agent runs platform services in a child process, `mairu platform-helper`, that holds no tokens. The agent and the helper verify each other, the helper exits with the agent, and a helper that died is restarted within 30 seconds; meanwhile those services fail closed. `mairu doctor` shows the helper's state and capabilities.
 
 ### Miscellaneous

@@ -13,8 +13,22 @@ pub fn cwd() -> Vec<u8> {
         .unwrap_or_default()
 }
 
+/// How the human is asked, which decides the first and last of the [`context_lines`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prompt {
+    /// The agent may be asking through a system dialog; the client cannot tell.
+    MaybeDialog,
+    /// pkttyagent is about to ask for a password on this terminal.
+    Password,
+}
+
 /// The lines of "What the human sees", for the terminal.
-pub fn context_lines(server: &str, role: &str, context: &crate::proto::ClientContext) -> String {
+pub fn context_lines(
+    server: &str,
+    role: &str,
+    context: &crate::proto::ClientContext,
+    prompt: Prompt,
+) -> String {
     let product = env!("CARGO_PKG_NAME");
     let command = match &context.intent {
         Some(crate::proto::client_context::Intent::Exec(e)) => {
@@ -25,8 +39,12 @@ pub fn context_lines(server: &str, role: &str, context: &crate::proto::ClientCon
         }
         None => "(unknown)".to_owned(),
     };
+    let heading = match prompt {
+        Prompt::MaybeDialog => "Authorization may be required",
+        Prompt::Password => "Authorization required",
+    };
     let mut lines = format!(
-        ":: {product} :: Authorization may be required: {role} on {server}\n:: {product} ::   command: {command}\n"
+        ":: {product} :: {heading}: {role} on {server}\n:: {product} ::   command: {command}\n"
     );
     if !context.cwd.is_empty() {
         lines.push_str(&format!(
@@ -37,15 +55,17 @@ pub fn context_lines(server: &str, role: &str, context: &crate::proto::ClientCon
     if let Some(from) = terminal_origin() {
         lines.push_str(&format!(":: {product} ::   from:    {from}\n"));
     }
-    lines.push_str(&format!(
-        ":: {product} :: Approve in the system dialog if one appears.\n"
-    ));
+    let instruction = match prompt {
+        Prompt::MaybeDialog => "Approve in the system dialog if one appears.",
+        Prompt::Password => "Enter your password below.",
+    };
+    lines.push_str(&format!(":: {product} :: {instruction}\n"));
     lines
 }
 
 /// `/dev/pts/3 (zsh, tmux pane)`: this process's controlling terminal and its session leader.
 #[cfg(target_os = "linux")]
-fn terminal_origin() -> Option<String> {
+pub fn terminal_origin() -> Option<String> {
     let procfs = |pid: u32| crate::platform::process::linux::procfs::Stat::read(pid).ok();
     let stat = procfs(std::process::id())?;
     let tty = crate::platform::process::linux::procfs::tty_path(stat.tty_nr)?;
@@ -68,13 +88,59 @@ fn terminal_origin() -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn terminal_origin() -> Option<String> {
+pub fn terminal_origin() -> Option<String> {
     None
 }
 
 /// Calls `AssumeRole`, printing the context lines while a hardened agent may be asking a human, and the long
-/// attempt notice when `long_attempt_notice` is set.
+/// attempt notice when `long_attempt_notice` is set. Falls back to a password prompt on this terminal when polkit
+/// has no authentication agent for this process.
 pub async fn assume_role_with_notice(
+    agent: &mut crate::agent::AgentConn,
+    req: crate::proto::AssumeRoleRequest,
+    long_attempt_notice: bool,
+) -> tonic::Result<tonic::Response<crate::proto::AssumeRoleResponse>> {
+    let notice = password_notice(&req);
+    crate::polkit_tty_agent::with_fallback(&notice, |attempt| {
+        let mut agent = agent.clone();
+        let req = req.clone();
+        async move {
+            match attempt {
+                crate::polkit_tty_agent::Attempt::First => {
+                    notify_while_waiting(&mut agent, req, long_attempt_notice).await
+                }
+                // The context is already printed, and the prompt owns the terminal.
+                crate::polkit_tty_agent::Attempt::Retry => agent.assume_role(req).await,
+            }
+        }
+    })
+    .await
+}
+
+/// Calls `AssumeRole` printing nothing unless it falls back to a password prompt on this terminal.
+pub async fn assume_role_quietly(
+    agent: &mut crate::agent::AgentConn,
+    req: crate::proto::AssumeRoleRequest,
+) -> tonic::Result<tonic::Response<crate::proto::AssumeRoleResponse>> {
+    let notice = password_notice(&req);
+    crate::polkit_tty_agent::with_fallback(&notice, |_| {
+        let mut agent = agent.clone();
+        let req = req.clone();
+        async move { agent.assume_role(req).await }
+    })
+    .await
+}
+
+fn password_notice(req: &crate::proto::AssumeRoleRequest) -> String {
+    context_lines(
+        &req.server_id,
+        &req.rolespec().role,
+        &req.client_context.clone().unwrap_or_default(),
+        Prompt::Password,
+    )
+}
+
+async fn notify_while_waiting(
     agent: &mut crate::agent::AgentConn,
     req: crate::proto::AssumeRoleRequest,
     long_attempt_notice: bool,
@@ -93,7 +159,7 @@ pub async fn assume_role_with_notice(
             retval = &mut resp => return retval,
             _ = &mut prompt_notice, if !prompt_noticed => {
                 prompt_noticed = true;
-                crate::terminal::send(&context_lines(&server, &role, &context)).await;
+                crate::terminal::send(&context_lines(&server, &role, &context, Prompt::MaybeDialog)).await;
             }
             _ = &mut long_attempt, if !long_noticed => {
                 long_noticed = true;
@@ -132,7 +198,12 @@ mod tests {
             cwd: b"/home/u/src/infra".to_vec(),
             auto_config_path: vec![],
         };
-        let lines = context_lines("contoso", "123456789012/Admin", &context);
+        let lines = context_lines(
+            "contoso",
+            "123456789012/Admin",
+            &context,
+            Prompt::MaybeDialog,
+        );
         assert!(
             lines.starts_with(
                 ":: mairu :: Authorization may be required: 123456789012/Admin on contoso\n"
@@ -141,6 +212,14 @@ mod tests {
         );
         assert!(lines.contains(":: mairu ::   command: terraform apply\n"));
         assert!(lines.contains(":: mairu ::   cwd:     /home/u/src/infra\n"));
+        assert!(lines.ends_with(":: mairu :: Approve in the system dialog if one appears.\n"));
+        let lines = context_lines("contoso", "123456789012/Admin", &context, Prompt::Password);
+        assert!(
+            lines
+                .starts_with(":: mairu :: Authorization required: 123456789012/Admin on contoso\n"),
+            "{lines}"
+        );
+        assert!(lines.ends_with(":: mairu :: Enter your password below.\n"));
     }
 
     #[test]
