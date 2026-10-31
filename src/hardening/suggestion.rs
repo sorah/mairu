@@ -45,6 +45,12 @@ pub fn maybe_show() {
     if !enabled(std::env::var_os(DISABLE_ENV).as_deref(), &config) {
         return;
     }
+    // `mairu harden` refuses WSL1.
+    if crate::platform::process::linux::wsl::Wsl::detect()
+        == Some(crate::platform::process::linux::wsl::Wsl::Wsl1)
+    {
+        return;
+    }
     let path = crate::config::state_dir().join(STATE_FILE);
     let previous = std::fs::read(&path)
         .ok()

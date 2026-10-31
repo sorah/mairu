@@ -191,6 +191,7 @@ mod tests {
             wayland_display: String::new(),
             dbus_session_bus_address: address.to_owned(),
             ssh: false,
+            ..Default::default()
         }
     }
 

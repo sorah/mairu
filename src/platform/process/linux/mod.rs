@@ -2,6 +2,7 @@
 
 pub mod peer;
 pub mod procfs;
+pub mod wsl;
 
 #[derive(Debug)]
 pub struct LinuxProcess;
@@ -334,7 +335,14 @@ impl crate::platform::ProcessPlatform for LinuxProcess {
                     .to_owned(),
             );
         }
+        if let Some(wsl) = wsl::Wsl::detect() {
+            notes.extend(wsl.notes());
+        }
         notes
+    }
+
+    fn wsl_interop(&self) -> Option<bool> {
+        wsl::Wsl::detect().and_then(wsl::Wsl::interop_enabled)
     }
 }
 

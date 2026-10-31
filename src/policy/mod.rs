@@ -267,6 +267,9 @@ impl Engine {
                 .collect::<Vec<_>>()
                 .into(),
         );
+        if let Some(interop) = facts.wsl_interop {
+            context.insert("wsl_interop".to_owned(), interop.into());
+        }
         for (key, value) in [
             ("tty", &facts.tty),
             ("exec_command", &facts.exec_command),
@@ -409,6 +412,8 @@ pub struct Facts {
     pub chained_role_arn: Option<String>,
     pub tools: std::collections::BTreeSet<String>,
     pub tool_matches: std::collections::BTreeSet<String>,
+    /// Present only on WSL2.
+    pub wsl_interop: Option<bool>,
 }
 
 /// A request's entities and the context apart from `presence`.
@@ -547,6 +552,7 @@ mod tests {
             chained_role_arn: None,
             tools: Default::default(),
             tool_matches: Default::default(),
+            wsl_interop: None,
         }
     }
 
@@ -916,5 +922,74 @@ mod tests {
         assert_eq!(account_id("12345/Admin"), None);
         assert_eq!(account_id("arn:aws:iam::123456789012:user/x"), None);
         assert_eq!(account_id("admin"), None);
+    }
+
+    const NO_PROD_WITH_INTEROP: &str = r#"
+        @id("no-prod-with-interop")
+        forbid (principal, action, resource in Mairu::Account::"999999999999")
+        when { context has wsl_interop && context.wsl_interop };
+    "#;
+
+    #[test]
+    fn test_wsl_interop_context() {
+        let engine = Engine::builtin(true).unwrap();
+        let prepared = engine.prepare(&facts(), Action::AssumeRole).unwrap();
+        assert!(!prepared.context.contains_key("wsl_interop"));
+        for interop in [true, false] {
+            let f = Facts {
+                wsl_interop: Some(interop),
+                ..facts()
+            };
+            let prepared = engine.prepare(&f, Action::AssumeRole).unwrap();
+            assert_eq!(prepared.context["wsl_interop"], interop);
+            let eval = engine.evaluate(&prepared, &Presence::fresh("platform"));
+            assert!(eval.errors.is_empty(), "{:?}", eval.errors);
+            assert!(eval.allowed);
+        }
+    }
+
+    #[test]
+    fn test_wsl_interop_policy() {
+        let engine =
+            Engine::new(&format!("{}\n{NO_PROD_WITH_INTEROP}", builtin_source(true))).unwrap();
+        let prod = |wsl_interop| Facts {
+            role: "999999999999/Admin".to_owned(),
+            wsl_interop,
+            ..facts()
+        };
+        let decide = |f: &Facts| {
+            let prepared = engine.prepare(f, Action::AssumeRole).unwrap();
+            let eval = engine.evaluate(&prepared, &Presence::fresh("platform"));
+            assert!(eval.errors.is_empty(), "{:?}", eval.errors);
+            eval
+        };
+        let eval = decide(&prod(Some(true)));
+        assert!(!eval.allowed);
+        assert_eq!(eval.forbids, vec!["no-prod-with-interop"]);
+        assert!(decide(&prod(Some(false))).allowed);
+        assert!(decide(&prod(None)).allowed);
+        let other = Facts {
+            wsl_interop: Some(true),
+            ..facts()
+        };
+        assert!(decide(&other).allowed);
+        assert!(
+            !evaluate_at_gate2(
+                &engine,
+                &prod(Some(true)),
+                "999999999999",
+                Presence::fresh("platform")
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn test_wsl_interop_requires_has() {
+        let err = Engine::new(
+            r#"@id("x") forbid (principal, action, resource) when { context.wsl_interop };"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PolicyError::Validation(_)), "{err:?}");
     }
 }

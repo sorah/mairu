@@ -245,7 +245,7 @@ Each client chooses how, separately for `open_url` and `notify`:
 | Mode | Behavior |
 |---|---|
 | `auto` (default) | `open_url`: `$BROWSER` when set, otherwise `agent`. `notify`: `agent`. |
-| `agent` | The agent's platform helper opens the URL through the desktop portal (or `xdg-open`) and posts through `org.freedesktop.Notifications`, on the desktop session of the requesting client. Over SSH without a display, nothing happens. |
+| `agent` | The agent's platform helper opens the URL through the desktop portal (or `xdg-open`) and posts through `org.freedesktop.Notifications`, on the desktop session of the requesting client. Over SSH without a display, nothing happens. On WSL2 with interop, URLs open in the Windows default browser (see [WSL2](#wsl2)). |
 | `command` | Runs your own program. |
 | `none` | Disabled. |
 
@@ -388,7 +388,7 @@ A request has `Mairu::User` as principal, `Mairu::Action::"AssumeRole"` (before 
 
 | Attributes | Determined by | Use them to |
 |---|---|---|
-| `presence`, `hardened`, `session`, `tty`, `caller` | the agent | grant |
+| `presence`, `hardened`, `session`, `tty`, `caller`, `wsl_interop` | the agent | grant |
 | `intent`, `exec_command`, `exec_command_line`, `cwd`, `chained_role_arn` | whoever runs mairu | narrow a `permit` that also requires `context.presence.verified`, or `forbid` |
 | `tools`, `tool_matches` | names any program can produce or avoid | restrict, or grant knowingly |
 
@@ -533,6 +533,51 @@ Root can replace the hardened copy and read the agent's memory, so hardening pro
 `cargo build --release --no-default-features --features platform-helper --bin mairu-platform-helper` builds the platform helper as a standalone `mairu-platform-helper` binary, without the client and agent, for packagers that ship it separately. On Linux the agent always runs `mairu platform-helper`.
 
 Packages install `/usr/bin/mairu` as `root:mairu 2755` with `cap_ipc_lock` (setcap after chgrp, which clears file capabilities), create `/var/lib/mairu` and `/var/lib/mairu/users` as `root:mairu 2770`, and install [pkg/polkit/co.0w0.mairu.policy](./pkg/polkit/co.0w0.mairu.policy) into `/usr/share/polkit-1/actions/`. [pkg/debian/postinst](./pkg/debian/postinst) does this for the Debian package; [pkg/sysusers.d](./pkg/sysusers.d/mairu.conf) and [pkg/tmpfiles.d](./pkg/tmpfiles.d/mairu.conf) declare the group and directories for systemd distributions.
+
+### WSL2
+
+mairu hardens a WSL2 distribution as any Linux host, with one limit: with Windows interop on, which is the WSL default, any program running as you can become root through `wsl.exe -u root` without a prompt, and bypass mairu. `harden` and `doctor` say so on every WSL2 host.
+
+| | Integrated (interop on) | Isolated (interop off) |
+|---|---|---|
+| Strength | A guardrail against over-eager tools such as AI agents, and against accidents | As native Linux against code inside the distribution |
+| Opening URLs (`agent` mode) | The Windows default browser, through `rundll32.exe url.dll,FileProtocolHandler` | Printed |
+| Approving | Your Windows OpenSSH agent through a relay, or `pkttyagent` | `ssh -A` from Windows into the distribution, or `pkttyagent` |
+
+To switch to the isolated profile, add to `/etc/wsl.conf` and restart the distribution from Windows with `wsl.exe --terminate <distro>`:
+
+```ini
+[interop]
+enabled = false
+appendWindowsPath = false
+```
+
+Even then, the Windows account and every other distribution with interop on can become root in this one (`wsl.exe -d <distro> -u root`); they are outside what mairu protects against.
+
+- `mairu doctor` shows the WSL version, whether interop is on, the profile, and whether `$SSH_AUTH_SOCK` reaches an SSH agent.
+- `context.wsl_interop` is present only on WSL2, and is true while interop is on. Refuse sensitive accounts with it:
+
+  ```cedar
+  @id("no-prod-with-interop")
+  forbid (principal, action, resource in Mairu::Account::"999999999999")
+  when { context has wsl_interop && context.wsl_interop };
+  ```
+
+- To approve with your Windows OpenSSH agent in the integrated profile, relay it into the distribution, with [npiperelay](https://github.com/jstarks/npiperelay) and `socat`, or with [wsl2-ssh-agent](https://github.com/mame/wsl2-ssh-agent), and register its key as `ssh_agent_keys` (see [SSH agent](#ssh-agent)). A Windows agent that asks for Windows Hello before each signature works too; mairu sees an ordinary signature.
+- WSLg provides no notification daemon. For Windows toasts, use `command` mode with a helper such as [wsl-notify-send](https://github.com/stuartleeks/wsl-notify-send):
+
+  ```sh
+  #!/bin/sh
+  # ~/bin/mairu-toast: the title and body come as the last two arguments
+  exec wsl-notify-send.exe --category "$1" "$2"
+  ```
+
+  ```sh
+  export MAIRU_NOTIFY_COMMAND=~/bin/mairu-toast
+  ```
+
+- [WSL-Hello-sudo](https://github.com/nullpo-head/WSL-Hello-sudo) (`pam_wsl_hello`) backs `sudo` with Windows Hello, which closes the `sudo` path to root (see [Root](#root)) but not the interop one.
+- WSL1 is not supported: `harden` refuses it, and a hardened copy there runs as misconfigured.
 
 ## Credential Server API
 

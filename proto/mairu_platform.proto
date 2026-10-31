@@ -126,6 +126,7 @@ message SessionHint {
   string wayland_display = 2;           // $WAYLAND_DISPLAY
   string dbus_session_bus_address = 3;  // honored only as unix:path= under $XDG_RUNTIME_DIR
   bool ssh = 4;                         // $SSH_CONNECTION or $SSH_TTY was set
+  string wsl_interop = 5;               // $WSL_INTEROP, honored only as /run/WSL/<n>_interop
 }
 
 // What an integrity store keeps for a name.

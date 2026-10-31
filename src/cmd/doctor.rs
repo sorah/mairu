@@ -95,6 +95,8 @@ pub async fn run(_args: &DoctorArgs) -> Result<(), anyhow::Error> {
 
     #[cfg(target_os = "linux")]
     warnings.extend(headless::report(agent_status.as_ref()));
+    #[cfg(target_os = "linux")]
+    wsl::report().await;
     print_desktop(agent_status.as_ref());
 
     for w in warnings {
@@ -555,6 +557,60 @@ mod install {
     pub(super) fn parse_version_output(output: &str) -> Option<String> {
         let version = output.split_whitespace().nth(1)?;
         crate::version::at_least(version, "0.0.0").then(|| version.to_owned())
+    }
+}
+
+/// The WSL version, interop and profile, and how the Windows SSH agent reaches this distribution. Root reachability
+/// through interop is among the process notes, which are warnings here.
+#[cfg(target_os = "linux")]
+mod wsl {
+    pub async fn report() {
+        use crate::platform::process::linux::wsl::Wsl;
+        let Some(wsl) = Wsl::detect() else {
+            return;
+        };
+        println!("wsl");
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        println!("  version       {} ({})", wsl.version(), release.trim());
+        let Wsl::Wsl2 { interop } = wsl else {
+            println!("  hardening     unsupported; use WSL2");
+            return;
+        };
+        println!("  interop       {interop}");
+        let profile = interop.profile();
+        let detail = match profile {
+            crate::platform::process::linux::wsl::Profile::Integrated => {
+                "a guardrail: root is reachable through `wsl.exe -u root`"
+            }
+            crate::platform::process::linux::wsl::Profile::Isolated => {
+                "native-Linux strength against code inside this distribution"
+            }
+        };
+        println!("  profile       {profile} ({detail})");
+        println!("  ssh-agent     {}", relayed_agent().await);
+    }
+
+    /// Whether `$SSH_AUTH_SOCK` reaches an agent, and how it would come from Windows.
+    async fn relayed_agent() -> String {
+        let via = if std::env::var_os("SSH_CONNECTION").is_some_and(|s| !s.is_empty()) {
+            "forwarded over SSH"
+        } else {
+            "local socket, e.g. a relay of the Windows OpenSSH agent"
+        };
+        match std::env::var_os("SSH_AUTH_SOCK").filter(|s| !s.is_empty()) {
+            None => "SSH_AUTH_SOCK not set; relay the Windows OpenSSH agent (npiperelay + socat, or wsl2-ssh-agent), or connect with `ssh -A` from Windows".to_owned(),
+            Some(path) => {
+                let path = std::path::Path::new(&path);
+                match crate::ssh_agent_presence::probe(path).await {
+                    Ok(ids) => format!(
+                        "{} reachable, {} keys ({via})",
+                        path.display(),
+                        ids.len()
+                    ),
+                    Err(e) => format!("{} unreachable ({e})", path.display()),
+                }
+            }
+        }
     }
 }
 

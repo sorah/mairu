@@ -69,6 +69,8 @@ namespace Mairu {
       // "mark:ai-agent"). A guardrail: same-user code can produce or avoid them.
       tools: Set<String>,
       tool_matches: Set<String>,
+      // Present only on WSL2: whether Windows interop is enabled, which makes root reachable.
+      wsl_interop?: Bool,
       // Present exactly at gate 2.
       caller?: Caller
     }

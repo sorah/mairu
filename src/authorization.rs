@@ -855,6 +855,7 @@ impl Shared {
             effective,
         );
         pending.pidfd = pidfd;
+        pending.facts.wsl_interop = platform.wsl_interop();
         pending
     }
 
@@ -1740,6 +1741,7 @@ impl Pending {
                 .map(|a| a.role_arn.clone()),
             tools: detection.tools.clone(),
             tool_matches: detection.tool_matches.clone(),
+            wsl_interop: None,
         };
         Self {
             pid: req.peer.map_or(0, |p| p.pid),
@@ -2137,6 +2139,7 @@ mod tests {
         session: parking_lot::Mutex<Option<crate::platform::SessionIdentity>>,
         ancestry: parking_lot::Mutex<Vec<crate::platform::Ancestor>>,
         ended: parking_lot::Mutex<Vec<crate::platform::SessionIdentity>>,
+        wsl_interop: parking_lot::Mutex<Option<bool>>,
     }
 
     impl crate::platform::ProcessPlatform for FakeProcess {
@@ -2180,6 +2183,9 @@ mod tests {
         }
         fn session_alive(&self, session: &crate::platform::SessionIdentity) -> bool {
             !self.ended.lock().contains(session)
+        }
+        fn wsl_interop(&self) -> Option<bool> {
+            *self.wsl_interop.lock()
         }
     }
 
@@ -2753,6 +2759,42 @@ mod tests {
             crate::policy::files::PolicyFiles::fixed(effective),
             MockServices::answering(R::Allowed, ""),
         )
+    }
+
+    #[tokio::test]
+    async fn test_wsl_interop_forbid() {
+        let f = unapproved_fixture(
+            true,
+            r#"
+            @id("no-prod-with-interop")
+            forbid (principal, action, resource in Mairu::Account::"999999999999")
+            when { context has wsl_interop && context.wsl_interop };
+            "#,
+            None,
+        );
+        *f.process.wsl_interop.lock() = Some(true);
+        let err = f
+            .decide(f.peer_pending(10, "999999999999/Admin", None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason(), Reason::Forbidden);
+        assert_eq!(err.policy_ids, vec!["no-prod-with-interop"]);
+        assert_eq!(f.services.prompts(), 0);
+        assert!(
+            f.decide(f.peer_pending(11, "123456789012/Admin", None))
+                .await
+                .is_ok()
+        );
+
+        for interop in [Some(false), None] {
+            *f.process.wsl_interop.lock() = interop;
+            assert!(
+                f.decide(f.peer_pending(12, "999999999999/Admin", None))
+                    .await
+                    .is_ok(),
+                "{interop:?}"
+            );
+        }
     }
 
     const USER_POLICY: &str = r#"

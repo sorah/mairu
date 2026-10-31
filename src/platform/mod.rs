@@ -35,6 +35,8 @@ pub trait ProcessPlatform: Send + Sync + std::fmt::Debug {
     fn ancestry(&self, pid: u32, start_time: u64, uid: u32) -> Vec<Ancestor>;
     /// Whether the process a session identity is keyed to still runs with the recorded start time.
     fn session_alive(&self, session: &SessionIdentity) -> bool;
+    /// Present only on WSL2: whether Windows interop is enabled, which makes root reachable. Read on every call.
+    fn wsl_interop(&self) -> Option<bool>;
 }
 
 /// How many processes [`ProcessPlatform::ancestry`] walks at most.
