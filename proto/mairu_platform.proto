@@ -42,7 +42,10 @@ enum IntegrityStatus {
   INTEGRITY_STATUS_UNAVAILABLE = 4;
 }
 
-message GetCapabilitiesRequest {}
+message GetCapabilitiesRequest {
+  // The requesting client's session; without it, notifications and open_url are not probed and report false.
+  SessionHint session = 1;
+}
 
 message Capabilities {
   PeerVerification peer_verification = 1;

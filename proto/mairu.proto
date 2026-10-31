@@ -49,6 +49,9 @@ service Agent {
   rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
   // Records the policy files and server configs after asking the human; needs a trusted peer.
   rpc ApprovePolicy(ApprovePolicyRequest) returns (ApprovePolicyResponse);
+  // Passed to the platform helper with the client's SessionHint; need a trusted peer and no authorization.
+  rpc OpenUrl(mairu.platform.OpenUrlRequest) returns (mairu.platform.OpenUrlResponse);
+  rpc Notify(mairu.platform.NotifyRequest) returns (mairu.platform.NotifyResponse);
 }
 
 message PingAgentRequest {
@@ -277,6 +280,7 @@ enum HardeningState {
 
 message GetAgentStatusRequest {
   ClientContext client_context = 1;  // env_names, for the caller's tool labels
+  mairu.platform.SessionHint session = 2;  // for the notifications and open_url capabilities
 }
 message GetAgentStatusResponse {
   string version = 1;

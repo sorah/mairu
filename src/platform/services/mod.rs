@@ -4,4 +4,6 @@ pub mod fallback;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "linux")]
+pub mod session_bus;
+#[cfg(target_os = "linux")]
 pub mod system_bus;

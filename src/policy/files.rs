@@ -710,7 +710,10 @@ pub mod test_support {
 
     #[async_trait::async_trait]
     impl crate::platform::PlatformServices for MemoryStores {
-        async fn capabilities(&self) -> crate::proto::platform::Capabilities {
+        async fn capabilities(
+            &self,
+            _req: crate::proto::platform::GetCapabilitiesRequest,
+        ) -> crate::proto::platform::Capabilities {
             Default::default()
         }
         async fn authorize(

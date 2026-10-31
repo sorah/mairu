@@ -70,6 +70,8 @@ pub mod authorization;
 #[cfg(feature = "cli")]
 pub mod caller_identity;
 #[cfg(feature = "cli")]
+pub mod convenience;
+#[cfg(feature = "cli")]
 pub mod ecs_server;
 #[cfg(feature = "cli")]
 pub mod network;

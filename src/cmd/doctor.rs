@@ -34,17 +34,17 @@ pub async fn run(_args: &DoctorArgs) -> Result<(), anyhow::Error> {
                 crate::platform::AgentTrust::Unverified => "NOT VERIFIED",
                 crate::platform::AgentTrust::Unverifiable => "not checked (client not hardened)",
             };
-            // Environment names go only to an agent this mairu trusts.
-            let client_context =
-                (conn.trust() != crate::platform::AgentTrust::Unverified).then(|| {
-                    crate::proto::ClientContext {
-                        env_names: crate::tool_detection::env_names(),
-                        ..Default::default()
-                    }
-                });
+            // Environment names and the session go only to an agent this mairu trusts.
+            let trusted = conn.trust() != crate::platform::AgentTrust::Unverified;
+            let client_context = trusted.then(|| crate::proto::ClientContext {
+                env_names: crate::tool_detection::env_names(),
+                ..Default::default()
+            });
+            let session = trusted.then(crate::proto::platform::SessionHint::current);
             let status = conn
                 .get_agent_status(tonic::Request::new(crate::proto::GetAgentStatusRequest {
                     client_context,
+                    session,
                 }))
                 .await;
             match status {
@@ -95,13 +95,41 @@ pub async fn run(_args: &DoctorArgs) -> Result<(), anyhow::Error> {
 
     #[cfg(target_os = "linux")]
     warnings.extend(headless::report(agent_status.as_ref()));
-    #[cfg(not(target_os = "linux"))]
-    let _ = agent_status;
+    print_desktop(agent_status.as_ref());
 
     for w in warnings {
         println!("warning  {w}");
     }
     Ok(())
+}
+
+/// How this client opens URLs and posts notifications, with what the agent can deliver for its session.
+fn print_desktop(status: Option<&crate::proto::GetAgentStatusResponse>) {
+    let settings = crate::convenience::Settings::get();
+    let caps = status.and_then(|s| s.capabilities.as_ref());
+    println!("desktop");
+    for (feature, delivery, capable) in [
+        (
+            crate::convenience::Feature::OpenUrl,
+            &settings.open_url,
+            caps.map(|c| c.open_url),
+        ),
+        (
+            crate::convenience::Feature::Notify,
+            &settings.notify,
+            caps.map(|c| c.notifications),
+        ),
+    ] {
+        let note = match (delivery, capable) {
+            (crate::convenience::Delivery::Agent, Some(true)) => "  (the agent can deliver here)",
+            (crate::convenience::Delivery::Agent, Some(false)) => {
+                "  (the agent cannot deliver here; see the notes above)"
+            }
+            (crate::convenience::Delivery::Agent, None) => "  (no status from the agent)",
+            _ => "",
+        };
+        println!("  {:<12}  {delivery}{note}", feature.name());
+    }
 }
 
 fn print_agent_status(

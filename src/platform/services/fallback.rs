@@ -9,7 +9,10 @@ pub const REASON_NO_FACILITY: &str = "no-authorization-facility";
 
 #[async_trait::async_trait]
 impl crate::platform::PlatformServices for FallbackServices {
-    async fn capabilities(&self) -> crate::proto::platform::Capabilities {
+    async fn capabilities(
+        &self,
+        _req: crate::proto::platform::GetCapabilitiesRequest,
+    ) -> crate::proto::platform::Capabilities {
         let process = crate::platform::process();
         crate::proto::platform::Capabilities {
             peer_verification: process.peer_verification().into(),
@@ -42,7 +45,7 @@ impl crate::platform::PlatformServices for FallbackServices {
         &self,
         req: crate::proto::platform::OpenUrlRequest,
     ) -> crate::proto::platform::OpenUrlResponse {
-        open_url(req.url).await
+        open_url(req).await
     }
 
     async fn record_integrity(
@@ -60,25 +63,13 @@ impl crate::platform::PlatformServices for FallbackServices {
     }
 }
 
-/// Only http(s) URLs are opened, so a URL cannot name a local file or an application.
-fn openable(url: &str) -> Result<url::Url, String> {
-    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => Ok(parsed),
-        scheme => Err(format!("refusing to open a {scheme}: URL")),
-    }
-}
-
 #[cfg(target_os = "macos")]
-async fn open_url(url: String) -> crate::proto::platform::OpenUrlResponse {
-    let url = match openable(&url) {
+async fn open_url(
+    req: crate::proto::platform::OpenUrlRequest,
+) -> crate::proto::platform::OpenUrlResponse {
+    let url = match req.checked_url() {
         Ok(u) => u,
-        Err(detail) => {
-            return crate::proto::platform::OpenUrlResponse {
-                opened: false,
-                detail,
-            };
-        }
+        Err(detail) => return crate::proto::platform::OpenUrlResponse::failed(detail),
     };
     let status = tokio::task::spawn_blocking(move || {
         crate::hardening::command("/usr/bin/open")
@@ -94,46 +85,31 @@ async fn open_url(url: String) -> crate::proto::platform::OpenUrlResponse {
             opened: true,
             detail: String::new(),
         },
-        Ok(Ok(s)) => crate::proto::platform::OpenUrlResponse {
-            opened: false,
-            detail: format!("/usr/bin/open exited with {s}"),
-        },
-        Ok(Err(e)) => crate::proto::platform::OpenUrlResponse {
-            opened: false,
-            detail: format!("failed to run /usr/bin/open: {e}"),
-        },
-        Err(e) => crate::proto::platform::OpenUrlResponse {
-            opened: false,
-            detail: e.to_string(),
-        },
+        Ok(Ok(s)) => crate::proto::platform::OpenUrlResponse::failed(format!(
+            "/usr/bin/open exited with {s}"
+        )),
+        Ok(Err(e)) => crate::proto::platform::OpenUrlResponse::failed(format!(
+            "failed to run /usr/bin/open: {e}"
+        )),
+        Err(e) => crate::proto::platform::OpenUrlResponse::failed(e.to_string()),
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn open_url(url: String) -> crate::proto::platform::OpenUrlResponse {
-    let detail = match openable(&url) {
+async fn open_url(
+    req: crate::proto::platform::OpenUrlRequest,
+) -> crate::proto::platform::OpenUrlResponse {
+    let detail = match req.checked_url() {
         Ok(_) => "opening URLs is not supported on this OS yet".to_owned(),
         Err(detail) => detail,
     };
-    crate::proto::platform::OpenUrlResponse {
-        opened: false,
-        detail,
-    }
+    crate::proto::platform::OpenUrlResponse::failed(detail)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::platform::PlatformServices;
-
-    #[test]
-    fn test_openable() {
-        assert!(openable("https://example.com/device?code=ABCD").is_ok());
-        assert!(openable("http://localhost:8080/").is_ok());
-        assert!(openable("file:///etc/passwd").is_err());
-        assert!(openable("x-apple.systempreferences:").is_err());
-        assert!(openable("not a url").is_err());
-    }
 
     #[tokio::test]
     async fn test_fallback_fails_closed() {
@@ -149,7 +125,7 @@ mod tests {
             .verify_integrity(crate::proto::platform::VerifyIntegrityRequest::default())
             .await;
         assert!(verify.results.is_empty());
-        let caps = FallbackServices.capabilities().await;
+        let caps = FallbackServices.capabilities(Default::default()).await;
         assert_eq!(
             caps.authorization(),
             crate::proto::platform::AuthorizationFacility::None

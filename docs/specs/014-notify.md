@@ -240,16 +240,26 @@ The helper applies the `http`/`https` rule and the 256/1024-byte truncation agai
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented on `hardening/notify`. Verified in Docker against a fake notification daemon and desktop portal on test session buses; a real desktop session (GNOME/KDE portal, a real notification daemon, a browser) was not available. Implementors MUST keep this section updated as they work.
 
 ### Checklist
 
-- [ ] Notifications and open-url: helper backends, `SessionHint`, client-chosen modes (`auto|agent|command|none`), agent `OpenUrl`/`Notify` RPCs
-- [ ] `UserConfig.open_url`, `UserConfig.notify`; environment variables; `--no-browser`
-- [ ] Event emission: authorize URL, login required, AI-agent request refused, policy lockdown; rate limits
-- [ ] Headless no-op behavior and `doctor` reporting
-- [ ] README: modes and helper examples
+- [x] Notifications and open-url: helper backends, `SessionHint`, client-chosen modes (`auto|agent|command|none`), agent `OpenUrl`/`Notify` RPCs
+- [x] `UserConfig.open_url`, `UserConfig.notify`; environment variables; `--no-browser`
+- [x] Event emission: authorize URL, login required, AI-agent request refused, policy lockdown; rate limits
+- [x] Headless no-op behavior and `doctor` reporting
+- [x] README: modes and helper examples
 
 ### Updates
 
 - 2026-10-29: Split out of hardening.md, policy.md and platform-helper.md.
+- 2026-10-31: Implemented. Decisions and deviations:
+  - Proto: `GetCapabilitiesRequest` gains `SessionHint session = 1` and `GetAgentStatusRequest` gains `mairu.platform.SessionHint session = 2`, so `notifications`/`open_url` describe the calling client's session as `doctor` needs. `PlatformServices::capabilities` takes the request. Without a hint the helper does not touch the session bus and reports both as false; the agent's own capability checks (authorization) pass none.
+  - The URL rule, truncation (at a UTF-8 boundary) and the display rule live on the proto types (`OpenUrlRequest::checked_url`, `NotifyRequest::truncate`, `SessionHint::refusal`) and are applied by the client, the agent and the helper. The display rule ("SSH without a display, or no display at all") applies to both features: a hint without `DISPLAY` and `WAYLAND_DISPLAY` gets `false` and no session-bus traffic.
+  - Hint validation (`src/platform/services/session_bus.rs`): only `unix:path=<p>` (optionally with `guid=`), no `%` escapes and no `;`, where the canonical `<p>` lies under the canonical `$XDG_RUNTIME_DIR` and is a socket owned by the helper's uid. A refused hint falls back to the default bus, with an info line in the agent log and a doctor note ("ignored the client's session bus address ..."). The default bus is that of the Secret Service store (012), moved into the same module: `$DBUS_SESSION_BUS_ADDRESS` on an unhardened helper, otherwise `$XDG_RUNTIME_DIR/bus`.
+  - Capabilities count a notification daemon or portal that is running or D-Bus activatable (`ListActivatableNames`), without activating it; `open_url` is also true when `xdg-open` is on `PATH`. `xdg-open` counts as opened when it exits 0 or is still running after 5 s (then reaped in the background), and gets `DISPLAY`/`WAYLAND_DISPLAY` from the hint (only `[A-Za-z0-9.:/_-]`, at most 256 bytes) and the bus address in use.
+  - Mode resolution (`src/convenience.rs`): an explicit `MAIRU_OPEN_URL`/`MAIRU_NOTIFY` wins over the matching `*_COMMAND`; `MAIRU_*=command` without `*_COMMAND` uses `config.json`'s `command`; `command` mode without a command disables the feature; an invalid environment value is ignored with a warning. `$BROWSER` is run like a `*_COMMAND` line (no colon-separated list or `%s`). Helper programs get stdin and stdout on `/dev/null` and keep stderr.
+  - Rate limits record only notifications that were delivered, so a client over SSH (whose `agent` mode reports `false`) does not hold back the next client on the desktop. File names are `<event>-<first 8 bytes of SHA-256 of the key, hex>`; "once per agent instance" is keyed to the agent's pid and its socket's mtime.
+  - The authorize URL is opened in a background task, so a login never waits for it. Refusals are checked in `assume_role_with_notice`/`assume_role_quietly` (every `exec`, sidecar and `credential-process` path) and in the sidecar's auto-refresh; login required in the ECS backend's error feedback and the auto-refresh. An unverified agent is never asked.
+  - Notification bodies are sent as plain text; no markup escaping.
+  - Tests: unit tests cover mode precedence, URL and truncation rules, hint validation, rate limits with injected times, command execution, and the D-Bus backend against a private `dbus-daemon` with an in-process stub `org.freedesktop.Notifications` (skipped when `dbus-daemon` is not installed). Verified in Docker as root (debian:trixie, scenario `014-notify`, 66 checks): the portal and `xdg-open` fallback (marker gid dropped), `--no-browser`/`none`/command/`$BROWSER`/`*_COMMAND`, SSH and no-display no-ops with the URL still printed, X forwarding over SSH opening, login required once per server per 10 min, AI-agent refusals once per (server, role) per minute and not for humans, notify command mode arguments and environment, refused hints (root-owned socket, regular file, a bus outside the runtime dir, `tcp:`) falling back to the default bus, `doctor` capabilities/notes/modes, a user without a session bus, and lockdown once per agent instance. Earlier scenarios 003–013 still pass.
