@@ -89,7 +89,9 @@ pub async fn run(_args: &DoctorArgs) -> Result<(), anyhow::Error> {
         matches!(state, crate::hardening::HardeningState::Hardened { .. }),
         |s| s.agent_hardening() == crate::proto::HardeningState::Hardened,
     );
-    warnings.extend(print_policy(agent_hardened, agent_status.as_ref()));
+    let (policy_warnings, ssh_agent_keys) = print_policy(agent_hardened, agent_status.as_ref());
+    warnings.extend(policy_warnings);
+    warnings.extend(ssh_agent::report(&ssh_agent_keys).await);
 
     #[cfg(target_os = "linux")]
     warnings.extend(headless::report(agent_status.as_ref()));
@@ -169,11 +171,11 @@ fn print_agent_status(
 }
 
 /// The policy files evaluated here, for the state the agent reports, or as unapproved without an agent. Returns
-/// warnings.
+/// warnings and the keys registered for the ssh-agent method.
 fn print_policy(
     hardened: bool,
     status: Option<&crate::proto::GetAgentStatusResponse>,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<crate::ssh_agent_presence::RegisteredKey>) {
     use crate::policy::settings::PolicyState;
     let mut warnings = vec![];
     let dir = crate::config::config_dir();
@@ -186,13 +188,21 @@ fn print_policy(
         _ => None,
     };
     let built = match state {
-        Some(state) => {
-            crate::policy::files::Effective::build_for(state, hardened, &policy, &settings)
-        }
+        Some(state) => crate::policy::files::Effective::build_for(
+            state,
+            hardened,
+            &policy,
+            &settings,
+            &status
+                .and_then(|s| s.approval_anchor.clone())
+                .unwrap_or_else(crate::policy::integrity_state::default_anchor),
+        ),
         None => crate::policy::files::Effective::build(hardened, &policy, &settings),
     };
+    let mut keys = vec![];
     match built {
         Ok(effective) => {
+            keys = effective.ssh_agent_keys.clone();
             let own = effective
                 .engine
                 .policy_ids()
@@ -220,7 +230,7 @@ fn print_policy(
         Err(e) => println!("policy   error: {e}"),
     }
     let Some(status) = status else {
-        return warnings;
+        return (warnings, keys);
     };
     for store in &status.policy_stores {
         let detail = if store.detail.is_empty() {
@@ -251,7 +261,73 @@ fn print_policy(
             warnings.push("the approval anchor allows \"platform\" while keys are registered, so a captured password can approve a policy that registers someone else's key; remove it from approval_methods and approve again".to_owned());
         }
     }
-    warnings
+    (warnings, keys)
+}
+
+/// Whether `$SSH_AUTH_SOCK` reaches an SSH agent, and which registered keys it holds.
+mod ssh_agent {
+    /// Prints the ssh-agent section; returns warnings.
+    pub async fn report(keys: &[crate::ssh_agent_presence::RegisteredKey]) -> Vec<String> {
+        let mut warnings = vec![];
+        println!("ssh-agent");
+        let socket = std::env::var_os("SSH_AUTH_SOCK").filter(|s| !s.is_empty());
+        let held = match &socket {
+            None => {
+                println!("  SSH_AUTH_SOCK not set");
+                if !keys.is_empty() {
+                    warnings.push("keys are registered for the ssh-agent method, and SSH_AUTH_SOCK is not set here, so the next method asks instead".to_owned());
+                }
+                None
+            }
+            Some(path) => {
+                let path = std::path::Path::new(path);
+                match crate::ssh_agent_presence::probe(path).await {
+                    Ok(identities) => {
+                        println!(
+                            "  SSH_AUTH_SOCK {} reachable ({} keys)",
+                            path.display(),
+                            identities.len()
+                        );
+                        Some(identities)
+                    }
+                    Err(e) => {
+                        println!("  SSH_AUTH_SOCK {} unreachable ({e})", path.display());
+                        warnings.push(format!("SSH_AUTH_SOCK ({}) is stale or unreachable ({e}), so the ssh-agent method declines and the next method asks; point it at a live agent, e.g. a ~/.ssh/agent.sock symlink kept current by ~/.ssh/rc", path.display()));
+                        None
+                    }
+                }
+            }
+        };
+        if keys.is_empty() {
+            println!("  registered    none");
+        }
+        let mut any_held = false;
+        for key in keys {
+            let state = match &held {
+                Some(identities) => {
+                    if identities
+                        .iter()
+                        .any(|i| i.fingerprint() == key.fingerprint())
+                    {
+                        any_held = true;
+                        "held by the SSH agent"
+                    } else {
+                        "not held"
+                    }
+                }
+                None => "unknown",
+            };
+            println!(
+                "  registered    {} {} ({state})",
+                key.fingerprint(),
+                key.public.comment()
+            );
+        }
+        if held.is_some() && !keys.is_empty() && !any_held {
+            warnings.push("the SSH agent at SSH_AUTH_SOCK holds no registered key, so the ssh-agent method declines and the next method asks".to_owned());
+        }
+        warnings
+    }
 }
 
 fn describe_capabilities(caps: &crate::proto::platform::Capabilities) -> String {

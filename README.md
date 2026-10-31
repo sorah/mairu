@@ -378,7 +378,7 @@ Settings that are not policies live in `~/.config/mairu/authorization.json`. Unk
 
 - `tool_detection` adds labels, or names to the built-in `ai-agent` label, for `context.tools`.
 - `grant_retention_secs` bounds how long an approval is kept at all; the default is 43200, which is also the maximum until the file is approved.
-- `methods`, `approval_methods` (who may approve the next change; `["platform"]` for now), `sts` (the region and endpoint of `sts:GetCallerIdentity`, also per server) and `network` (a `proxy` for every outbound connection of the agent, and PEM `extra_roots` trusted beside the system roots) apply once the file is approved.
+- `methods` (how to ask, in order), `approval_methods` (who may approve the next change), `ssh_agent_keys` (see [SSH agent](#ssh-agent)), `sts` (the region and endpoint of `sts:GetCallerIdentity`, also per server) and `network` (a `proxy` for every outbound connection of the agent, and PEM `extra_roots` trusted beside the system roots) apply once the file is approved.
 
 ### Tmux over SSH
 
@@ -401,7 +401,53 @@ Password:
 - A command without a terminal, such as a cron job or an AI tool's shell command, cannot be asked, and is refused when it needs approval.
 - `mairu doctor` shows the terminal, SSH, polkit and `pkttyagent` state, and warns when a prompt could not be shown.
 
-Typing a password into a terminal has the same exposure as `sudo` in that terminal: echo is off, so capturing the pane's output does not reveal it, but programs running as you can capture keystrokes by reading the pty, through tmux key bindings, by printing a fake prompt first, or with ptrace when `kernel.yama.ptrace_scope` is 0. polkit asks for the same password as `sudo`, so where you type the sudo password into tmux, such programs can already become root. Prefer a PAM setup a captured password cannot satisfy (see [Root](#root)).
+Typing a password into a terminal has the same exposure as `sudo` in that terminal: echo is off, so capturing the pane's output does not reveal it, but programs running as you can capture keystrokes by reading the pty, through tmux key bindings, by printing a fake prompt first, or with ptrace when `kernel.yama.ptrace_scope` is 0. polkit asks for the same password as `sudo`, so where you type the sudo password into tmux, such programs can already become root. Prefer a PAM setup a captured password cannot satisfy (see [Root](#root)), or approve with a key through your SSH agent instead.
+
+### SSH agent
+
+Register a public key in `authorization.json`, and mairu approves requests by a signature from your SSH agent at `$SSH_AUTH_SOCK`, usually forwarded with `ssh -A` from your laptop. A signature over a one-time challenge cannot be replayed, unlike a password typed into a pane.
+
+```json
+{
+  "version": 1,
+  "ssh_agent_keys": [
+    {"key": "sk-ssh-ed25519@openssh.com AAAA... me@laptop"},
+    {"key": "sk-ecdsa-sha2-nistp256@openssh.com AAAA... spare", "require_user_verification": true},
+    {"key": "ecdsa-sha2-nistp256 AAAA... secretive@mac"}
+  ]
+}
+```
+
+```
+:: mairu :: Authorization required: 123456789012/Admin on contoso
+:: mairu ::   command: terraform apply
+:: mairu ::   cwd:     /home/u/src/infra
+:: mairu ::   from:    /dev/pts/3 (zsh, tmux pane)
+:: mairu :: Approve the signature on your SSH agent (me@laptop) to authorize 123456789012/Admin on contoso
+```
+
+- Any key type an SSH agent signs with is accepted: `ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, `ssh-rsa` (signed as `rsa-sha2-512`), and the FIDO `sk-ssh-ed25519@openssh.com` and `sk-ecdsa-sha2-nistp256@openssh.com`.
+- **The lock on a key belongs to your SSH agent, not to mairu**: a FIDO touch, an `ssh-add -c` confirmation, Touch ID in an agent such as Secretive, or nothing at all. mairu checks the only lock a signature shows, the user-present flag of `sk-` keys, and with `require_user_verification` also the user-verified flag (a PIN or biometric on the key). A key held unlocked proves only that your agent is reachable, so choose the key and configure its agent accordingly.
+- With keys registered, `methods` defaults to `["ssh-agent", "platform"]` and `approval_methods` to `["ssh-agent"]`. When the agent is unreachable or holds none of the keys, or refuses to sign, the next method asks. A policy can require the method with `context.presence has method && context.presence.method == "ssh-agent"`.
+- The same signature approves `mairu exec`, `mairu credential-process`, `mairu policy approve` and `mairu unlock --tool`. Signatures use the SSHSIG namespace `co.0w0.mairu.authorize`, so a signature made for git or anything else never counts.
+- Registering the first key is a policy change: `mairu policy approve` asks through polkit once, and records the key as the approval anchor. From then on only a signature by an anchored key approves the next change. `mairu policy check` warns when `approval_methods` still allows `"platform"` while keys are registered.
+- `mairu doctor` shows whether `$SSH_AUTH_SOCK` is reachable, which registered keys it holds, and warns about a stale socket. `mairu lock` also drops every outstanding challenge.
+
+In a long-lived tmux session, `SSH_AUTH_SOCK` points at the socket of the SSH login that started it, which disappears when that login ends. Keep a stable symlink instead:
+
+```sh
+# ~/.ssh/rc: runs on every SSH login
+if test "$SSH_AUTH_SOCK"; then ln -sf "$SSH_AUTH_SOCK" ~/.ssh/agent.sock; fi
+```
+
+```sh
+# ~/.tmux.conf: do not copy SSH_AUTH_SOCK from the attaching client
+set -g update-environment "DISPLAY KRB5CCNAME SSH_ASKPASS SSH_AGENT_PID SSH_CONNECTION WINDOWID XAUTHORITY"
+# your shell's rc file, inside tmux
+export SSH_AUTH_SOCK=~/.ssh/agent.sock
+```
+
+Programs running as you on that host can also reach the forwarded agent and ask it to sign; only the agent's own lock stands in their way. A program that times its request to coincide with yours can take one approval, but never a policy approval: `mairu policy approve` asks on the terminal first, and approval and credential checks are never pending together.
 
 ### Harden home
 

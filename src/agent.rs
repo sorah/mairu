@@ -785,6 +785,7 @@ impl crate::proto::agent_server::Agent for Agent {
                 peer: peer.as_deref(),
                 expected_digest: &req.expected_digest,
                 expected_server_digests: &req.expected_server_digests,
+                client_context: req.client_context.as_ref(),
                 server_digests: servers
                     .iter()
                     .map(|s| {
@@ -815,7 +816,11 @@ impl crate::proto::agent_server::Agent for Agent {
             .cloned();
         let remaining = self
             .authorizer
-            .unmark_tools(peer.as_deref(), labels)
+            .unmark_tools(
+                peer.as_deref(),
+                labels,
+                request.get_ref().client_context.as_ref(),
+            )
             .await?;
         Ok(tonic::Response::new(UnmarkToolsResponse { remaining }))
     }

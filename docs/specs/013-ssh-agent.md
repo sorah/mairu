@@ -361,18 +361,34 @@ PERMISSION_DENIED     INVALID_RESPONSE (bad, expired or replayed response)
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented on `hardening/ssh-agent`. Verified in Docker with ssh-agent holding non-sk keys; `sk-` signatures, including the user-present and user-verified flags, are verified by unit tests with fixtures built in the tests (no FIDO hardware here). Implementors MUST keep this section updated as they work.
 
 ### Checklist
 
-- [ ] ssh-agent presence method: challenge issue, store and verification (`src/ssh_agent_presence.rs`)
-- [ ] Key-based branch of the decision procedure; request digest; challenges at gate 2 with held credentials
-- [ ] Proto: `AuthorizationChallenge`, `AuthorizationStatement`, `AuthorizationResponse`, `ClientContext.authorization_response`, `AuthorizationError.challenge`
-- [ ] Client relay and retry in `exec`, `credential-process`, `policy approve`, `unlock --tool`
-- [ ] Settings: `ssh_agent_keys`, `ssh-agent` method, defaults, `check` warning
-- [ ] `doctor`: `SSH_AUTH_SOCK` reachability, registered keys, stale socket, approval warning
-- [ ] README: registering a key, tmux `SSH_AUTH_SOCK` symlink
+- [x] ssh-agent presence method: challenge issue, store and verification (`src/ssh_agent_presence.rs`)
+- [x] Key-based branch of the decision procedure; request digest; challenges at gate 2 with held credentials
+- [x] Proto: `AuthorizationChallenge`, `AuthorizationStatement`, `AuthorizationResponse`, `ClientContext.authorization_response`, `AuthorizationError.challenge`
+- [x] Client relay and retry in `exec`, `credential-process`, `policy approve`, `unlock --tool`
+- [x] Settings: `ssh_agent_keys`, `ssh-agent` method, defaults, `check` warning
+- [x] `doctor`: `SSH_AUTH_SOCK` reachability, registered keys, stale socket, approval warning
+- [x] README: registering a key, tmux `SSH_AUTH_SOCK` symlink
 
 ### Updates
 
 - 2026-10-29: Split out of hardening.md, policy.md and platform-helper.md.
+- 2026-10-31: Implemented. Decisions and deviations:
+  - Crates: `ssh-key` 0.6.7 (`ed25519`, `p256`, `p384`, `p521`, `rsa`) and `ssh-encoding` 0.2, behind `cli`. The SSH agent protocol client is our own (`SshAgentClient`, two requests: `REQUEST_IDENTITIES` and `SIGN_REQUEST`, `SSH_AGENT_RSA_SHA2_512` for RSA keys), since that is all the relay needs. The client wraps the signature blob exactly as the agent returned it into the SSHSIG, because `ssh-key` 0.6 re-encodes `sk-ecdsa` signatures with the flags and counter inside the signature string. `rsa` 0.9 (pulled in for `ssh-rsa` keys) carries RUSTSEC-2023-0071, a timing side channel in private-key operations; mairu only verifies RSA signatures. Tests use `ed25519-dalek`, `p256` and `signature` as dev-dependencies to build `sk-` fixtures, and an in-process fake SSH agent for the relay.
+  - The approval anchor keeps OpenSSH key lines as specified, with the `authorized_keys` option `verify-required ` in front of a key registered with `require_user_verification`, so that the flag survives in the anchor.
+  - `"ssh-agent"` in `approval_methods` without any key in `ssh_agent_keys` fails validation: such an anchor could approve nothing until root resets it.
+  - `UNAPPROVED`/`TAMPERED` (and unapproved servers): `methods` is `["ssh-agent", "platform"]` when the anchor in force holds keys, with those keys; otherwise `["platform"]`. `APPROVED`: the file's `ssh_agent_keys`, and its `methods` or the defaults.
+  - A response is looked up only among the challenges of the requesting process (`take_for`): another process sending a stolen `challenge_id` gets `REASON_INVALID_RESPONSE` and the challenge stays usable by its own process. Verification also checks that the challenge's action matches the gate.
+  - One request carries one response, used by whichever gate first reaches the ssh-agent method; a gate permitting by it clears it, so the other gate issues a new challenge if it needs one. The client answers up to 3 challenges per RPC. A gate-1 signature presents itself to gate 2 as the fresh candidate, as a platform check does, so a policy that needs `scope == "request"` at both gates asks once.
+  - A decline sticks for the rest of the client command: after `no-ssh-agent`, `no-registered-key` or `sign-failed`, later challenges (including after the `pkttyagent` retry) are declined without asking the SSH agent again. `declined` is accepted without an outstanding challenge, since it only skips the method.
+  - An outstanding challenge holds its human check open for "one approval at a time" ([012](012-policy-approval.md#one-approval-at-a-time)): a credential (or `unlock --tool`) challenge counts as a pending credential check, and an approval challenge keeps the approval pending until it is answered, expires or `mairu lock` drops it. The retry of `ApprovePolicy` takes over the approval its challenge held.
+  - Over 4 outstanding challenges per peer, the oldest is evicted. Expired challenges are swept on issue, before every check, and by the 60 s sweeper.
+  - `UnmarkTools` asks through the methods and keys in force for the policy's own state; `ApprovePolicy` through the anchor's. Gate-2 challenges hold the fetched credentials like `REASON_NO_AUTHENTICATION_AGENT` does.
+  - The SSHSIG hash may be `sha256` or `sha512` (the client signs `sha512`); the namespace and the public key must match a registered key exactly (for `sk-` keys this includes the application).
+  - `credential-process` without a terminal answers challenges but prints nothing, as for the other context lines. `mairu policy check` prints each registered key's fingerprint, and warns about `"platform"` in `approval_methods` with keys. `doctor` adds an `ssh-agent` section: `SSH_AUTH_SOCK` reachable or not with its key count, each registered key and whether the agent holds it; warnings for an unreachable socket, no registered key held, and keys registered without `SSH_AUTH_SOCK`. The anchor warning stays in the policy section where 012 put it.
+  - Logs: decisions carry the method; "Verified a signature from the SSH agent" names the action and key fingerprint; `mairu lock` logs how many challenges it dropped. Statements, nonces and signatures are never logged.
+  - Verified in Docker (`013-ssh-agent`, 74 checks: hardened install, polkit answering through a rules file, fake credential server and STS, OpenSSH 10 ssh-agent with ed25519 and ecdsa keys): `policy check` listing the key and its warnings (platform in `approval_methods`, `require_user_verification` on a non-sk key); the file's key ignored while unapproved; the bootstrap approval through polkit recording `ssh-agent` and the key as the anchor; Admin under a policy requiring `method == "ssh-agent"` vended by a signature with polkit answering NO, with the context lines naming the key; `mairu exec` through the sidecar's ECS endpoint, one signature and then the lease; a gate-2 challenge for an opaque role whose credentials are held and not fetched again; no agent, a stale socket and an agent without registered keys declining and falling back to polkit, and to `pkttyagent` with a password when polkit has no agent; `ssh-add -c` refusing (`sign-failed`) and confirming; `ssh -A` into a tmux pane approving by the forwarded agent, the pane's socket going stale when that login ends (doctor warns, polkit asks), and the `~/.ssh/rc` symlink making a later login's agent reachable again; `unlock --tool` by signature; registering a second key refused without the agent even with polkit answering YES, and approved by a signature of the anchored key (generation 2, both keys anchored); `mairu lock` dropping a challenge while `ssh-add -c` waits, after which the late signature is refused with `REASON_INVALID_RESPONSE`. Scenarios 003–012 still pass. Replays, other peers and requests, expiry, wrong namespace, unregistered keys, the per-peer limit and the approval/check exclusion are covered by unit tests.
+  - Not verified: a real FIDO touch (the manual test), Secretive or other agents with their own UI, and macOS (cross-compiling the CLI needs Apple's toolchain; the module is platform-independent).

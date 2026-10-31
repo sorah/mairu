@@ -27,7 +27,7 @@ namespace Mairu {
     // "none"; "request": checked for this very request; "process": the lease of this running
     // `mairu exec`; "session": a grant for this terminal session.
     scope: String,
-    // The method that performed the check, such as "platform"; absent when not verified.
+    // The method that performed the check, "platform" or "ssh-agent"; absent when not verified.
     method?: String,
     // Seconds since the covering human check; 0 when not verified.
     age: Long,

@@ -32,6 +32,56 @@ pub fn context_lines(
     caller_arn: Option<&str>,
     tools: Option<&str>,
 ) -> String {
+    let heading = match prompt {
+        Prompt::MaybeDialog => "Authorization may be required",
+        Prompt::Password => "Authorization required",
+    };
+    let instruction = match prompt {
+        Prompt::MaybeDialog => "Approve in the system dialog if one appears.".to_owned(),
+        Prompt::Password => "Enter your password below.".to_owned(),
+    };
+    lines(
+        heading,
+        server,
+        role,
+        context,
+        caller_arn,
+        tools,
+        &instruction,
+    )
+}
+
+/// The lines of "What the human sees" before the SSH agent is asked to sign with the key named `comment`.
+pub fn ssh_agent_lines(
+    server: &str,
+    role: &str,
+    context: &crate::proto::ClientContext,
+    comment: &str,
+    caller_arn: Option<&str>,
+    tools: Option<&str>,
+) -> String {
+    lines(
+        "Authorization required",
+        server,
+        role,
+        context,
+        caller_arn,
+        tools,
+        &format!(
+            "Approve the signature on your SSH agent ({comment}) to authorize {role} on {server}"
+        ),
+    )
+}
+
+fn lines(
+    heading: &str,
+    server: &str,
+    role: &str,
+    context: &crate::proto::ClientContext,
+    caller_arn: Option<&str>,
+    tools: Option<&str>,
+    instruction: &str,
+) -> String {
     let product = env!("CARGO_PKG_NAME");
     let command = match &context.intent {
         Some(crate::proto::client_context::Intent::Exec(e)) => {
@@ -41,10 +91,6 @@ pub fn context_lines(
             "(credential-process)".to_owned()
         }
         None => "(unknown)".to_owned(),
-    };
-    let heading = match prompt {
-        Prompt::MaybeDialog => "Authorization may be required",
-        Prompt::Password => "Authorization required",
     };
     let mut lines = format!(":: {product} :: {heading}: {role} on {server}\n");
     if let Some(arn) = caller_arn.filter(|a| !a.is_empty()) {
@@ -68,10 +114,6 @@ pub fn context_lines(
         (None, Some(tools)) => lines.push_str(&format!(":: {product} ::   tools:   {tools}\n")),
         (None, None) => {}
     }
-    let instruction = match prompt {
-        Prompt::MaybeDialog => "Approve in the system dialog if one appears.",
-        Prompt::Password => "Enter your password below.",
-    };
     lines.push_str(&format!(":: {product} :: {instruction}\n"));
     lines
 }
@@ -118,42 +160,87 @@ pub fn terminal_origin() -> Option<String> {
 }
 
 /// Calls `AssumeRole`, printing the context lines while a hardened agent may be asking a human, and the long
-/// attempt notice when `long_attempt_notice` is set. Falls back to a password prompt on this terminal when polkit
-/// has no authentication agent for this process.
+/// attempt notice when `long_attempt_notice` is set. Answers challenges through the SSH agent, and falls back to a
+/// password prompt on this terminal when polkit has no authentication agent for this process.
 pub async fn assume_role_with_notice(
     agent: &mut crate::agent::AgentConn,
     req: crate::proto::AssumeRoleRequest,
     long_attempt_notice: bool,
 ) -> tonic::Result<tonic::Response<crate::proto::AssumeRoleResponse>> {
+    let relay = crate::ssh_agent_presence::Relay::from_env();
     let notice = |refusal: &crate::proto::AuthorizationError| password_notice(&req, refusal);
     crate::polkit_tty_agent::with_fallback(notice, |attempt| {
-        let mut agent = agent.clone();
+        let agent = agent.clone();
         let req = req.clone();
+        let relay = relay.clone();
         async move {
-            match attempt {
-                crate::polkit_tty_agent::Attempt::First => {
-                    notify_while_waiting(&mut agent, req, long_attempt_notice).await
-                }
-                // The context is already printed, and the prompt owns the terminal.
-                crate::polkit_tty_agent::Attempt::Retry => agent.assume_role(req).await,
-            }
+            let signature_notice = |refusal: &crate::proto::AuthorizationError, comment: &str| {
+                ssh_agent_notice(&req, refusal, comment)
+            };
+            relay
+                .with_challenges(signature_notice, |response| {
+                    let mut agent = agent.clone();
+                    let mut req = req.clone();
+                    let signed = crate::ssh_agent_presence::is_signed(response.as_ref());
+                    crate::ssh_agent_presence::set_response(&mut req.client_context, response);
+                    async move {
+                        match attempt {
+                            crate::polkit_tty_agent::Attempt::First if !signed => {
+                                notify_while_waiting(&mut agent, req, long_attempt_notice).await
+                            }
+                            // The context is already printed; the SSH agent or the password prompt asks.
+                            _ => agent.assume_role(req).await,
+                        }
+                    }
+                })
+                .await
         }
     })
     .await
 }
 
-/// Calls `AssumeRole` printing nothing unless it falls back to a password prompt on this terminal.
+/// Calls `AssumeRole` printing nothing unless it falls back to a password prompt on this terminal. Challenges are
+/// still answered through the SSH agent.
 pub async fn assume_role_quietly(
     agent: &mut crate::agent::AgentConn,
     req: crate::proto::AssumeRoleRequest,
 ) -> tonic::Result<tonic::Response<crate::proto::AssumeRoleResponse>> {
+    let relay = crate::ssh_agent_presence::Relay::from_env();
     let notice = |refusal: &crate::proto::AuthorizationError| password_notice(&req, refusal);
     crate::polkit_tty_agent::with_fallback(notice, |_| {
-        let mut agent = agent.clone();
+        let agent = agent.clone();
         let req = req.clone();
-        async move { agent.assume_role(req).await }
+        let relay = relay.clone();
+        async move {
+            relay
+                .with_challenges(
+                    |_, _| String::new(),
+                    |response| {
+                        let mut agent = agent.clone();
+                        let mut req = req.clone();
+                        crate::ssh_agent_presence::set_response(&mut req.client_context, response);
+                        async move { agent.assume_role(req).await }
+                    },
+                )
+                .await
+        }
     })
     .await
+}
+
+fn ssh_agent_notice(
+    req: &crate::proto::AssumeRoleRequest,
+    refusal: &crate::proto::AuthorizationError,
+    comment: &str,
+) -> String {
+    ssh_agent_lines(
+        &req.server_id,
+        &req.rolespec().role,
+        &req.client_context.clone().unwrap_or_default(),
+        comment,
+        Some(&refusal.caller_arn),
+        tools_summary(&refusal.tools).as_deref(),
+    )
 }
 
 fn password_notice(
@@ -236,6 +323,7 @@ mod tests {
             cwd: b"/home/u/src/infra".to_vec(),
             auto_config_path: vec![],
             env_names: vec![],
+            authorization_response: None,
         };
         let lines = context_lines(
             "contoso",

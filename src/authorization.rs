@@ -11,6 +11,7 @@ const HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The presence method backed by `PlatformServices::authorize`.
 pub const METHOD_PLATFORM: &str = "platform";
+pub const METHOD_SSH_AGENT: &str = crate::ssh_agent_presence::METHOD;
 
 const COMMAND_DETAIL_LIMIT: usize = 512;
 const COMMAND_LINE_LIMIT: usize = 4096;
@@ -132,6 +133,8 @@ struct Shared {
     clock: std::sync::Arc<dyn Clock>,
     hardened: bool,
     state: parking_lot::Mutex<State>,
+    /// Never locked while `checks` is: dropping a challenge ends its check.
+    challenges: parking_lot::Mutex<crate::ssh_agent_presence::Challenges<CheckGuard>>,
     inflight: parking_lot::Mutex<
         std::collections::HashMap<
             FlightKey,
@@ -185,6 +188,9 @@ struct Pending {
     session: Option<crate::platform::SessionIdentity>,
     server_id: String,
     role_key: RoleKey,
+    rolespec: crate::proto::Rolespec,
+    /// The answer to a challenge, for whichever gate asks with a key-based method first.
+    response: Option<crate::proto::AuthorizationResponse>,
     exec: bool,
     prefetch: bool,
     facts: crate::policy::Facts,
@@ -269,6 +275,7 @@ impl Authorizer {
                 let now = shared.clock.now();
                 let retention = shared.grant_retention();
                 shared.state.lock().sweep(now, retention, shared.process);
+                shared.sweep_challenges();
             }
         });
         this
@@ -292,6 +299,9 @@ impl Authorizer {
                 hardened,
                 checks: Default::default(),
                 state: Default::default(),
+                challenges: parking_lot::Mutex::new(crate::ssh_agent_presence::Challenges::new(
+                    rand::random(),
+                )),
                 inflight: Default::default(),
             }),
         }
@@ -340,19 +350,33 @@ impl Authorizer {
         };
         let mut methods = vec![];
         for method in &verified.effective.settings.methods {
-            if method == METHOD_PLATFORM && self.shared.platform_usable().await.is_ok() {
+            let usable = match method.as_str() {
+                METHOD_SSH_AGENT => !verified.effective.ssh_agent_keys.is_empty(),
+                METHOD_PLATFORM => self.shared.platform_usable().await.is_ok(),
+                _ => false,
+            };
+            if usable {
                 methods.push(method.clone());
             }
         }
         methods
     }
 
-    /// Drops grants (of `session` only, when given) and, with `include_leases`, leases. Returns the counts.
+    /// Drops grants (of `session` only, when given) and, with `include_leases`, leases. Returns the counts. Every
+    /// outstanding challenge is dropped too.
     pub fn revoke(
         &self,
         session: Option<Option<crate::platform::SessionIdentity>>,
         include_leases: bool,
     ) -> (u32, u32) {
+        let challenges = self.shared.challenges.lock().clear();
+        if !challenges.is_empty() {
+            tracing::info!(
+                challenges = challenges.len(),
+                "Dropped outstanding challenges"
+            );
+        }
+        drop(challenges);
         let mut state = self.shared.state.lock();
         let (grants_before, leases_before) = (state.grants.len(), state.leases.len());
         match session {
@@ -417,6 +441,7 @@ impl Authorizer {
         &self,
         peer: Option<&crate::platform::PeerIdentity>,
         labels: &[String],
+        context: Option<&crate::proto::ClientContext>,
     ) -> Result<Vec<String>, tonic::Status> {
         use crate::proto::authorization_error::Reason;
         use crate::proto::platform::authorize_response::Result as R;
@@ -455,37 +480,86 @@ impl Authorizer {
             tracing::info!(pid = peer.pid, session = ?session, tools = ?labels, reason = ?reason, detail, "Tool marks kept");
             Err(Refusal::new(reason, detail).into_status())
         };
-        if let Err(e) = shared.platform_usable().await {
-            return refuse(
-                Reason::Unavailable,
-                format!("no method could ask for approval; tried {METHOD_PLATFORM}: {e}"),
-            );
-        }
-        let _check = match Checks::begin_check(&shared.checks, tty.clone()) {
-            Ok(guard) => guard,
-            Err(approval) => {
-                return refuse(Reason::CheckPending, Checks::approval_pending(&approval));
-            }
+        let remove = |method: &str| {
+            let remaining = shared.state.lock().marks.remove(&session, labels);
+            tracing::info!(pid = peer.pid, session = ?session, tools = ?labels, remaining = ?remaining, method, "Removed tool marks");
+            Ok(remaining)
         };
-        let resp = shared.services.authorize(request).await;
-        match resp.result() {
-            R::Allowed => {
-                let remaining = shared.state.lock().marks.remove(&session, labels);
-                tracing::info!(pid = peer.pid, session = ?session, tools = ?labels, remaining = ?remaining, "Removed tool marks");
-                Ok(remaining)
+        let begin_check = || {
+            shared.sweep_challenges();
+            Checks::begin_check(&shared.checks, tty.clone()).map_err(|approval| {
+                Refusal::new(Reason::CheckPending, Checks::approval_pending(&approval))
+            })
+        };
+        let effective = shared
+            .policy
+            .load()
+            .await
+            .map_err(|e| tonic::Status::internal(format!("failed to build the policy: {e}")))?
+            .effective
+            .clone();
+        let response = context.and_then(|c| c.authorization_response.as_ref());
+        let mut tried: Vec<String> = vec![];
+        for method in effective.settings.methods.iter().map(String::as_str) {
+            match method {
+                METHOD_SSH_AGENT if !effective.ssh_agent_keys.is_empty() => {
+                    let binding = crate::ssh_agent_presence::Binding {
+                        pid: peer.pid,
+                        start_time: peer.start_time,
+                        action: crate::ssh_agent_presence::ACTION_UNMARK_TOOLS,
+                        server_id: String::new(),
+                        rolespec: None,
+                        request_digest: unmark_digest(labels, context),
+                    };
+                    let challenge = shared.take_challenge(response, peer.pid, peer.start_time);
+                    match shared.ssh_agent_check(
+                        binding,
+                        response,
+                        challenge,
+                        &effective.ssh_agent_keys,
+                        || begin_check().map(Some),
+                    ) {
+                        Ok(KeyCheck::Verified { .. }) => return remove(method),
+                        Ok(KeyCheck::Declined(reason)) => {
+                            tried.push(format!("{method}: declined ({reason})"));
+                        }
+                        Err(refusal) => {
+                            tracing::info!(pid = peer.pid, session = ?session, tools = ?labels, reason = ?refusal.reason(), detail = refusal.detail, "Tool marks kept");
+                            return Err(refusal.into_status());
+                        }
+                    }
+                }
+                METHOD_PLATFORM => {
+                    if let Err(e) = shared.platform_usable().await {
+                        tried.push(format!("{method}: {e}"));
+                        continue;
+                    }
+                    let _check = match begin_check() {
+                        Ok(guard) => guard,
+                        Err(refusal) => return refuse(refusal.reason(), refusal.detail),
+                    };
+                    let resp = shared.services.authorize(request.clone()).await;
+                    match resp.result() {
+                        R::Allowed => return remove(method),
+                        R::Denied | R::Cancelled => return refuse(Reason::Denied, resp.reason),
+                        R::Unavailable if resp.reason == REASON_NO_AUTHENTICATION_AGENT => {
+                            return refuse(Reason::NoAuthenticationAgent, String::new());
+                        }
+                        R::Unavailable | R::Unspecified => {
+                            tried.push(format!("{method}: {}: {}", resp.reason, resp.detail));
+                        }
+                    }
+                }
+                _ => {}
             }
-            R::Denied | R::Cancelled => refuse(Reason::Denied, resp.reason),
-            R::Unavailable if resp.reason == REASON_NO_AUTHENTICATION_AGENT => {
-                refuse(Reason::NoAuthenticationAgent, String::new())
-            }
-            R::Unavailable | R::Unspecified => refuse(
-                Reason::Unavailable,
-                format!(
-                    "no method could ask for approval; tried {METHOD_PLATFORM}: {}: {}",
-                    resp.reason, resp.detail
-                ),
-            ),
         }
+        refuse(
+            Reason::Unavailable,
+            format!(
+                "no method could ask for approval; tried {}",
+                tried.join(", ")
+            ),
+        )
     }
 
     /// Gate 1. Decides; asks a human when the policy would permit the request after a check and nothing
@@ -675,7 +749,11 @@ impl Authorizer {
                 })
             }
             Err(refusal) => {
-                if refusal.reason() == Reason::NoAuthenticationAgent {
+                // Refusals the client retries after.
+                if matches!(
+                    refusal.reason(),
+                    Reason::NoAuthenticationAgent | Reason::Challenge
+                ) {
                     let until = self.shared.clock.now() + HOLD_DURATION;
                     self.shared.state.lock().held.insert(
                         key,
@@ -714,6 +792,7 @@ fn log_decision(
             tools = ?pending.detection.tool_matches,
             caller_arn,
             presence = a.presence.scope.as_str(),
+            method = a.presence.method,
             "Authorization permitted"
         ),
         Err(e) => tracing::info!(
@@ -842,7 +921,7 @@ impl Shared {
 
     async fn decide_at(
         self: &std::sync::Arc<Self>,
-        pending: Pending,
+        mut pending: Pending,
         action: crate::policy::Action<'_>,
         extra: Option<crate::policy::Presence>,
     ) -> Result<Authorized, Refusal> {
@@ -949,27 +1028,73 @@ impl Shared {
         // What could be asked.
         let mut tried: Vec<String> = vec![];
         let mut fresh_allowed = false;
+        let origin = pending
+            .facts
+            .tty
+            .clone()
+            .unwrap_or_else(|| format!("pid {}", pending.pid));
+        let begin_check = || {
+            self.sweep_challenges();
+            Checks::begin_check(&self.checks, origin.clone()).map_err(|approval| {
+                Refusal::new(Reason::CheckPending, Checks::approval_pending(&approval))
+            })
+        };
         for method in effective.settings.methods.iter().map(String::as_str) {
-            if method != METHOD_PLATFORM {
-                continue;
-            }
+            let keys = match method {
+                METHOD_PLATFORM => None,
+                METHOD_SSH_AGENT if !effective.ssh_agent_keys.is_empty() => {
+                    Some(&effective.ssh_agent_keys)
+                }
+                _ => continue,
+            };
             let presence = crate::policy::Presence::fresh(method);
             if !note(&engine.evaluate(&prepared, &presence)) {
                 continue;
             }
             fresh_allowed = true;
+            if let Some(keys) = keys {
+                let action = match caller {
+                    None => crate::ssh_agent_presence::ACTION_ASSUME_ROLE,
+                    Some(_) => crate::ssh_agent_presence::ACTION_USE_CREDENTIALS,
+                };
+                let response = pending.response.as_ref();
+                let challenge = self.take_challenge(response, pending.pid, pending.start_time);
+                match self.ssh_agent_check(
+                    pending.binding(action),
+                    response,
+                    challenge,
+                    keys,
+                    || begin_check().map(Some),
+                )? {
+                    KeyCheck::Verified { fingerprint, .. } => {
+                        tracing::info!(
+                            pid = pending.pid,
+                            action,
+                            key = fingerprint,
+                            "Verified a signature from the SSH agent"
+                        );
+                        self.record(&pending, &lease_key, method);
+                        // A response answers one challenge; the other gate asks anew.
+                        pending.response = None;
+                        return Ok(Authorized {
+                            shared: self.clone(),
+                            lease: (pending.exec && pending.pidfd.is_some()).then_some(lease_key),
+                            demand: true,
+                            pending,
+                            presence,
+                        });
+                    }
+                    KeyCheck::Declined(reason) => {
+                        tried.push(format!("{method}: declined ({reason})"));
+                        continue;
+                    }
+                }
+            }
             if let Err(e) = self.platform_usable().await {
                 tried.push(format!("{method}: {e}"));
                 continue;
             }
-            let origin = pending
-                .facts
-                .tty
-                .clone()
-                .unwrap_or_else(|| format!("pid {}", pending.pid));
-            let _check = Checks::begin_check(&self.checks, origin).map_err(|approval| {
-                Refusal::new(Reason::CheckPending, Checks::approval_pending(&approval))
-            })?;
+            let _check = begin_check()?;
             let resp = self.prompt(&pending, caller).await;
             use crate::proto::platform::authorize_response::Result as R;
             match resp.result() {
@@ -1027,6 +1152,71 @@ impl Shared {
             Reason::NotPermitted,
             "no policy permits this role, even after a human check",
         ))
+    }
+
+    /// Drops expired challenges, ending their checks.
+    fn sweep_challenges(&self) {
+        let expired = self.challenges.lock().sweep(self.clock.now());
+        drop(expired);
+    }
+
+    /// The outstanding challenge a response answers, removed so that it is used once. Only the process it was
+    /// issued to can take it.
+    fn take_challenge(
+        &self,
+        response: Option<&crate::proto::AuthorizationResponse>,
+        pid: u32,
+        start_time: u64,
+    ) -> Option<crate::ssh_agent_presence::PendingChallenge<CheckGuard>> {
+        let response = response?;
+        self.challenges
+            .lock()
+            .take_for(&response.challenge_id, pid, start_time)
+    }
+
+    /// The ssh-agent method for one request: verifies a signature over `challenge`, which `response` answers, or
+    /// issues a challenge when there is no response. `begin` starts the check a challenge stands for until it is
+    /// answered or expires.
+    fn ssh_agent_check(
+        &self,
+        binding: crate::ssh_agent_presence::Binding,
+        response: Option<&crate::proto::AuthorizationResponse>,
+        challenge: Option<crate::ssh_agent_presence::PendingChallenge<CheckGuard>>,
+        keys: &[crate::ssh_agent_presence::RegisteredKey],
+        begin: impl FnOnce() -> Result<Option<CheckGuard>, Refusal>,
+    ) -> Result<KeyCheck, Refusal> {
+        use crate::proto::authorization_error::Reason;
+        use crate::proto::authorization_response::Result as R;
+        match response.and_then(|r| r.result.as_ref()) {
+            Some(R::Declined(reason)) => {
+                drop(challenge);
+                Ok(KeyCheck::Declined(reason.clone()))
+            }
+            Some(R::Sshsig(sshsig)) => {
+                let Some(challenge) = challenge else {
+                    return Err(Refusal::new(
+                        Reason::InvalidResponse,
+                        "the challenge is unknown, expired or already used",
+                    ));
+                };
+                match challenge.verify(&binding, self.clock.now(), sshsig, keys) {
+                    Ok(key) => Ok(KeyCheck::Verified {
+                        fingerprint: key.fingerprint(),
+                    }),
+                    Err(e) => Err(Refusal::new(Reason::InvalidResponse, e)),
+                }
+            }
+            None => {
+                drop(challenge);
+                let guard = begin()?;
+                let (challenge, evicted) =
+                    self.challenges
+                        .lock()
+                        .issue(binding, keys, self.clock.now(), guard);
+                drop(evicted);
+                Err(Refusal::challenge(challenge))
+            }
+        }
     }
 
     /// Concurrent identical requests from one process at the same gate share one prompt. Dropping every waiter
@@ -1094,6 +1284,13 @@ impl Shared {
             );
         }
     }
+}
+
+/// What the ssh-agent method came to, short of a refusal.
+#[derive(Debug)]
+enum KeyCheck {
+    Verified { fingerprint: String },
+    Declined(String),
 }
 
 /// Human checks waiting for an answer. A policy approval and credential checks are never pending together, so a
@@ -1194,6 +1391,7 @@ pub struct Approval<'a> {
     pub peer: Option<&'a crate::platform::PeerIdentity>,
     pub expected_digest: &'a [u8],
     pub expected_server_digests: &'a std::collections::HashMap<String, Vec<u8>>,
+    pub client_context: Option<&'a crate::proto::ClientContext>,
     /// Of each server in `servers.d`, as the files are now.
     pub server_digests: std::collections::BTreeMap<String, crate::policy::integrity_state::Digest>,
 }
@@ -1222,10 +1420,23 @@ impl Authorizer {
             .process
             .controlling_tty(peer)
             .unwrap_or_else(|| format!("pid {}", peer.pid));
-        let _approval = Checks::begin_approval(&shared.checks, origin.clone()).map_err(|busy| {
-            tracing::warn!(pid = peer.pid, origin, busy = %busy, "Refused a policy approval");
-            tonic::Status::failed_precondition(busy.to_string())
-        })?;
+        let response = approval
+            .client_context
+            .and_then(|c| c.authorization_response.as_ref());
+        // The retry of an approval answering its own challenge continues the approval that challenge holds.
+        let mut challenge = shared
+            .take_challenge(response, peer.pid, peer.start_time)
+            .filter(|c| c.action() == crate::ssh_agent_presence::ACTION_APPROVE_POLICY);
+        shared.sweep_challenges();
+        let mut approval_guard = match challenge.as_mut().and_then(|c| c.guard.take()) {
+            Some(guard) => Some(guard),
+            None => Some(
+                Checks::begin_approval(&shared.checks, origin.clone()).map_err(|busy| {
+                    tracing::warn!(pid = peer.pid, origin, busy = %busy, "Refused a policy approval");
+                    tonic::Status::failed_precondition(busy.to_string())
+                })?,
+            ),
+        };
 
         let (policy, settings) = crate::policy::files::PolicyFiles::read_contents(dir);
         let digest = crate::policy::integrity_state::policy_digest(&policy, &settings);
@@ -1279,6 +1490,51 @@ impl Authorizer {
         let mut tried = vec![];
         let mut allowed = false;
         for method in &decision.anchor.methods {
+            if method == METHOD_SSH_AGENT {
+                let keys =
+                    crate::policy::settings::EffectiveSettings::anchored_keys(&decision.anchor);
+                if keys.is_empty() {
+                    tried.push(format!("{method}: the approval anchor holds no key"));
+                    continue;
+                }
+                let binding = crate::ssh_agent_presence::Binding {
+                    pid: peer.pid,
+                    start_time: peer.start_time,
+                    action: crate::ssh_agent_presence::ACTION_APPROVE_POLICY,
+                    server_id: String::new(),
+                    rolespec: None,
+                    request_digest: approval_request_digest(
+                        approval.expected_digest,
+                        approval.expected_server_digests,
+                        approval.client_context,
+                    ),
+                };
+                // An outstanding approval challenge keeps the approval pending.
+                match shared.ssh_agent_check(binding, response, challenge.take(), &keys, || {
+                    Ok(approval_guard.take())
+                }) {
+                    Ok(KeyCheck::Verified { fingerprint, .. }) => {
+                        tracing::info!(
+                            pid = peer.pid,
+                            origin,
+                            key = fingerprint,
+                            "Verified a signature from the SSH agent for the policy approval"
+                        );
+                        allowed = true;
+                        break;
+                    }
+                    Ok(KeyCheck::Declined(reason)) => {
+                        tried.push(format!("{method}: declined ({reason})"));
+                        continue;
+                    }
+                    Err(refusal) => {
+                        if refusal.reason() != Reason::Challenge {
+                            tracing::info!(pid = peer.pid, origin, reason = ?refusal.reason(), detail = refusal.detail, "Policy approval refused");
+                        }
+                        return Err(refusal.into_status());
+                    }
+                }
+            }
             if method != METHOD_PLATFORM {
                 tried.push(format!("{method}: not supported by this mairu"));
                 continue;
@@ -1439,7 +1695,8 @@ impl Pending {
         detection: crate::tool_detection::Detection,
         effective: std::sync::Arc<crate::policy::files::Effective>,
     ) -> Self {
-        let context = req.client_context.cloned().unwrap_or_default();
+        let mut context = req.client_context.cloned().unwrap_or_default();
+        let response = context.authorization_response.take();
         let exec = match &context.intent {
             Some(crate::proto::client_context::Intent::Exec(e)) => Some(e),
             _ => None,
@@ -1493,6 +1750,8 @@ impl Pending {
             session,
             server_id: req.server.id().to_owned(),
             role_key: req.rolespec.into(),
+            rolespec: req.rolespec.clone(),
+            response,
             exec: exec.is_some(),
             prefetch: exec.is_some_and(|e| e.prefetch),
             command_detail: command_line.map(|l| truncate(&l, COMMAND_DETAIL_LIMIT).to_owned()),
@@ -1519,6 +1778,17 @@ impl Pending {
     /// Identifies the request; also the key of its held credentials.
     fn flight_key(&self) -> FlightKey {
         (self.pid, self.start_time, self.digest)
+    }
+
+    fn binding(&self, action: &'static str) -> crate::ssh_agent_presence::Binding {
+        crate::ssh_agent_presence::Binding {
+            pid: self.pid,
+            start_time: self.start_time,
+            action,
+            server_id: self.server_id.clone(),
+            rolespec: Some(self.rolespec.clone()),
+            request_digest: self.digest,
+        }
     }
 
     fn authorize_request(
@@ -1595,6 +1865,14 @@ fn subject(
     }
 }
 
+/// The client context as request digests cover it: without the response, which the retry adds.
+fn digested_context(context: Option<&crate::proto::ClientContext>) -> crate::proto::ClientContext {
+    crate::proto::ClientContext {
+        authorization_response: None,
+        ..context.cloned().unwrap_or_default()
+    }
+}
+
 /// SHA-256 over the prost encoding of the action, server, rolespec and client context: what the human sees.
 fn request_digest(
     server_id: &str,
@@ -1609,10 +1887,48 @@ fn request_digest(
             rolespec.clone(),
         )),
         cached: false,
-        client_context: Some(context.clone()),
+        client_context: Some(digested_context(Some(context))),
     };
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"AssumeRole\0");
+    hasher.update(request.encode_to_vec());
+    hasher.finalize().into()
+}
+
+/// An `ApprovePolicy` request: the digests the client showed, in server id order, and its context.
+fn approval_request_digest(
+    expected_digest: &[u8],
+    expected_server_digests: &std::collections::HashMap<String, Vec<u8>>,
+    context: Option<&crate::proto::ClientContext>,
+) -> [u8; 32] {
+    use prost::Message;
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"ApprovePolicy\0");
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    };
+    field(expected_digest);
+    let servers: std::collections::BTreeMap<_, _> = expected_server_digests.iter().collect();
+    for (id, digest) in servers {
+        field(id.as_bytes());
+        field(digest);
+    }
+    field(&digested_context(context).encode_to_vec());
+    hasher.finalize().into()
+}
+
+/// An `UnmarkTools` request: the labels and its context.
+fn unmark_digest(labels: &[String], context: Option<&crate::proto::ClientContext>) -> [u8; 32] {
+    use prost::Message;
+    use sha2::Digest;
+    let request = crate::proto::UnmarkToolsRequest {
+        tools: labels.to_vec(),
+        client_context: Some(digested_context(context)),
+    };
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"UnmarkTools\0");
     hasher.update(request.encode_to_vec());
     hasher.finalize().into()
 }
@@ -1953,6 +2269,7 @@ mod tests {
             cwd: b"/home/alice".to_vec(),
             auto_config_path: vec![],
             env_names: vec![],
+            authorization_response: None,
         }
     }
 
@@ -2164,7 +2481,7 @@ mod tests {
         assert_eq!(f.services.prompts(), 1);
         let remaining = f
             .authorizer
-            .unmark_tools(Some(&peer(10)), &labels[..1])
+            .unmark_tools(Some(&peer(10)), &labels[..1], None)
             .await
             .unwrap();
         assert_eq!(remaining, vec!["ci"]);
@@ -2175,7 +2492,7 @@ mod tests {
         };
         let status = f
             .authorizer
-            .unmark_tools(Some(&peer(10)), &labels[1..])
+            .unmark_tools(Some(&peer(10)), &labels[1..], None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -2191,7 +2508,7 @@ mod tests {
         *f.process.session.lock() = None;
         let status = f
             .authorizer
-            .unmark_tools(Some(&peer(10)), &labels[1..])
+            .unmark_tools(Some(&peer(10)), &labels[1..], None)
             .await
             .unwrap_err();
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -2988,6 +3305,7 @@ mod tests {
                     peer: Some(peer),
                     expected_digest: &digest,
                     expected_server_digests: &expected,
+                    client_context: None,
                     server_digests: servers.iter().map(|(id, d)| (id.to_string(), *d)).collect(),
                 })
                 .await
@@ -3037,6 +3355,7 @@ mod tests {
                 peer: Some(&peer),
                 expected_digest: &[0; 32],
                 expected_server_digests: &wrong,
+                client_context: None,
                 server_digests: Default::default(),
             })
             .await
@@ -3054,6 +3373,7 @@ mod tests {
                         peer: Some(&peer),
                         expected_digest: &[0; 32],
                         expected_server_digests: &wrong,
+                        client_context: None,
                         server_digests: [("contoso".to_owned(), [1; 32])].into(),
                     })
                     .await
@@ -3354,6 +3674,7 @@ mod tests {
                     true,
                     &crate::policy::files::Content::Absent,
                     &crate::policy::files::Content::Absent,
+                    &crate::policy::integrity_state::default_anchor(),
                 )
                 .unwrap(),
             ),
@@ -3389,6 +3710,7 @@ mod tests {
             false,
             &crate::policy::files::Content::Absent,
             &settings,
+            &crate::policy::integrity_state::default_anchor(),
         )
         .unwrap();
         let services = MockServices::answering(R::Allowed, "");
@@ -3413,5 +3735,591 @@ mod tests {
         let p = f.pending(10, None, "r", None);
         assert!(!p.gate2(false));
         assert_eq!(p.sts_target(), crate::caller_identity::StsTarget::default());
+    }
+
+    /// The built-in policy with a registered key: methods `["ssh-agent", "platform"]`.
+    fn key_fixture(
+        engine: crate::policy::Engine,
+        services: std::sync::Arc<MockServices>,
+    ) -> Fixture {
+        let key = crate::ssh_agent_presence::test_support::key();
+        let mut effective = crate::policy::files::Effective::with_engine(engine);
+        effective.settings.methods = crate::policy::settings::default_methods(true);
+        effective.settings.ssh_agent_keys = vec![crate::policy::settings::SshAgentKeyEntry {
+            key: key.to_openssh(),
+            require_user_verification: false,
+        }];
+        effective.ssh_agent_keys = vec![key];
+        fixture_with_policy(
+            crate::policy::files::PolicyFiles::fixed(effective),
+            services,
+        )
+    }
+
+    fn responding(
+        mut context: crate::proto::ClientContext,
+        response: crate::proto::AuthorizationResponse,
+    ) -> crate::proto::ClientContext {
+        context.authorization_response = Some(response);
+        context
+    }
+
+    fn challenge_of(r: Result<Authorized, Refusal>) -> crate::proto::AuthorizationChallenge {
+        let refusal = r.unwrap_err();
+        assert_eq!(refusal.reason(), Reason::Challenge, "{refusal:?}");
+        refusal.challenge.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_ssh_agent_challenge_and_grant() {
+        use crate::ssh_agent_presence::test_support::signed;
+        let f = key_fixture(
+            crate::policy::Engine::builtin(true).unwrap(),
+            MockServices::answering(R::Allowed, ""),
+        );
+        let ctx = exec_context("terraform apply", false);
+        let c = challenge_of(
+            f.decide(f.pending(10, Some(TTY), "admin", Some(ctx.clone())))
+                .await,
+        );
+        assert_eq!(c.method, "ssh-agent");
+        assert_eq!(
+            c.key_fingerprints,
+            vec![crate::ssh_agent_presence::test_support::key().fingerprint()]
+        );
+        let statement = <crate::proto::AuthorizationStatement as prost::Message>::decode(
+            c.statement.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(statement.action, "assume-role");
+        assert_eq!(statement.peer_pid, 10);
+        assert_eq!(statement.server_id, "contoso");
+        assert_eq!(
+            statement.request_digest,
+            f.pending(10, Some(TTY), "admin", Some(ctx.clone()))
+                .digest
+                .to_vec()
+        );
+
+        let retry = responding(ctx.clone(), signed(&c));
+        let pending = f.pending(10, Some(TTY), "admin", Some(retry));
+        assert_eq!(
+            pending.digest.to_vec(),
+            statement.request_digest,
+            "the response is not digested"
+        );
+        let authorized = f.decide(pending).await.unwrap();
+        assert_eq!(
+            authorized.presence,
+            crate::policy::Presence::fresh("ssh-agent")
+        );
+        assert_eq!(f.services.prompts(), 0);
+        // Remembered like a platform check, with its method.
+        let authorized = f
+            .decide(f.pending(10, Some(TTY), "admin", Some(ctx)))
+            .await
+            .unwrap();
+        assert_eq!(authorized.presence.scope, crate::policy::Scope::Process);
+        assert_eq!(authorized.presence.method.as_deref(), Some("ssh-agent"));
+        assert_eq!(f.authorizer.counts(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn test_ssh_agent_invalid_responses() {
+        use crate::ssh_agent_presence::test_support::signed;
+        let f = key_fixture(
+            crate::policy::Engine::builtin(true).unwrap(),
+            MockServices::answering(R::Allowed, ""),
+        );
+        // No session and no exec: nothing is remembered, so every request asks.
+        let ctx = || {
+            Some(crate::proto::ClientContext {
+                intent: Some(crate::proto::client_context::Intent::CredentialProcess(
+                    crate::proto::CredentialProcessIntent {},
+                )),
+                cwd: b"/home/alice".to_vec(),
+                ..Default::default()
+            })
+        };
+        let issue = || async { challenge_of(f.decide(f.pending(10, None, "admin", ctx())).await) };
+        let invalid = |r: Result<Authorized, Refusal>| {
+            let refusal = r.unwrap_err();
+            assert_eq!(refusal.reason(), Reason::InvalidResponse, "{refusal:?}");
+            assert_eq!(refusal.into_status().code(), tonic::Code::PermissionDenied);
+        };
+        let retry = |pid: u32, ctx: Option<crate::proto::ClientContext>, r| {
+            f.pending(pid, None, "admin", ctx.map(|c| responding(c, r)))
+        };
+
+        // Replayed.
+        let c = issue().await;
+        f.decide(retry(10, ctx(), signed(&c))).await.unwrap();
+        invalid(f.decide(retry(10, ctx(), signed(&c))).await);
+        // Another process.
+        let c = issue().await;
+        invalid(f.decide(retry(11, ctx(), signed(&c))).await);
+        // The rightful process can still use it.
+        f.decide(retry(10, ctx(), signed(&c))).await.unwrap();
+        // Another request: another working directory.
+        let c = issue().await;
+        let mut other = ctx().unwrap();
+        other.cwd = b"/tmp".to_vec();
+        invalid(f.decide(retry(10, Some(other), signed(&c))).await);
+        // Another role.
+        let c = issue().await;
+        invalid(
+            f.decide(f.pending(10, None, "other", ctx().map(|x| responding(x, signed(&c)))))
+                .await,
+        );
+        // Expired.
+        let c = issue().await;
+        f.clock.advance(61);
+        invalid(f.decide(retry(10, ctx(), signed(&c))).await);
+        // Dropped by `mairu lock`.
+        let c = issue().await;
+        f.authorizer.revoke(None, false);
+        invalid(f.decide(retry(10, ctx(), signed(&c))).await);
+        // An unregistered key.
+        let c = issue().await;
+        let mut response = signed(&c);
+        let mut other_key = c.clone();
+        other_key.statement = b"x".to_vec();
+        if let Some(crate::proto::authorization_response::Result::Sshsig(sig)) =
+            &mut response.result
+        {
+            *sig = crate::ssh_agent_presence::test_support::sign(&other_key);
+        }
+        invalid(f.decide(retry(10, ctx(), response)).await);
+        assert_eq!(f.services.prompts(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ssh_agent_declined_falls_back() {
+        use crate::ssh_agent_presence::test_support::declined;
+        let f = key_fixture(
+            crate::policy::Engine::builtin(true).unwrap(),
+            MockServices::answering(R::Allowed, ""),
+        );
+        let ctx = exec_context("terraform apply", false);
+        let c = challenge_of(
+            f.decide(f.pending(10, Some(TTY), "admin", Some(ctx.clone())))
+                .await,
+        );
+        let authorized = f
+            .decide(f.pending(10, Some(TTY), "admin", Some(responding(ctx, declined(&c)))))
+            .await
+            .unwrap();
+        assert_eq!(
+            authorized.presence,
+            crate::policy::Presence::fresh("platform")
+        );
+        assert_eq!(f.services.prompts(), 1);
+        assert!(f.authorizer.shared.challenges.lock().is_empty());
+
+        // With no platform either, the refusal names both.
+        let f = key_fixture(
+            crate::policy::Engine::builtin(true).unwrap(),
+            MockServices::answering(R::Unavailable, "polkit-unavailable"),
+        );
+        let ctx = exec_context("terraform apply", false);
+        let c = challenge_of(
+            f.decide(f.pending(10, Some(TTY), "admin", Some(ctx.clone())))
+                .await,
+        );
+        let refusal = f
+            .decide(f.pending(10, Some(TTY), "admin", Some(responding(ctx, declined(&c)))))
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.reason(), Reason::Unavailable);
+        assert!(
+            refusal
+                .detail
+                .contains("ssh-agent: declined (no-ssh-agent)"),
+            "{refusal:?}"
+        );
+        assert!(refusal.detail.contains("platform"), "{refusal:?}");
+    }
+
+    #[tokio::test]
+    async fn test_ssh_agent_prefetch_never_challenged() {
+        let f = key_fixture(
+            crate::policy::Engine::builtin(true).unwrap(),
+            MockServices::answering(R::Allowed, ""),
+        );
+        let refusal = f
+            .decide(f.pending(10, Some(TTY), "admin", Some(exec_context("x", true))))
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.reason(), Reason::PresenceRequired);
+        assert!(f.authorizer.shared.challenges.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ssh_agent_policy_requires_method() {
+        use crate::ssh_agent_presence::test_support::signed;
+        let policy = r#"
+            @id("ssh-agent-only")
+            permit (principal, action == Mairu::Action::"AssumeRole", resource)
+            when { context.presence.verified && context.presence has method && context.presence.method == "ssh-agent" };
+        "#;
+        let f = key_fixture(
+            crate::policy::Engine::new(policy).unwrap(),
+            MockServices::answering(R::Allowed, ""),
+        );
+        let ctx = exec_context("terraform apply", false);
+        let c = challenge_of(
+            f.decide(f.pending(10, Some(TTY), "admin", Some(ctx.clone())))
+                .await,
+        );
+        // Declining leaves no method the policy accepts.
+        let refusal = f
+            .decide(f.pending(
+                10,
+                Some(TTY),
+                "admin",
+                Some(responding(
+                    ctx.clone(),
+                    crate::ssh_agent_presence::test_support::declined(&c),
+                )),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.reason(), Reason::Unavailable);
+        assert_eq!(f.services.prompts(), 0);
+        let c = challenge_of(
+            f.decide(f.pending(10, Some(TTY), "admin", Some(ctx.clone())))
+                .await,
+        );
+        f.decide(f.pending(10, Some(TTY), "admin", Some(responding(ctx, signed(&c)))))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ssh_agent_challenge_limit_per_peer() {
+        let f = key_fixture(
+            crate::policy::Engine::builtin(true).unwrap(),
+            MockServices::answering(R::Allowed, ""),
+        );
+        for _ in 0..6 {
+            challenge_of(f.decide(f.pending(10, None, "admin", None)).await);
+        }
+        challenge_of(f.decide(f.pending(11, None, "admin", None)).await);
+        assert_eq!(f.authorizer.shared.challenges.lock().len(), 5);
+        f.authorizer.revoke(Some(Some(TTY)), false);
+        assert!(
+            f.authorizer.shared.challenges.lock().is_empty(),
+            "every form of lock drops challenges"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssh_agent_gate2_holds_credentials() {
+        use crate::ssh_agent_presence::test_support::signed;
+        let f = key_fixture(
+            crate::policy::Engine::new(HUMAN_AND_PROD).unwrap(),
+            MockServices::answering(R::Allowed, ""),
+        );
+        f.sts.answer(Some("999999999999"));
+        let flow = Flow::new();
+        let ctx = exec_context("terraform apply", false);
+        // Gate 1 asks first, then gate 2 for the real account.
+        let err = flow
+            .request(
+                &f,
+                f.pending(10, Some(TTY), "admin", Some(ctx.clone())),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason(), Reason::Challenge);
+        assert_eq!(err.gate, crate::proto::GATE_ASSUME_ROLE);
+        assert_eq!(flow.fetches(), 0);
+        let c = err.challenge.unwrap();
+        // The signature for gate 1 permits the request at both gates.
+        let obtained = flow
+            .request(
+                &f,
+                f.pending(
+                    10,
+                    Some(TTY),
+                    "admin",
+                    Some(responding(ctx.clone(), signed(&c))),
+                ),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(obtained.source, Source::Fetched);
+
+        // Another process of the session: gate 1 permits by the grant, and gate 2 asks.
+        let err = flow
+            .request(
+                &f,
+                f.pending(11, Some(TTY), "admin", Some(ctx.clone())),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason(), Reason::Challenge);
+        assert_eq!(err.gate, crate::proto::GATE_USE_CREDENTIALS);
+        assert_eq!(err.caller_arn, caller("999999999999").arn);
+        let c = err.challenge.unwrap();
+        let statement = <crate::proto::AuthorizationStatement as prost::Message>::decode(
+            c.statement.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(statement.action, "use-credentials");
+        assert_eq!((flow.fetches(), f.sts.calls()), (2, 2));
+        // The retry vends what was held, and fetches nothing again.
+        let obtained = flow
+            .request(
+                &f,
+                f.pending(11, Some(TTY), "admin", Some(responding(ctx, signed(&c)))),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(obtained.source, Source::Held);
+        assert_eq!((flow.fetches(), f.sts.calls()), (2, 2));
+        assert_eq!(f.services.prompts(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ssh_agent_check_and_approval_exclusive() {
+        let dir = TempDir::new("ssh-exclusive");
+        std::fs::write(
+            crate::policy::files::PolicyFiles::policy_path(&dir.0),
+            READONLY_FREE,
+        )
+        .unwrap();
+        let services = MockServices::answering(R::Allowed, "");
+        let key = crate::ssh_agent_presence::test_support::key();
+        let mut record = crate::policy::files::test_support::record_of(&dir.0, 1, &[]);
+        record.digest = vec![0; 32];
+        record.approval = Some(crate::proto::platform::ApprovalAnchor {
+            methods: vec!["ssh-agent".to_owned()],
+            ssh_agent_keys: vec![key.to_anchor_line()],
+            windows_hello_keys: vec![],
+        });
+        services.stores.strong.lock().record = Some(record);
+        let f = dir_fixture(&dir, services.clone()).await;
+        assert_eq!(
+            f.authorizer.policy().await.unwrap().state,
+            crate::policy::settings::PolicyState::Tampered
+        );
+        assert_eq!(
+            f.authorizer.methods().await,
+            vec!["ssh-agent", "platform"],
+            "in lockdown the anchored keys serve credential checks"
+        );
+        // An outstanding credential challenge keeps an approval from starting.
+        let c = challenge_of(f.assume_role("123456789012/Admin", [0; 32]).await);
+        let status = f.approve(&dir, &peer(20), &[]).await.unwrap_err();
+        assert!(
+            status.message().contains("credential check is pending"),
+            "{status:?}"
+        );
+        f.authorizer.revoke(None, false);
+        drop(c);
+
+        // An outstanding approval challenge keeps credential checks from asking.
+        let status = f.approve(&dir, &peer(20), &[]).await.unwrap_err();
+        let refusal = crate::proto::AuthorizationError::from_status(&status).unwrap();
+        assert_eq!(refusal.reason(), Reason::Challenge);
+        let refusal = f
+            .assume_role("123456789012/Admin", [0; 32])
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.reason(), Reason::CheckPending);
+        // Until it expires.
+        f.clock.advance(61);
+        challenge_of(f.assume_role("123456789012/Admin", [0; 32]).await);
+        assert_eq!(services.prompts(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_approve_with_ssh_agent() {
+        use crate::policy::settings::PolicyState;
+        use crate::ssh_agent_presence::test_support::{key, signed};
+        let dir = TempDir::new("ssh-approve");
+        let settings_path = crate::policy::files::PolicyFiles::settings_path(&dir.0);
+        let registered = serde_json::json!({
+            "version": 1,
+            "ssh_agent_keys": [{"key": key().to_openssh()}],
+        });
+        std::fs::write(&settings_path, registered.to_string()).unwrap();
+        let services = MockServices::answering(R::Allowed, "");
+        let f = dir_fixture(&dir, services.clone()).await;
+        // Unapproved: the file's keys do not count, and the bootstrap goes through the platform.
+        assert_eq!(f.authorizer.methods().await, vec!["platform"]);
+        f.approve(&dir, &peer(10), &[]).await.unwrap();
+        assert_eq!(services.prompts(), 1);
+        let verified = f.authorizer.policy().await.unwrap();
+        assert_eq!(verified.state, PolicyState::Approved);
+        assert_eq!(verified.anchor.methods, vec!["ssh-agent"]);
+        assert_eq!(verified.anchor.ssh_agent_keys, vec![key().to_anchor_line()]);
+        assert_eq!(f.authorizer.methods().await, vec!["ssh-agent", "platform"]);
+
+        // The next change, even one adding "platform" back, needs a signature by the anchored key.
+        let downgrade = serde_json::json!({
+            "version": 1,
+            "approval_methods": ["platform"],
+            "ssh_agent_keys": [{"key": key().to_openssh()}],
+        });
+        std::fs::write(&settings_path, downgrade.to_string()).unwrap();
+        let (policy, settings) = crate::policy::files::PolicyFiles::read_contents(&dir.0);
+        let digest = crate::policy::integrity_state::policy_digest(&policy, &settings);
+        let expected = std::collections::HashMap::new();
+        let approve = |context: Option<crate::proto::ClientContext>| {
+            let peer = peer(10);
+            let authorizer = f.authorizer.clone();
+            let expected = expected.clone();
+            async move {
+                authorizer
+                    .approve_policy(Approval {
+                        peer: Some(&peer),
+                        expected_digest: &digest,
+                        expected_server_digests: &expected,
+                        client_context: context.as_ref(),
+                        server_digests: Default::default(),
+                    })
+                    .await
+            }
+        };
+        let status = approve(None).await.unwrap_err();
+        let c = crate::proto::AuthorizationError::from_status(&status)
+            .unwrap()
+            .challenge
+            .unwrap();
+        let statement = <crate::proto::AuthorizationStatement as prost::Message>::decode(
+            c.statement.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(statement.action, "approve-policy");
+        // A declined signature does not fall back to a method the anchor lacks.
+        let status = approve(Some(crate::proto::ClientContext {
+            authorization_response: Some(crate::ssh_agent_presence::test_support::declined(&c)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+        let refusal = crate::proto::AuthorizationError::from_status(&status).unwrap();
+        assert_eq!(refusal.reason(), Reason::Unavailable);
+        assert_eq!(services.prompts(), 1);
+
+        let status = approve(None).await.unwrap_err();
+        let c = crate::proto::AuthorizationError::from_status(&status)
+            .unwrap()
+            .challenge
+            .unwrap();
+        let resp = approve(Some(crate::proto::ClientContext {
+            authorization_response: Some(signed(&c)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert_eq!(resp.integrity(), crate::proto::PolicyIntegrity::Approved);
+        assert_eq!(services.prompts(), 1);
+        let verified = f.authorizer.policy().await.unwrap();
+        assert_eq!(verified.anchor.methods, vec!["platform"]);
+        assert!(verified.anchor.ssh_agent_keys.is_empty());
+        // The approved anchor now names the platform method alone.
+        approve(None).await.unwrap();
+        assert_eq!(services.prompts(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_unmark_with_ssh_agent() {
+        use crate::ssh_agent_presence::test_support::signed;
+        let f = key_fixture(
+            crate::policy::Engine::builtin(true).unwrap(),
+            MockServices::answering(R::Allowed, ""),
+        );
+        *f.process.session.lock() = Some(TTY);
+        let labels = vec!["ai-agent".to_owned()];
+        f.authorizer.mark_tools(TTY, &labels);
+        let ctx = crate::proto::ClientContext {
+            cwd: b"/home/alice".to_vec(),
+            ..Default::default()
+        };
+        let status = f
+            .authorizer
+            .unmark_tools(Some(&peer(10)), &labels, Some(&ctx))
+            .await
+            .unwrap_err();
+        let c = crate::proto::AuthorizationError::from_status(&status)
+            .unwrap()
+            .challenge
+            .unwrap();
+        let statement = <crate::proto::AuthorizationStatement as prost::Message>::decode(
+            c.statement.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(statement.action, "unmark-tools");
+        // Signed for other labels.
+        let status = f
+            .authorizer
+            .unmark_tools(
+                Some(&peer(10)),
+                &["ci".to_owned()],
+                Some(&responding(ctx.clone(), signed(&c))),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        let status = f
+            .authorizer
+            .unmark_tools(Some(&peer(10)), &labels, Some(&ctx))
+            .await
+            .unwrap_err();
+        let c = crate::proto::AuthorizationError::from_status(&status)
+            .unwrap()
+            .challenge
+            .unwrap();
+        let remaining = f
+            .authorizer
+            .unmark_tools(Some(&peer(10)), &labels, Some(&responding(ctx, signed(&c))))
+            .await
+            .unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(f.services.prompts(), 0);
+    }
+
+    #[test]
+    fn test_request_digest_stability() {
+        let ctx = exec_context("terraform apply", false);
+        let digest = request_digest("contoso", &rolespec("admin"), &ctx);
+        // Fixed by the prost encoding: a change here breaks outstanding challenges across versions only.
+        assert_eq!(
+            digest,
+            request_digest("contoso", &rolespec("admin"), &ctx.clone())
+        );
+        let with_response = responding(
+            ctx.clone(),
+            crate::proto::AuthorizationResponse {
+                challenge_id: vec![1; 16],
+                result: None,
+            },
+        );
+        assert_eq!(
+            digest,
+            request_digest("contoso", &rolespec("admin"), &with_response)
+        );
+        assert_ne!(digest, request_digest("contoso", &rolespec("other"), &ctx));
+
+        let servers: std::collections::HashMap<String, Vec<u8>> =
+            [("a".to_owned(), vec![1]), ("b".to_owned(), vec![2])].into();
+        let d = approval_request_digest(&[0; 32], &servers, None);
+        assert_eq!(
+            d,
+            approval_request_digest(&[0; 32], &servers.clone(), Some(&Default::default()))
+        );
+        assert_ne!(d, approval_request_digest(&[1; 32], &servers, None));
+        let labels = ["ai-agent".to_owned()];
+        assert_ne!(
+            unmark_digest(&labels, None),
+            unmark_digest(&["ci".to_owned()], None)
+        );
     }
 }
