@@ -22,12 +22,14 @@ pub enum Prompt {
     Password,
 }
 
-/// The lines of "What the human sees", for the terminal.
+/// The lines of "What the human sees", for the terminal. `caller_arn` is the identity of credentials already
+/// fetched, when the agent asks before vending them.
 pub fn context_lines(
     server: &str,
     role: &str,
     context: &crate::proto::ClientContext,
     prompt: Prompt,
+    caller_arn: Option<&str>,
 ) -> String {
     let product = env!("CARGO_PKG_NAME");
     let command = match &context.intent {
@@ -43,9 +45,14 @@ pub fn context_lines(
         Prompt::MaybeDialog => "Authorization may be required",
         Prompt::Password => "Authorization required",
     };
-    let mut lines = format!(
-        ":: {product} :: {heading}: {role} on {server}\n:: {product} ::   command: {command}\n"
-    );
+    let mut lines = format!(":: {product} :: {heading}: {role} on {server}\n");
+    if let Some(arn) = caller_arn.filter(|a| !a.is_empty()) {
+        lines.push_str(&format!(
+            ":: {product} ::   identity: {}\n",
+            crate::caller_identity::summary(arn)
+        ));
+    }
+    lines.push_str(&format!(":: {product} ::   command: {command}\n"));
     if !context.cwd.is_empty() {
         lines.push_str(&format!(
             ":: {product} ::   cwd:     {}\n",
@@ -100,8 +107,8 @@ pub async fn assume_role_with_notice(
     req: crate::proto::AssumeRoleRequest,
     long_attempt_notice: bool,
 ) -> tonic::Result<tonic::Response<crate::proto::AssumeRoleResponse>> {
-    let notice = password_notice(&req);
-    crate::polkit_tty_agent::with_fallback(&notice, |attempt| {
+    let notice = |refusal: &crate::proto::AuthorizationError| password_notice(&req, refusal);
+    crate::polkit_tty_agent::with_fallback(notice, |attempt| {
         let mut agent = agent.clone();
         let req = req.clone();
         async move {
@@ -122,8 +129,8 @@ pub async fn assume_role_quietly(
     agent: &mut crate::agent::AgentConn,
     req: crate::proto::AssumeRoleRequest,
 ) -> tonic::Result<tonic::Response<crate::proto::AssumeRoleResponse>> {
-    let notice = password_notice(&req);
-    crate::polkit_tty_agent::with_fallback(&notice, |_| {
+    let notice = |refusal: &crate::proto::AuthorizationError| password_notice(&req, refusal);
+    crate::polkit_tty_agent::with_fallback(notice, |_| {
         let mut agent = agent.clone();
         let req = req.clone();
         async move { agent.assume_role(req).await }
@@ -131,12 +138,16 @@ pub async fn assume_role_quietly(
     .await
 }
 
-fn password_notice(req: &crate::proto::AssumeRoleRequest) -> String {
+fn password_notice(
+    req: &crate::proto::AssumeRoleRequest,
+    refusal: &crate::proto::AuthorizationError,
+) -> String {
     context_lines(
         &req.server_id,
         &req.rolespec().role,
         &req.client_context.clone().unwrap_or_default(),
         Prompt::Password,
+        Some(&refusal.caller_arn),
     )
 }
 
@@ -159,7 +170,7 @@ async fn notify_while_waiting(
             retval = &mut resp => return retval,
             _ = &mut prompt_notice, if !prompt_noticed => {
                 prompt_noticed = true;
-                crate::terminal::send(&context_lines(&server, &role, &context, Prompt::MaybeDialog)).await;
+                crate::terminal::send(&context_lines(&server, &role, &context, Prompt::MaybeDialog, None)).await;
             }
             _ = &mut long_attempt, if !long_noticed => {
                 long_noticed = true;
@@ -203,7 +214,9 @@ mod tests {
             "123456789012/Admin",
             &context,
             Prompt::MaybeDialog,
+            None,
         );
+        assert!(!lines.contains("identity:"));
         assert!(
             lines.starts_with(
                 ":: mairu :: Authorization may be required: 123456789012/Admin on contoso\n"
@@ -213,10 +226,17 @@ mod tests {
         assert!(lines.contains(":: mairu ::   command: terraform apply\n"));
         assert!(lines.contains(":: mairu ::   cwd:     /home/u/src/infra\n"));
         assert!(lines.ends_with(":: mairu :: Approve in the system dialog if one appears.\n"));
-        let lines = context_lines("contoso", "123456789012/Admin", &context, Prompt::Password);
+        let lines = context_lines(
+            "contoso",
+            "admin",
+            &context,
+            Prompt::Password,
+            Some("arn:aws:sts::999999999999:assumed-role/Admin/alice"),
+        );
         assert!(
-            lines
-                .starts_with(":: mairu :: Authorization required: 123456789012/Admin on contoso\n"),
+            lines.starts_with(
+                ":: mairu :: Authorization required: admin on contoso\n:: mairu ::   identity: 999999999999 assumed-role/Admin\n:: mairu ::   command: terraform apply\n"
+            ),
             "{lines}"
         );
         assert!(lines.ends_with(":: mairu :: Enter your password below.\n"));
@@ -240,5 +260,16 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(is_presence_required(&status));
         assert!(refusal_message(&tonic::Status::permission_denied("plain")).is_none());
+
+        let mut gate2 = crate::proto::AuthorizationError::new(
+            crate::proto::authorization_error::Reason::Denied,
+            "",
+        );
+        gate2.gate = crate::proto::GATE_USE_CREDENTIALS.to_owned();
+        gate2.caller_arn = "arn:aws:sts::999999999999:assumed-role/Admin/alice".to_owned();
+        assert_eq!(
+            refusal_message(&gate2.into_status()).unwrap(),
+            "refused at use-credentials: authorization was denied, or the dialog was dismissed (credentials of arn:aws:sts::999999999999:assumed-role/Admin/alice)"
+        );
     }
 }

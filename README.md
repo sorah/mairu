@@ -278,6 +278,14 @@ Callers without a terminal, such as an IDE running `credential-process`, are rem
 
 An unhardened agent never asks. `mairu doctor` shows the remembered approvals and whether polkit can be used.
 
+Before vending credentials, a hardened agent also asks AWS STS who they belong to (`sts:GetCallerIdentity` at `sts.amazonaws.com`, once per credential set, cached with them). Credentials whose account differs from the one the role name declares (`123456789012/Admin`, or a role ARN) are refused:
+
+```
+Error: refused at use-credentials: refused by policy (policies: builtin-caller-account-mismatch): credentials belong to 999999999999 (arn:aws:sts::999999999999:assumed-role/Admin/alice), not to the account the role name declares (123456789012)
+```
+
+If STS cannot be reached, a hardened agent vends nothing. Roles outside the `aws` partition, and networks that reach STS only through a VPC endpoint, cannot be served by a hardened agent for now.
+
 ### Tmux over SSH
 
 Without a desktop session, as over SSH or in tmux, polkit has no authentication agent to show a dialog. mairu then runs polkit's own text agent, `/usr/bin/pkttyagent`, for itself on its terminal, and polkit asks for your login password right there:

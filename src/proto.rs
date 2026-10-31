@@ -40,12 +40,19 @@ impl Session {
     }
 }
 
+/// `AuthorizationError.gate` of gate 1, before anything is fetched.
+pub const GATE_ASSUME_ROLE: &str = "assume-role";
+/// `AuthorizationError.gate` of gate 2, before credentials are vended.
+pub const GATE_USE_CREDENTIALS: &str = "use-credentials";
+
 impl AuthorizationError {
     pub fn new(reason: authorization_error::Reason, detail: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
             detail: detail.into(),
             policy_ids: vec![],
+            gate: String::new(),
+            caller_arn: String::new(),
         }
     }
 
@@ -84,6 +91,12 @@ impl AuthorizationError {
             Reason::Denied => "authorization was denied, or the dialog was dismissed",
             Reason::Forbidden => "refused by policy",
             Reason::NotPermitted => "no policy permits this role, even after a human check",
+            // At gate 2 without a caller, the identity itself could not be obtained.
+            Reason::Unavailable
+                if self.gate == GATE_USE_CREDENTIALS && self.caller_arn.is_empty() =>
+            {
+                "the identity of the credentials could not be checked"
+            }
             Reason::Unavailable => "no method could ask for approval",
             Reason::NoAuthenticationAgent => {
                 "polkit has no authentication agent for this process, for example outside a desktop session"
@@ -96,6 +109,12 @@ impl AuthorizationError {
         }
         if !self.detail.is_empty() {
             message.push_str(&format!(": {}", self.detail));
+        }
+        if self.gate == GATE_USE_CREDENTIALS {
+            if !self.caller_arn.is_empty() && !message.contains(&self.caller_arn) {
+                message.push_str(&format!(" (credentials of {})", self.caller_arn));
+            }
+            message = format!("refused at {}: {message}", self.gate);
         }
         message
     }

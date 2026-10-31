@@ -23,24 +23,38 @@ pub enum Attempt {
 }
 
 /// Runs `rpc`. When polkit has no authentication agent for this process, registers pkttyagent on the terminal,
-/// prints `notice` there, and runs `rpc` once more. The process making the RPC must be this one, since pkttyagent
-/// registers for it and the agent asks polkit about its peer.
-pub async fn with_fallback<T, F, Fut>(notice: &str, mut rpc: F) -> tonic::Result<T>
+/// prints `notice` for that refusal there, and runs `rpc` once more. The process making the RPC must be this one,
+/// since pkttyagent registers for it and the agent asks polkit about its peer.
+pub async fn with_fallback<T, N, F, Fut>(notice: N, mut rpc: F) -> tonic::Result<T>
 where
+    N: FnOnce(&crate::proto::AuthorizationError) -> String,
     F: FnMut(Attempt) -> Fut,
     Fut: std::future::Future<Output = tonic::Result<T>>,
 {
     let first = rpc(Attempt::First).await;
-    match &first {
-        Err(status) if is_no_authentication_agent(status) => {}
-        _ => return first,
-    }
-    fallback(notice, rpc).await.unwrap_or(first)
+    let refusal = match &first {
+        Err(status) => match crate::proto::AuthorizationError::from_status(status) {
+            Some(e)
+                if e.reason()
+                    == crate::proto::authorization_error::Reason::NoAuthenticationAgent =>
+            {
+                e
+            }
+            _ => return first,
+        },
+        Ok(_) => return first,
+    };
+    fallback(&refusal, notice, rpc).await.unwrap_or(first)
 }
 
 #[cfg(target_os = "linux")]
-async fn fallback<T, F, Fut>(notice: &str, mut rpc: F) -> Option<tonic::Result<T>>
+async fn fallback<T, N, F, Fut>(
+    refusal: &crate::proto::AuthorizationError,
+    notice: N,
+    mut rpc: F,
+) -> Option<tonic::Result<T>>
 where
+    N: FnOnce(&crate::proto::AuthorizationError) -> String,
     F: FnMut(Attempt) -> Fut,
     Fut: std::future::Future<Output = tonic::Result<T>>,
 {
@@ -49,28 +63,27 @@ where
         Ok(agent) => agent,
         Err(e) => {
             tracing::info!(err = %e, "Cannot prompt through pkttyagent");
-            return Some(Err(e.into_status()));
+            return Some(Err(e.into_status(refusal)));
         }
     };
-    crate::terminal::send(notice).await;
+    crate::terminal::send(&notice(refusal)).await;
     let retval = rpc(Attempt::Retry).await;
     drop(agent);
     Some(retval)
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn fallback<T, F, Fut>(_notice: &str, _rpc: F) -> Option<tonic::Result<T>>
+async fn fallback<T, N, F, Fut>(
+    _refusal: &crate::proto::AuthorizationError,
+    _notice: N,
+    _rpc: F,
+) -> Option<tonic::Result<T>>
 where
+    N: FnOnce(&crate::proto::AuthorizationError) -> String,
     F: FnMut(Attempt) -> Fut,
     Fut: std::future::Future<Output = tonic::Result<T>>,
 {
     None
-}
-
-fn is_no_authentication_agent(status: &tonic::Status) -> bool {
-    crate::proto::AuthorizationError::from_status(status).is_some_and(|e| {
-        e.reason() == crate::proto::authorization_error::Reason::NoAuthenticationAgent
-    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -86,12 +99,12 @@ pub enum FallbackError {
 }
 
 impl FallbackError {
-    /// Still `REASON_NO_AUTHENTICATION_AGENT`, with what kept the fallback from asking as its detail.
-    pub fn into_status(self) -> tonic::Status {
-        crate::proto::AuthorizationError::new(
-            crate::proto::authorization_error::Reason::NoAuthenticationAgent,
-            self.to_string(),
-        )
+    /// Still the agent's `refusal`, with what kept the fallback from asking as its detail.
+    pub fn into_status(self, refusal: &crate::proto::AuthorizationError) -> tonic::Status {
+        crate::proto::AuthorizationError {
+            detail: self.to_string(),
+            ..refusal.clone()
+        }
         .into_status()
     }
 }
@@ -440,20 +453,37 @@ mod tests {
 
     #[test]
     fn test_fallback_error_status() {
-        let status = FallbackError::NoTerminal.into_status();
+        let mut refusal = crate::proto::AuthorizationError::new(
+            crate::proto::authorization_error::Reason::NoAuthenticationAgent,
+            "",
+        );
+        refusal.gate = crate::proto::GATE_USE_CREDENTIALS.to_owned();
+        let status = FallbackError::NoTerminal.into_status(&refusal);
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-        assert!(is_no_authentication_agent(&status));
+        assert_eq!(
+            crate::proto::AuthorizationError::from_status(&status)
+                .unwrap()
+                .reason(),
+            crate::proto::authorization_error::Reason::NoAuthenticationAgent
+        );
         let message = crate::cmd::authorization::refusal_message(&status).unwrap();
         assert!(message.contains("no terminal"), "{message}");
+        assert!(
+            message.starts_with("refused at use-credentials: "),
+            "{message}"
+        );
     }
 
     #[tokio::test]
     async fn test_with_fallback_passes_other_results() {
         let mut calls = vec![];
-        let retval: tonic::Result<u8> = with_fallback("", |attempt| {
-            calls.push(attempt);
-            async { Err(tonic::Status::permission_denied("nope")) }
-        })
+        let retval: tonic::Result<u8> = with_fallback(
+            |_| String::new(),
+            |attempt| {
+                calls.push(attempt);
+                async { Err(tonic::Status::permission_denied("nope")) }
+            },
+        )
         .await;
         assert_eq!(retval.unwrap_err().code(), tonic::Code::PermissionDenied);
         assert_eq!(calls, vec![Attempt::First]);

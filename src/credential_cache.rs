@@ -2,6 +2,8 @@
 pub struct CachedCredential {
     pub rolespec: crate::proto::Rolespec,
     pub credentials: std::sync::Arc<crate::client::AssumeRoleResponse>,
+    /// Who the credentials belong to, once asked; a hardened agent asks before vending them.
+    pub caller: Option<crate::caller_identity::Caller>,
 }
 
 /// Per-server credential cache
@@ -37,7 +39,8 @@ impl CredentialCache {
     pub fn store(
         &self,
         rolespec: crate::proto::Rolespec,
-        credentials: &crate::client::AssumeRoleResponse,
+        credentials: std::sync::Arc<crate::client::AssumeRoleResponse>,
+        caller: Option<crate::caller_identity::Caller>,
     ) {
         if credentials.mairu.no_cache {
             return;
@@ -46,9 +49,25 @@ impl CredentialCache {
         let mut items = self.items.write().unwrap();
         let item = CachedCredential {
             rolespec: rolespec.clone(),
-            credentials: std::sync::Arc::new(credentials.to_owned()),
+            credentials,
+            caller,
         };
         items.insert(rolespec, item);
+    }
+
+    /// Records the caller of a cached entry, if it still holds the same credentials.
+    pub fn set_caller(
+        &self,
+        rolespec: &crate::proto::Rolespec,
+        credentials: &std::sync::Arc<crate::client::AssumeRoleResponse>,
+        caller: crate::caller_identity::Caller,
+    ) {
+        let mut items = self.items.write().unwrap();
+        if let Some(item) = items.get_mut(rolespec)
+            && std::sync::Arc::ptr_eq(&item.credentials, credentials)
+        {
+            item.caller = Some(caller);
+        }
     }
 
     pub fn get(&self, rolespec: &crate::proto::Rolespec) -> Option<CachedCredential> {

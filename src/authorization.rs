@@ -1,9 +1,12 @@
-//! Gate 1 of `AssumeRole`: decides whether a human must approve a request, asks through the platform helper, and
-//! remembers the answer as grants (per terminal session) and leases (per running `mairu exec`).
+//! The gates of `AssumeRole`: decides whether a human must approve a request, before fetching (gate 1) and once the
+//! credentials' caller identity is known (gate 2), asks through the platform helper, and remembers the answer as
+//! grants (per terminal session) and leases (per running `mairu exec`).
 
 /// Grants are dropped after this to bound memory; freshness itself is up to the policy.
 const GRANT_RETENTION: std::time::Duration = std::time::Duration::from_secs(43200);
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Credentials refused at gate 2 with a status the client retries after wait this long for the retry.
+const HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The presence method backed by `PlatformServices::authorize`.
 pub const METHOD_PLATFORM: &str = "platform";
@@ -81,10 +84,20 @@ struct Lease {
     pidfd: std::sync::Arc<std::os::fd::OwnedFd>,
 }
 
+/// Fetched credentials waiting for the client's retry of a gate-2 check; never vended without passing gate 2.
+#[derive(Debug)]
+struct Held {
+    credentials: std::sync::Arc<crate::client::AssumeRoleResponse>,
+    caller: crate::caller_identity::Caller,
+    until: std::time::Duration,
+    session: Option<crate::platform::SessionIdentity>,
+}
+
 #[derive(Debug, Default)]
 struct State {
     grants: std::collections::HashMap<GrantKey, Grant>,
     leases: std::collections::HashMap<LeaseKey, Lease>,
+    held: std::collections::HashMap<FlightKey, Held>,
 }
 
 impl State {
@@ -92,6 +105,7 @@ impl State {
         self.leases.retain(|_, l| pidfd_alive(&l.pidfd));
         self.grants
             .retain(|_, g| now.saturating_sub(g.created) <= GRANT_RETENTION);
+        self.held.retain(|_, h| now < h.until);
     }
 }
 
@@ -103,6 +117,7 @@ type FlightKey = (u32, u64, [u8; 32]);
 struct Shared {
     engine: crate::policy::Engine,
     services: std::sync::Arc<dyn crate::platform::PlatformServices>,
+    identifier: std::sync::Arc<dyn crate::caller_identity::Identify>,
     clock: std::sync::Arc<dyn Clock>,
     hardened: bool,
     state: parking_lot::Mutex<State>,
@@ -137,7 +152,7 @@ impl std::fmt::Debug for Authorizer {
     }
 }
 
-/// A request as gate 1 sees it.
+/// A request as gate 1 sees it; gate 2 adds the caller identity.
 #[derive(Debug)]
 pub struct Request<'a> {
     pub peer: Option<&'a crate::platform::PeerIdentity>,
@@ -171,6 +186,27 @@ pub struct Authorized {
     shared: std::sync::Arc<Shared>,
     lease: Option<LeaseKey>,
     demand: bool,
+    pending: Pending,
+    /// What permitted it; counts as a remembered candidate at gate 2.
+    presence: crate::policy::Presence,
+}
+
+/// Where vended credentials came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Cache,
+    /// Held for the retry of a gate-2 check.
+    Held,
+    Fetched,
+}
+
+/// Credentials that passed both gates.
+#[derive(Debug)]
+pub struct Obtained {
+    pub credentials: std::sync::Arc<crate::client::AssumeRoleResponse>,
+    pub caller: Option<crate::caller_identity::Caller>,
+    pub source: Source,
+    pub authorized: Authorized,
 }
 
 impl Authorized {
@@ -198,7 +234,13 @@ impl Authorizer {
         services: std::sync::Arc<dyn crate::platform::PlatformServices>,
         hardened: bool,
     ) -> Self {
-        let this = Self::with_clock(engine, services, hardened, std::sync::Arc::new(BootClock));
+        let this = Self::with_clock(
+            engine,
+            services,
+            std::sync::Arc::new(crate::caller_identity::Sts::default()),
+            hardened,
+            std::sync::Arc::new(BootClock),
+        );
         let weak = std::sync::Arc::downgrade(&this.shared);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(SWEEP_INTERVAL);
@@ -218,6 +260,7 @@ impl Authorizer {
     fn with_clock(
         engine: crate::policy::Engine,
         services: std::sync::Arc<dyn crate::platform::PlatformServices>,
+        identifier: std::sync::Arc<dyn crate::caller_identity::Identify>,
         hardened: bool,
         clock: std::sync::Arc<dyn Clock>,
     ) -> Self {
@@ -225,6 +268,7 @@ impl Authorizer {
             shared: std::sync::Arc::new(Shared {
                 engine,
                 services,
+                identifier,
                 clock,
                 hardened,
                 state: Default::default(),
@@ -274,6 +318,10 @@ impl Authorizer {
         let mut state = self.shared.state.lock();
         let (grants_before, leases_before) = (state.grants.len(), state.leases.len());
         match session {
+            None => state.held.clear(),
+            Some(session) => state.held.retain(|_, h| h.session != session),
+        }
+        match session {
             None => {
                 state.grants.clear();
                 if include_leases {
@@ -297,7 +345,8 @@ impl Authorizer {
         )
     }
 
-    /// Decides; asks a human when the policy would permit the request after a check and nothing remembered does.
+    /// Gate 1. Decides; asks a human when the policy would permit the request after a check and nothing
+    /// remembered does.
     pub async fn authorize_assume_role(&self, req: Request<'_>) -> Result<Authorized, Refusal> {
         if req
             .user_config
@@ -308,38 +357,200 @@ impl Authorizer {
                 role = req.rolespec.role,
                 "Refused by disallow_roles"
             );
-            return Err(Refusal::new(
+            let mut refusal = Refusal::new(
                 crate::proto::authorization_error::Reason::Forbidden,
                 format!(
                     "role '{}' is disallowed by disallow_roles in {}",
                     req.rolespec.role,
                     crate::config::UserConfig::path().display()
                 ),
-            ));
+            );
+            refusal.gate = crate::proto::GATE_ASSUME_ROLE.to_owned();
+            return Err(refusal);
         }
-        let pending = self.shared.pending(&req);
-        let result = self.shared.decide(pending.clone()).await;
-        match &result {
-            Ok(_) => tracing::info!(
-                pid = pending.pid,
-                session = ?pending.session,
-                server_id = pending.server_id,
-                rolespec = ?pending.role_key,
-                intent = pending.facts.intent,
-                "Authorization permitted"
-            ),
-            Err(e) => tracing::info!(
-                pid = pending.pid,
-                session = ?pending.session,
-                server_id = pending.server_id,
-                rolespec = ?pending.role_key,
-                intent = pending.facts.intent,
-                reason = ?e.reason(),
-                detail = e.detail,
-                "Authorization refused"
-            ),
+        self.gate1(self.shared.pending(&req)).await
+    }
+
+    async fn gate1(&self, pending: Pending) -> Result<Authorized, Refusal> {
+        let result = self
+            .shared
+            .decide(pending.clone(), crate::policy::Action::AssumeRole, None)
+            .await;
+        if result.is_err() {
+            self.shared.state.lock().held.remove(&pending.flight_key());
         }
+        log_decision(&pending, None, &result);
         result
+    }
+
+    /// Gate 2: decides again with the caller identity of the credentials, counting what permitted gate 1 first. An
+    /// unhardened agent skips it.
+    pub async fn authorize_use_credentials(
+        &self,
+        gate1: Authorized,
+        caller: &crate::caller_identity::Caller,
+    ) -> Result<Authorized, Refusal> {
+        if !self.shared.hardened {
+            return Ok(gate1);
+        }
+        let result = self
+            .shared
+            .decide(
+                gate1.pending.clone(),
+                crate::policy::Action::UseCredentials(caller),
+                Some(gate1.presence.clone()),
+            )
+            .await;
+        log_decision(&gate1.pending, Some(caller), &result);
+        let gate2 = result?;
+        Ok(Authorized {
+            lease: gate1.lease.or(gate2.lease),
+            ..gate1
+        })
+    }
+
+    /// Obtains credentials for a request gate 1 permitted, from those held for its retry, the cache, or `fetch`,
+    /// and passes them through gate 2 with their caller identity. Caches them, with that identity, only once they
+    /// pass.
+    pub async fn obtain<F, Fut>(
+        &self,
+        gate1: Authorized,
+        cache: &crate::credential_cache::CredentialCache,
+        rolespec: &crate::proto::Rolespec,
+        cacheable: bool,
+        fetch: F,
+    ) -> Result<Obtained, tonic::Status>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<crate::client::AssumeRoleResponse, tonic::Status>>,
+    {
+        use crate::proto::authorization_error::Reason;
+        let key = gate1.pending.flight_key();
+        let held = {
+            let now = self.shared.clock.now();
+            self.shared
+                .state
+                .lock()
+                .held
+                .remove(&key)
+                .filter(|h| now < h.until)
+        };
+        let (credentials, caller, source) = if let Some(held) = held {
+            (held.credentials, Some(held.caller), Source::Held)
+        } else if cacheable && let Some(cached) = cache.get(rolespec) {
+            (cached.credentials, cached.caller, Source::Cache)
+        } else {
+            (std::sync::Arc::new(fetch().await?), None, Source::Fetched)
+        };
+
+        if !self.shared.hardened {
+            if cacheable && source == Source::Fetched {
+                cache.store(rolespec.clone(), credentials.clone(), None);
+            }
+            return Ok(Obtained {
+                credentials,
+                caller: None,
+                source,
+                authorized: gate1,
+            });
+        }
+
+        let caller = match caller {
+            Some(caller) => caller,
+            None => match self.shared.identifier.identify(&credentials).await {
+                Ok(caller) => {
+                    if source == Source::Cache {
+                        cache.set_caller(rolespec, &credentials, caller.clone());
+                    }
+                    caller
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pid = gate1.pending.pid,
+                        server_id = gate1.pending.server_id,
+                        rolespec = ?gate1.pending.role_key,
+                        aws_access_key_id = credentials.access_key_id,
+                        err = e,
+                        "Failed to identify the caller of credentials; refusing"
+                    );
+                    let mut refusal = Refusal::new(
+                        Reason::Unavailable,
+                        format!(
+                            "could not identify the credentials through sts:GetCallerIdentity: {e}"
+                        ),
+                    );
+                    refusal.gate = crate::proto::GATE_USE_CREDENTIALS.to_owned();
+                    return Err(refusal.into_status());
+                }
+            },
+        };
+
+        let session = gate1.pending.session;
+        match self.authorize_use_credentials(gate1, &caller).await {
+            Ok(authorized) => {
+                if cacheable && source != Source::Cache {
+                    cache.store(rolespec.clone(), credentials.clone(), Some(caller.clone()));
+                }
+                Ok(Obtained {
+                    credentials,
+                    caller: Some(caller),
+                    source,
+                    authorized,
+                })
+            }
+            Err(refusal) => {
+                if refusal.reason() == Reason::NoAuthenticationAgent {
+                    let until = self.shared.clock.now() + HOLD_DURATION;
+                    self.shared.state.lock().held.insert(
+                        key,
+                        Held {
+                            credentials,
+                            caller,
+                            until,
+                            session,
+                        },
+                    );
+                }
+                Err(refusal.into_status())
+            }
+        }
+    }
+}
+
+fn log_decision(
+    pending: &Pending,
+    caller: Option<&crate::caller_identity::Caller>,
+    result: &Result<Authorized, Refusal>,
+) {
+    let gate = match caller {
+        None => crate::proto::GATE_ASSUME_ROLE,
+        Some(_) => crate::proto::GATE_USE_CREDENTIALS,
+    };
+    let caller_arn = caller.map(|c| c.arn.as_str());
+    match result {
+        Ok(a) => tracing::info!(
+            gate,
+            pid = pending.pid,
+            session = ?pending.session,
+            server_id = pending.server_id,
+            rolespec = ?pending.role_key,
+            intent = pending.facts.intent,
+            caller_arn,
+            presence = a.presence.scope.as_str(),
+            "Authorization permitted"
+        ),
+        Err(e) => tracing::info!(
+            gate,
+            pid = pending.pid,
+            session = ?pending.session,
+            server_id = pending.server_id,
+            rolespec = ?pending.role_key,
+            intent = pending.facts.intent,
+            caller_arn,
+            reason = ?e.reason(),
+            detail = e.detail,
+            "Authorization refused"
+        ),
     }
 }
 
@@ -388,9 +599,43 @@ impl Shared {
         }
     }
 
-    async fn decide(self: &std::sync::Arc<Self>, pending: Pending) -> Result<Authorized, Refusal> {
+    /// The decision procedure at either gate. `extra` is a remembered candidate tried first.
+    async fn decide(
+        self: &std::sync::Arc<Self>,
+        pending: Pending,
+        action: crate::policy::Action<'_>,
+        extra: Option<crate::policy::Presence>,
+    ) -> Result<Authorized, Refusal> {
+        let caller = match action {
+            crate::policy::Action::AssumeRole => None,
+            crate::policy::Action::UseCredentials(caller) => Some(caller),
+        };
+        self.decide_at(pending, action, extra)
+            .await
+            .map_err(|mut refusal| {
+                match caller {
+                    None => refusal.gate = crate::proto::GATE_ASSUME_ROLE.to_owned(),
+                    Some(caller) => {
+                        refusal.gate = crate::proto::GATE_USE_CREDENTIALS.to_owned();
+                        refusal.caller_arn = caller.arn.clone();
+                    }
+                }
+                refusal
+            })
+    }
+
+    async fn decide_at(
+        self: &std::sync::Arc<Self>,
+        pending: Pending,
+        action: crate::policy::Action<'_>,
+        extra: Option<crate::policy::Presence>,
+    ) -> Result<Authorized, Refusal> {
         use crate::proto::authorization_error::Reason;
-        let prepared = self.engine.prepare(&pending.facts).map_err(|e| {
+        let caller = match action {
+            crate::policy::Action::AssumeRole => None,
+            crate::policy::Action::UseCredentials(caller) => Some(caller),
+        };
+        let prepared = self.engine.prepare(&pending.facts, action).map_err(|e| {
             tracing::error!(
                 err = e,
                 "Failed to build the authorization request; refusing"
@@ -419,7 +664,7 @@ impl Shared {
             eval.allowed
         };
 
-        // What is remembered: nothing, the lease of this process, the grant of this session.
+        // What is remembered: what permitted gate 1, nothing, the lease of this process, the grant of this session.
         {
             let now = self.clock.now();
             let mut state = self.state.lock();
@@ -427,17 +672,21 @@ impl Shared {
                 .leases
                 .get(&lease_key)
                 .is_some_and(|l| pidfd_alive(&l.pidfd));
-            let authorized = |lease: bool| Authorized {
+            let authorized = |lease: bool, presence: crate::policy::Presence| Authorized {
                 shared: self.clone(),
                 lease: lease.then(|| lease_key.clone()),
                 demand: !pending.prefetch,
+                pending: pending.clone(),
+                presence,
             };
-            if note(
-                &self
-                    .engine
-                    .evaluate(&prepared, &crate::policy::Presence::none()),
-            ) {
-                return Ok(authorized(has_lease));
+            if let Some(presence) = extra.filter(|p| p.verified)
+                && note(&self.engine.evaluate(&prepared, &presence))
+            {
+                return Ok(authorized(has_lease, presence));
+            }
+            let none = crate::policy::Presence::none();
+            if note(&self.engine.evaluate(&prepared, &none)) {
+                return Ok(authorized(has_lease, none));
             }
             if let Some(lease) = state.leases.get(&lease_key)
                 && pidfd_alive(&lease.pidfd)
@@ -449,7 +698,7 @@ impl Shared {
                     secs(now.saturating_sub(lease.last_demand_expiry)),
                 );
                 if note(&self.engine.evaluate(&prepared, &presence)) {
-                    return Ok(authorized(true));
+                    return Ok(authorized(true, presence));
                 }
             }
             if let Some(session) = pending.session {
@@ -463,7 +712,7 @@ impl Shared {
                     );
                     if note(&self.engine.evaluate(&prepared, &presence)) {
                         grant.last_used = now;
-                        return Ok(authorized(has_lease));
+                        return Ok(authorized(has_lease, presence));
                     }
                 }
             }
@@ -480,11 +729,8 @@ impl Shared {
         let mut tried: Vec<String> = vec![];
         let mut fresh_allowed = false;
         for method in [METHOD_PLATFORM] {
-            if !note(
-                &self
-                    .engine
-                    .evaluate(&prepared, &crate::policy::Presence::fresh(method)),
-            ) {
+            let presence = crate::policy::Presence::fresh(method);
+            if !note(&self.engine.evaluate(&prepared, &presence)) {
                 continue;
             }
             fresh_allowed = true;
@@ -492,7 +738,7 @@ impl Shared {
                 tried.push(format!("{method}: {e}"));
                 continue;
             }
-            let resp = self.prompt(&pending).await;
+            let resp = self.prompt(&pending, caller).await;
             use crate::proto::platform::authorize_response::Result as R;
             match resp.result() {
                 R::Allowed => {
@@ -501,6 +747,8 @@ impl Shared {
                         shared: self.clone(),
                         lease: (pending.exec && pending.pidfd.is_some()).then_some(lease_key),
                         demand: true,
+                        pending,
+                        presence,
                     });
                 }
                 R::Denied | R::Cancelled => {
@@ -524,10 +772,22 @@ impl Shared {
             ));
         }
         if !forbids.is_empty() {
-            let mut refusal = Refusal::new(
-                Reason::Forbidden,
-                format!("refused by policy {}", forbids.join(", ")),
-            );
+            let detail = match caller {
+                Some(caller)
+                    if forbids
+                        .iter()
+                        .any(|id| id == crate::policy::POLICY_CALLER_ACCOUNT_MISMATCH) =>
+                {
+                    format!(
+                        "credentials belong to {} ({}), not to the account the role name declares ({})",
+                        caller.account,
+                        caller.arn,
+                        crate::policy::account_id(&pending.facts.role).unwrap_or_default()
+                    )
+                }
+                _ => format!("refused by policy {}", forbids.join(", ")),
+            };
+            let mut refusal = Refusal::new(Reason::Forbidden, detail);
             refusal.policy_ids = forbids;
             return Err(refusal);
         }
@@ -537,10 +797,22 @@ impl Shared {
         ))
     }
 
-    /// Concurrent identical requests from one process share one prompt. Dropping every waiter cancels it.
-    async fn prompt(&self, pending: &Pending) -> crate::proto::platform::AuthorizeResponse {
+    /// Concurrent identical requests from one process at the same gate share one prompt. Dropping every waiter
+    /// cancels it.
+    async fn prompt(
+        &self,
+        pending: &Pending,
+        caller: Option<&crate::caller_identity::Caller>,
+    ) -> crate::proto::platform::AuthorizeResponse {
         use futures::FutureExt;
-        let key: FlightKey = (pending.pid, pending.start_time, pending.digest);
+        let key: FlightKey = match caller {
+            None => pending.flight_key(),
+            Some(_) => (
+                pending.pid,
+                pending.start_time,
+                gate2_digest(&pending.digest),
+            ),
+        };
         let flight: PromptFuture = {
             let mut inflight = self.inflight.lock();
             inflight.retain(|_, w| w.upgrade().is_some());
@@ -548,7 +820,7 @@ impl Shared {
                 Some(f) => f,
                 None => {
                     let services = self.services.clone();
-                    let request = pending.authorize_request();
+                    let request = pending.authorize_request(caller);
                     let fut: futures::future::BoxFuture<'static, _> =
                         Box::pin(async move { services.authorize(request).await });
                     let shared = fut.shared();
@@ -667,7 +939,15 @@ impl Pending {
         }
     }
 
-    fn authorize_request(&self) -> crate::proto::platform::AuthorizeRequest {
+    /// Identifies the request; also the key of its held credentials.
+    fn flight_key(&self) -> FlightKey {
+        (self.pid, self.start_time, self.digest)
+    }
+
+    fn authorize_request(
+        &self,
+        caller: Option<&crate::caller_identity::Caller>,
+    ) -> crate::proto::platform::AuthorizeRequest {
         let f = &self.facts;
         let mut details = std::collections::HashMap::new();
         details.insert("server".to_owned(), f.server_id.clone());
@@ -691,6 +971,14 @@ impl Pending {
             .map_or_else(|| "(unknown)".to_owned(), |e| e.display().to_string());
         details.insert("requester".to_owned(), format!("{exe} pid {}", self.pid));
         details.insert("intent".to_owned(), f.intent.to_owned());
+        let mut message = format!("Provide AWS credentials for {} on {}", f.role, f.server_id);
+        if let Some(caller) = caller {
+            details.insert(
+                "caller".to_owned(),
+                format!("{} {}", caller.account, caller.arn),
+            );
+            message.push_str(&format!(" ({})", caller.summary()));
+        }
         crate::proto::platform::AuthorizeRequest {
             action: crate::proto::platform::authorize_request::Action::AssumeRole.into(),
             subject: Some(crate::proto::platform::Process {
@@ -708,7 +996,7 @@ impl Pending {
                 argv: vec![],
                 name: String::new(),
             }),
-            message: format!("Provide AWS credentials for {} on {}", f.role, f.server_id),
+            message,
             details,
         }
     }
@@ -733,6 +1021,15 @@ fn request_digest(
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"AssumeRole\0");
     hasher.update(request.encode_to_vec());
+    hasher.finalize().into()
+}
+
+/// Keeps a gate-2 prompt from sharing a gate-1 prompt for the same request.
+fn gate2_digest(digest: &[u8; 32]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"UseCredentials\0");
+    hasher.update(digest);
     hasher.finalize().into()
 }
 
@@ -867,9 +1164,49 @@ mod tests {
         }
     }
 
+    /// Answers with a fixed caller, or fails; counts calls.
+    #[derive(Debug, Default)]
+    struct FakeSts {
+        caller: parking_lot::Mutex<Option<crate::caller_identity::Caller>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeSts {
+        fn answer(&self, account: Option<&str>) {
+            *self.caller.lock() = account.map(caller);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::caller_identity::Identify for FakeSts {
+        async fn identify(
+            &self,
+            _credentials: &crate::client::AssumeRoleResponse,
+        ) -> Result<crate::caller_identity::Caller, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.caller
+                .lock()
+                .clone()
+                .ok_or_else(|| "connection refused".to_owned())
+        }
+    }
+
+    fn caller(account: &str) -> crate::caller_identity::Caller {
+        crate::caller_identity::Caller::new(
+            account.to_owned(),
+            format!("arn:aws:sts::{account}:assumed-role/Admin/alice"),
+            "AROAEXAMPLE:alice".to_owned(),
+        )
+    }
+
     struct Fixture {
         authorizer: Authorizer,
         services: std::sync::Arc<MockServices>,
+        sts: std::sync::Arc<FakeSts>,
         clock: std::sync::Arc<TestClock>,
         pidfd: std::sync::Arc<std::os::fd::OwnedFd>,
     }
@@ -891,9 +1228,18 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         let pidfd: std::os::fd::OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
         let pidfd = std::sync::Arc::new(pidfd);
+        let sts = std::sync::Arc::new(FakeSts::default());
+        sts.answer(Some("123456789012"));
         Fixture {
-            authorizer: Authorizer::with_clock(engine, services.clone(), true, clock.clone()),
+            authorizer: Authorizer::with_clock(
+                engine,
+                services.clone(),
+                sts.clone(),
+                true,
+                clock.clone(),
+            ),
             services,
+            sts,
             clock,
             pidfd,
         }
@@ -958,7 +1304,10 @@ mod tests {
         }
 
         async fn decide(&self, pending: Pending) -> Result<Authorized, Refusal> {
-            self.authorizer.shared.decide(pending).await
+            self.authorizer
+                .shared
+                .decide(pending, crate::policy::Action::AssumeRole, None)
+                .await
         }
     }
 
@@ -1252,6 +1601,318 @@ mod tests {
         assert_eq!(f.authorizer.revoke(None, false), (1, 0));
         assert_eq!(f.authorizer.revoke(None, true), (0, 1));
         assert_eq!(f.authorizer.counts(), (0, 0));
+    }
+
+    fn credentials() -> crate::client::AssumeRoleResponse {
+        crate::client::AssumeRoleResponse {
+            version: 1,
+            access_key_id: "ASIAEXAMPLE".to_owned(),
+            secret_access_key: secrecy::SecretString::from("secret".to_owned()),
+            session_token: Some("token".to_owned()),
+            expiration: chrono::Utc::now() + chrono::TimeDelta::seconds(3600),
+            mairu: Default::default(),
+        }
+    }
+
+    /// The agent's `assume_role` after the config lookups: gate 1, then obtain with a counted fetch.
+    struct Flow {
+        cache: crate::credential_cache::CredentialCache,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Flow {
+        fn new() -> Self {
+            Self {
+                cache: crate::credential_cache::CredentialCache::new(),
+                fetches: Default::default(),
+            }
+        }
+
+        fn fetches(&self) -> usize {
+            self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn request(
+            &self,
+            f: &Fixture,
+            pending: Pending,
+            cacheable: bool,
+        ) -> Result<Obtained, crate::proto::AuthorizationError> {
+            let rs = rolespec(&pending.facts.role);
+            let gate1 = f.authorizer.gate1(pending).await?;
+            f.authorizer
+                .obtain(gate1, &self.cache, &rs, cacheable, || async {
+                    self.fetches
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(credentials())
+                })
+                .await
+                .map_err(|status| crate::proto::AuthorizationError::from_status(&status).unwrap())
+        }
+    }
+
+    const HUMAN_AND_PROD: &str = r#"
+        @id("human")
+        permit (principal, action == Mairu::Action::"AssumeRole", resource)
+        when { context.presence.verified };
+        @id("prod-by-real-account")
+        forbid (principal, action == Mairu::Action::"UseCredentials", resource in Mairu::Account::"999999999999")
+        unless { context.presence.verified && context.presence.scope == "request" };
+    "#;
+
+    #[tokio::test]
+    async fn test_gate2_account_mismatch() {
+        let f = fixture(MockServices::answering(R::Allowed, ""));
+        f.sts.answer(Some("999999999999"));
+        let flow = Flow::new();
+        let err = flow
+            .request(
+                &f,
+                f.pending(10, Some(TTY), "123456789012/Admin", None),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason(), Reason::Forbidden);
+        assert_eq!(
+            err.policy_ids,
+            vec![crate::policy::POLICY_CALLER_ACCOUNT_MISMATCH]
+        );
+        assert_eq!(err.gate, crate::proto::GATE_USE_CREDENTIALS);
+        assert_eq!(
+            err.caller_arn,
+            "arn:aws:sts::999999999999:assumed-role/Admin/alice"
+        );
+        assert!(
+            err.detail.contains("credentials belong to 999999999999")
+                && err.detail.contains("(123456789012)"),
+            "{}",
+            err.detail
+        );
+        assert!(
+            err.user_message()
+                .starts_with("refused at use-credentials: ")
+        );
+        assert_eq!(f.services.prompts(), 1, "only gate 1 asked");
+        assert!(flow.cache.get(&rolespec("123456789012/Admin")).is_none());
+        // The declared account matches.
+        f.sts.answer(Some("123456789012"));
+        let obtained = flow
+            .request(
+                &f,
+                f.pending(10, Some(TTY), "123456789012/Admin", None),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(obtained.source, Source::Fetched);
+    }
+
+    #[tokio::test]
+    async fn test_gate2_prod_by_real_account() {
+        let f = fixture_with(
+            crate::policy::Engine::new(HUMAN_AND_PROD).unwrap(),
+            MockServices::answering(R::Allowed, ""),
+        );
+        f.sts.answer(Some("999999999999"));
+        let flow = Flow::new();
+        // Gate 1 asked for this very request, which also satisfies gate 2.
+        let obtained = flow
+            .request(&f, f.pending(10, Some(TTY), "admin", None), true)
+            .await
+            .unwrap();
+        assert_eq!(obtained.source, Source::Fetched);
+        assert_eq!(f.services.prompts(), 1);
+        assert_eq!(f.sts.calls(), 1);
+        // Another process in the session: the grant passes gate 1, but production asks again at gate 2, from the
+        // cache with the cached caller and no STS call.
+        let obtained = flow
+            .request(&f, f.pending(11, Some(TTY), "admin", None), true)
+            .await
+            .unwrap();
+        assert_eq!(obtained.source, Source::Cache);
+        assert_eq!(f.services.prompts(), 2);
+        assert_eq!(f.sts.calls(), 1);
+        assert_eq!(flow.fetches(), 1);
+        // Another account behind the same opaque name is not production.
+        let flow = Flow::new();
+        f.sts.answer(Some("111111111111"));
+        flow.request(&f, f.pending(12, Some(TTY), "admin", None), true)
+            .await
+            .unwrap();
+        assert_eq!(f.services.prompts(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_gate2_prefetch_never_asks() {
+        let f = fixture_with(
+            crate::policy::Engine::new(HUMAN_AND_PROD).unwrap(),
+            MockServices::answering(R::Allowed, ""),
+        );
+        f.sts.answer(Some("999999999999"));
+        let flow = Flow::new();
+        let demand = || f.pending(10, None, "admin", Some(exec_context("sleep 1d", false)));
+        let prefetch = || f.pending(10, None, "admin", Some(exec_context("sleep 1d", true)));
+        flow.request(&f, demand(), false).await.unwrap();
+        assert_eq!(f.services.prompts(), 1);
+        let err = flow.request(&f, prefetch(), false).await.unwrap_err();
+        assert_eq!(err.reason(), Reason::PresenceRequired);
+        assert_eq!(err.gate, crate::proto::GATE_USE_CREDENTIALS);
+        assert_eq!(f.services.prompts(), 1, "nobody was asked");
+    }
+
+    #[tokio::test]
+    async fn test_gate2_sts_failure() {
+        let f = fixture(MockServices::answering(R::Allowed, ""));
+        f.sts.answer(None);
+        let flow = Flow::new();
+        let p = || f.pending(10, Some(TTY), "123456789012/Admin", None);
+        let err = flow.request(&f, p(), true).await.unwrap_err();
+        assert_eq!(err.reason(), Reason::Unavailable);
+        assert_eq!(err.gate, crate::proto::GATE_USE_CREDENTIALS);
+        assert!(err.detail.contains("connection refused"), "{}", err.detail);
+        assert!(flow.cache.get(&rolespec("123456789012/Admin")).is_none());
+        let err = flow.request(&f, p(), true).await.unwrap_err();
+        assert_eq!(err.reason(), Reason::Unavailable);
+        assert_eq!((flow.fetches(), f.sts.calls()), (2, 2));
+        f.sts.answer(Some("123456789012"));
+        flow.request(&f, p(), true).await.unwrap();
+        flow.request(&f, p(), true).await.unwrap();
+        assert_eq!((flow.fetches(), f.sts.calls()), (3, 3));
+        assert!(
+            flow.cache
+                .get(&rolespec("123456789012/Admin"))
+                .unwrap()
+                .caller
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gate2_cached_entry_without_caller() {
+        let f = fixture(MockServices::answering(R::Allowed, ""));
+        let flow = Flow::new();
+        // A chain's first hop is cached before anyone asked who it belongs to.
+        flow.cache.store(
+            rolespec("123456789012/Admin"),
+            std::sync::Arc::new(credentials()),
+            None,
+        );
+        let p = || f.pending(10, Some(TTY), "123456789012/Admin", None);
+        assert_eq!(
+            flow.request(&f, p(), true).await.unwrap().source,
+            Source::Cache
+        );
+        assert_eq!(
+            flow.request(&f, p(), true).await.unwrap().source,
+            Source::Cache
+        );
+        assert_eq!((flow.fetches(), f.sts.calls()), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn test_gate2_retry_uses_held_credentials() {
+        let f = fixture_with(
+            crate::policy::Engine::new(HUMAN_AND_PROD).unwrap(),
+            MockServices::answering(R::Allowed, ""),
+        );
+        f.sts.answer(Some("999999999999"));
+        let flow = Flow::new();
+        flow.request(&f, f.pending(10, Some(TTY), "admin", None), false)
+            .await
+            .unwrap();
+        let no_agent = crate::proto::platform::AuthorizeResponse::unavailable(
+            REASON_NO_AUTHENTICATION_AGENT,
+            "",
+        );
+        *f.services.answer.lock() = no_agent.clone();
+        let p = || f.pending(11, Some(TTY), "admin", None);
+        let err = flow.request(&f, p(), false).await.unwrap_err();
+        assert_eq!(err.reason(), Reason::NoAuthenticationAgent);
+        assert_eq!(err.gate, crate::proto::GATE_USE_CREDENTIALS);
+        assert_eq!((flow.fetches(), f.sts.calls()), (2, 2));
+        // The retry, once an agent is registered, fetches nothing again.
+        *f.services.answer.lock() = MockServices::answering(R::Allowed, "")
+            .answer
+            .lock()
+            .clone();
+        let obtained = flow.request(&f, p(), false).await.unwrap();
+        assert_eq!(obtained.source, Source::Held);
+        assert_eq!((flow.fetches(), f.sts.calls()), (2, 2));
+        assert_eq!(f.services.prompts(), 3);
+        // Taken by the retry.
+        flow.request(&f, p(), false).await.unwrap();
+        assert_eq!(flow.fetches(), 3);
+
+        // Held for 60 s at most, and dropped by a revoke.
+        *f.services.answer.lock() = no_agent;
+        flow.request(&f, p(), false).await.unwrap_err();
+        f.clock.advance(61);
+        flow.request(&f, p(), false).await.unwrap_err();
+        assert_eq!(flow.fetches(), 5, "an expired hold is fetched again");
+        f.authorizer.revoke(Some(Some(TTY)), false);
+        *f.services.answer.lock() = MockServices::answering(R::Allowed, "")
+            .answer
+            .lock()
+            .clone();
+        let obtained = flow.request(&f, p(), false).await.unwrap();
+        assert_eq!(
+            obtained.source,
+            Source::Fetched,
+            "a revoke drops held credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gate2_skipped_unhardened() {
+        let services = MockServices::answering(R::Denied, "");
+        let clock = std::sync::Arc::new(TestClock::default());
+        let sts = std::sync::Arc::new(FakeSts::default());
+        let authorizer = Authorizer::with_clock(
+            crate::policy::Engine::builtin(false).unwrap(),
+            services.clone(),
+            sts.clone(),
+            false,
+            clock,
+        );
+        let f = Fixture {
+            authorizer,
+            services,
+            sts,
+            clock: Default::default(),
+            pidfd: fixture(MockServices::answering(R::Allowed, "")).pidfd,
+        };
+        let flow = Flow::new();
+        let obtained = flow
+            .request(
+                &f,
+                f.pending(10, Some(TTY), "123456789012/Admin", None),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(obtained.caller.is_none());
+        assert_eq!((f.sts.calls(), f.services.prompts()), (0, 0));
+        let cached = flow.cache.get(&rolespec("123456789012/Admin")).unwrap();
+        assert!(cached.caller.is_none());
+    }
+
+    #[test]
+    fn test_gate2_prompt_details() {
+        let f = fixture(MockServices::answering(R::Allowed, ""));
+        let p = f.pending(10, Some(TTY), "admin", None);
+        assert!(!p.authorize_request(None).details.contains_key("caller"));
+        let c = caller("999999999999");
+        let req = p.authorize_request(Some(&c));
+        assert_eq!(
+            req.details.get("caller").map(String::as_str),
+            Some("999999999999 arn:aws:sts::999999999999:assumed-role/Admin/alice")
+        );
+        assert!(
+            req.message.contains("999999999999 assumed-role/Admin"),
+            "{}",
+            req.message
+        );
     }
 
     #[test]
