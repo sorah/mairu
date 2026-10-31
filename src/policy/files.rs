@@ -448,8 +448,7 @@ mod tests {
             r#"@id("aaaa") forbid (principal, action, resource);"#,
         )
         .unwrap();
-        let files =
-            PolicyFiles::with_ttl(dir.0.clone(), true, std::time::Duration::from_millis(50));
+        let files = PolicyFiles::with_ttl(dir.0.clone(), true, std::time::Duration::from_secs(1));
         assert!(
             files
                 .load()
@@ -478,7 +477,7 @@ mod tests {
                 .policy_ids()
                 .contains(&"aaaa".to_owned())
         );
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(
             files
                 .load()
