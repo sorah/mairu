@@ -1,6 +1,10 @@
 //! The Cedar engine: the embedded schema and built-in policies, request building, and evaluation that fails
 //! closed.
 
+pub mod files;
+pub mod settings;
+pub mod user;
+
 const SCHEMA: &str = include_str!("mairu.cedarschema");
 const BUILTIN_HUMAN: &str = include_str!("builtin/human.cedar");
 const BUILTIN_AI_AGENT: &str = include_str!("builtin/ai_agent.cedar");
@@ -30,8 +34,45 @@ pub enum PolicyError {
 pub struct Engine {
     schema: cedar_policy::Schema,
     policies: cedar_policy::PolicySet,
+    text: String,
     assume_role: cedar_policy::EntityUid,
     use_credentials: cedar_policy::EntityUid,
+}
+
+/// The Cedar schema policies are validated against, as `mairu policy schema` prints it.
+pub fn schema_text() -> &'static str {
+    SCHEMA
+}
+
+pub fn schema() -> Result<cedar_policy::Schema, PolicyError> {
+    let (schema, _warnings) = cedar_policy::Schema::from_cedarschema_str(SCHEMA)
+        .map_err(|e| PolicyError::Schema(e.to_string()))?;
+    Ok(schema)
+}
+
+/// Strict validation of one policy set against the schema.
+pub fn validate(
+    schema: &cedar_policy::Schema,
+    policies: &cedar_policy::PolicySet,
+) -> Result<(), String> {
+    let validation = cedar_policy::Validator::new(schema.clone())
+        .validate(policies, cedar_policy::ValidationMode::Strict);
+    if validation.validation_passed() {
+        return Ok(());
+    }
+    let errors: Vec<String> = validation
+        .validation_errors()
+        .map(ToString::to_string)
+        .collect();
+    Err(errors.join("; "))
+}
+
+fn builtin_source(hardened: bool) -> String {
+    if hardened {
+        format!("{BUILTIN_HUMAN}\n{BUILTIN_AI_AGENT}")
+    } else {
+        BUILTIN_UNHARDENED.to_owned()
+    }
 }
 
 /// The gate a request is decided at.
@@ -54,31 +95,45 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     /// `builtin-human` and `builtin-ai-agent-per-request` for a hardened agent, `builtin-unhardened` otherwise.
     pub fn builtin(hardened: bool) -> Result<Self, PolicyError> {
-        if hardened {
-            Self::new(&format!("{BUILTIN_HUMAN}\n{BUILTIN_AI_AGENT}"))
-        } else {
-            Self::new(BUILTIN_UNHARDENED)
+        Self::new(&builtin_source(hardened))
+    }
+
+    /// The built-ins for the hardening state plus `user` policies, whose ids are already assigned.
+    pub fn with_user_policies(
+        hardened: bool,
+        user: &[user::UserPolicy],
+    ) -> Result<Self, PolicyError> {
+        let builtin = builtin_source(hardened);
+        let mut text = format!("{builtin}\n{BUILTIN_ALWAYS_ON}");
+        let mut policies = cedar_policy::PolicySet::new();
+        Self::add_policies(&mut policies, &text)?;
+        for p in user {
+            policies
+                .add(p.policy.clone())
+                .map_err(|e| PolicyError::Parse(e.to_string()))?;
+            text.push('\n');
+            text.push_str(&p.text);
+            text.push('\n');
         }
+        Self::from_policies(policies, text)
     }
 
     /// Parses policies whose ids come from their `@id` annotations, joins the always-on built-ins, and validates
     /// them in strict mode.
     pub fn new(source: &str) -> Result<Self, PolicyError> {
-        let (schema, _warnings) = cedar_policy::Schema::from_cedarschema_str(SCHEMA)
-            .map_err(|e| PolicyError::Schema(e.to_string()))?;
+        Self::from_text(&format!("{source}\n{BUILTIN_ALWAYS_ON}"))
+    }
+
+    /// Parses a complete policy set, such as `GetPolicyResponse.effective_policies`, as is.
+    pub fn from_text(text: &str) -> Result<Self, PolicyError> {
         let mut policies = cedar_policy::PolicySet::new();
-        for source in [source, BUILTIN_ALWAYS_ON] {
-            Self::add_policies(&mut policies, source)?;
-        }
-        let validation = cedar_policy::Validator::new(schema.clone())
-            .validate(&policies, cedar_policy::ValidationMode::Strict);
-        if !validation.validation_passed() {
-            let errors: Vec<String> = validation
-                .validation_errors()
-                .map(ToString::to_string)
-                .collect();
-            return Err(PolicyError::Validation(errors.join("; ")));
-        }
+        Self::add_policies(&mut policies, text)?;
+        Self::from_policies(policies, text.to_owned())
+    }
+
+    fn from_policies(policies: cedar_policy::PolicySet, text: String) -> Result<Self, PolicyError> {
+        let schema = schema()?;
+        validate(&schema, &policies).map_err(PolicyError::Validation)?;
         let action = |uid: &str| {
             uid.parse()
                 .map_err(|e: cedar_policy::ParseErrors| PolicyError::Schema(e.to_string()))
@@ -86,6 +141,7 @@ impl Engine {
         Ok(Self {
             schema,
             policies,
+            text,
             assume_role: action(ACTION_ASSUME_ROLE)?,
             use_credentials: action(ACTION_USE_CREDENTIALS)?,
         })
@@ -107,6 +163,11 @@ impl Engine {
                 .map_err(|e| PolicyError::Parse(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// The Cedar text of every policy in force.
+    pub fn text(&self) -> &str {
+        &self.text
     }
 
     pub fn policy_ids(&self) -> Vec<String> {
@@ -247,23 +308,29 @@ impl Engine {
             .map(ToString::to_string)
             .collect();
         let allowed = response.decision() == cedar_policy::Decision::Allow && errors.is_empty();
+        let mut policies: Vec<String> = response
+            .diagnostics()
+            .reason()
+            .map(ToString::to_string)
+            .collect();
+        policies.sort();
         let forbids = if allowed {
             vec![]
         } else {
-            response
-                .diagnostics()
-                .reason()
+            policies
+                .iter()
                 .filter(|id| {
                     self.policies
-                        .policy(id)
+                        .policy(&cedar_policy::PolicyId::new(id.as_str()))
                         .is_some_and(|p| p.effect() == cedar_policy::Effect::Forbid)
                 })
-                .map(ToString::to_string)
+                .cloned()
                 .collect()
         };
         Evaluation {
             allowed,
             forbids,
+            policies,
             errors,
         }
     }
@@ -423,6 +490,8 @@ pub struct Evaluation {
     pub allowed: bool,
     /// Ids of the `forbid` policies that determined a `Deny`.
     pub forbids: Vec<String>,
+    /// Ids of every policy that determined the decision.
+    pub policies: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -431,6 +500,7 @@ impl Evaluation {
         Self {
             allowed: false,
             forbids: vec![],
+            policies: vec![],
             errors: vec![e],
         }
     }

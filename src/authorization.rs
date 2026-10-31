@@ -5,8 +5,6 @@
 // A refusal is the protocol's own AuthorizationError, returned once per request.
 #![allow(clippy::result_large_err)]
 
-/// Grants are dropped after this to bound memory; freshness itself is up to the policy.
-const GRANT_RETENTION: std::time::Duration = std::time::Duration::from_secs(43200);
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Credentials refused at gate 2 with a status the client retries after wait this long for the retry.
 const HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
@@ -105,11 +103,17 @@ struct State {
 }
 
 impl State {
-    fn sweep(&mut self, now: std::time::Duration, process: &dyn crate::platform::ProcessPlatform) {
+    /// Grants are dropped after `retention` to bound memory; freshness itself is up to the policy.
+    fn sweep(
+        &mut self,
+        now: std::time::Duration,
+        retention: std::time::Duration,
+        process: &dyn crate::platform::ProcessPlatform,
+    ) {
         self.leases.retain(|_, l| pidfd_alive(&l.pidfd));
         self.marks.sweep(|s| process.session_alive(s));
         self.grants
-            .retain(|_, g| now.saturating_sub(g.created) <= GRANT_RETENTION);
+            .retain(|_, g| now.saturating_sub(g.created) <= retention);
         self.held.retain(|_, h| now < h.until);
     }
 }
@@ -120,11 +124,10 @@ type PromptFuture = futures::future::Shared<
 type FlightKey = (u32, u64, [u8; 32]);
 
 struct Shared {
-    engine: crate::policy::Engine,
+    policy: crate::policy::files::PolicyFiles,
     services: std::sync::Arc<dyn crate::platform::PlatformServices>,
     identifier: std::sync::Arc<dyn crate::caller_identity::Identify>,
     process: &'static dyn crate::platform::ProcessPlatform,
-    labels: Vec<crate::tool_detection::ToolLabel>,
     clock: std::sync::Arc<dyn Clock>,
     hardened: bool,
     state: parking_lot::Mutex<State>,
@@ -153,7 +156,6 @@ pub struct Authorizer {
 impl std::fmt::Debug for Authorizer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Authorizer")
-            .field("engine", &self.shared.engine)
             .field("hardened", &self.shared.hardened)
             .finish()
     }
@@ -238,12 +240,12 @@ type Refusal = crate::proto::AuthorizationError;
 impl Authorizer {
     /// Starts the sweeper; needs a Tokio runtime.
     pub fn new(
-        engine: crate::policy::Engine,
+        policy: crate::policy::files::PolicyFiles,
         services: std::sync::Arc<dyn crate::platform::PlatformServices>,
         hardened: bool,
     ) -> Self {
         let this = Self::with_clock(
-            engine,
+            policy,
             services,
             std::sync::Arc::new(crate::caller_identity::Sts::default()),
             crate::platform::process(),
@@ -260,14 +262,15 @@ impl Authorizer {
                     return;
                 };
                 let now = shared.clock.now();
-                shared.state.lock().sweep(now, shared.process);
+                let retention = shared.grant_retention();
+                shared.state.lock().sweep(now, retention, shared.process);
             }
         });
         this
     }
 
     fn with_clock(
-        engine: crate::policy::Engine,
+        policy: crate::policy::files::PolicyFiles,
         services: std::sync::Arc<dyn crate::platform::PlatformServices>,
         identifier: std::sync::Arc<dyn crate::caller_identity::Identify>,
         process: &'static dyn crate::platform::ProcessPlatform,
@@ -276,11 +279,10 @@ impl Authorizer {
     ) -> Self {
         Self {
             shared: std::sync::Arc::new(Shared {
-                engine,
+                policy,
                 services,
                 identifier,
                 process,
-                labels: crate::tool_detection::ToolLabel::builtin(),
                 clock,
                 hardened,
                 state: Default::default(),
@@ -289,34 +291,44 @@ impl Authorizer {
         }
     }
 
-    /// The built-in policy for this process's hardening state.
-    pub fn builtin(
+    /// The policy files in `config_dir()` and the built-ins for this process's hardening state. Fails only when
+    /// the built-ins cannot be built.
+    pub fn from_config(
         services: std::sync::Arc<dyn crate::platform::PlatformServices>,
-    ) -> Result<Self, crate::policy::PolicyError> {
+    ) -> Result<Self, String> {
         let hardened = crate::hardening::Hardening::marker().is_some();
-        Ok(Self::new(
-            crate::policy::Engine::builtin(hardened)?,
-            services,
-            hardened,
-        ))
+        let policy = crate::policy::files::PolicyFiles::new(crate::config::config_dir(), hardened);
+        policy.load()?;
+        Ok(Self::new(policy, services, hardened))
+    }
+
+    /// The policy and settings in force now.
+    pub fn policy(&self) -> Result<std::sync::Arc<crate::policy::files::Effective>, String> {
+        self.shared.policy.load()
     }
 
     /// Live grants and leases.
     pub fn counts(&self) -> (u32, u32) {
         let now = self.shared.clock.now();
+        let retention = self.shared.grant_retention();
         let mut state = self.shared.state.lock();
-        state.sweep(now, self.shared.process);
+        state.sweep(now, retention, self.shared.process);
         (
             u32::try_from(state.grants.len()).unwrap_or(u32::MAX),
             u32::try_from(state.leases.len()).unwrap_or(u32::MAX),
         )
     }
 
-    /// The methods that could ask a human right now, in order.
+    /// The effective methods that could ask a human right now, in order.
     pub async fn methods(&self) -> Vec<String> {
+        let Ok(effective) = self.shared.policy.load() else {
+            return vec![];
+        };
         let mut methods = vec![];
-        if self.shared.platform_usable().await.is_ok() {
-            methods.push(METHOD_PLATFORM.to_owned());
+        for method in &effective.settings.methods {
+            if method == METHOD_PLATFORM && self.shared.platform_usable().await.is_ok() {
+                methods.push(method.clone());
+            }
         }
         methods
     }
@@ -663,6 +675,13 @@ fn log_decision(
 }
 
 impl Shared {
+    fn grant_retention(&self) -> std::time::Duration {
+        self.policy.load().map_or_else(
+            |_| crate::policy::settings::EffectiveSettings::default().grant_retention(),
+            |e| e.settings.grant_retention(),
+        )
+    }
+
     fn pending(&self, req: &Request<'_>) -> Pending {
         let platform = self.process;
         let env_names = req
@@ -706,11 +725,15 @@ impl Shared {
         let ancestry = peer
             .map(|p| self.process.ancestry(p.pid, p.start_time, p.uid))
             .unwrap_or_default();
+        let labels = self.policy.load().map_or_else(
+            |_| crate::tool_detection::ToolLabel::builtin(),
+            |e| e.labels.clone(),
+        );
         crate::tool_detection::Detection::detect(
             &ancestry,
             env_names,
             &self.state.lock().marks,
-            &self.labels,
+            &labels,
         )
     }
 
@@ -768,7 +791,15 @@ impl Shared {
             crate::policy::Action::AssumeRole => None,
             crate::policy::Action::UseCredentials(caller) => Some(caller),
         };
-        let prepared = self.engine.prepare(&pending.facts, action).map_err(|e| {
+        let effective = self.policy.load().map_err(|e| {
+            Refusal::new(
+                Reason::NotPermitted,
+                format!("the authorization policy could not be built: {e}"),
+            )
+        })?;
+        let engine = &effective.engine;
+        let retention = effective.settings.grant_retention();
+        let prepared = engine.prepare(&pending.facts, action).map_err(|e| {
             tracing::error!(
                 err = e,
                 "Failed to build the authorization request; refusing"
@@ -813,12 +844,12 @@ impl Shared {
                 presence,
             };
             if let Some(presence) = extra.filter(|p| p.verified)
-                && note(&self.engine.evaluate(&prepared, &presence))
+                && note(&engine.evaluate(&prepared, &presence))
             {
                 return Ok(authorized(has_lease, presence));
             }
             let none = crate::policy::Presence::none();
-            if note(&self.engine.evaluate(&prepared, &none)) {
+            if note(&engine.evaluate(&prepared, &none)) {
                 return Ok(authorized(has_lease, none));
             }
             if let Some(lease) = state.leases.get(&lease_key)
@@ -830,20 +861,22 @@ impl Shared {
                     secs(now.saturating_sub(lease.created)),
                     secs(now.saturating_sub(lease.last_demand_expiry)),
                 );
-                if note(&self.engine.evaluate(&prepared, &presence)) {
+                if note(&engine.evaluate(&prepared, &presence)) {
                     return Ok(authorized(true, presence));
                 }
             }
             if let Some(session) = pending.session {
                 let key: GrantKey = (session, pending.server_id.clone(), pending.role_key.clone());
-                if let Some(grant) = state.grants.get_mut(&key) {
+                if let Some(grant) = state.grants.get_mut(&key)
+                    && now.saturating_sub(grant.created) <= retention
+                {
                     let presence = crate::policy::Presence::remembered(
                         crate::policy::Scope::Session,
                         &grant.method,
                         secs(now.saturating_sub(grant.created)),
                         secs(now.saturating_sub(grant.last_used)),
                     );
-                    if note(&self.engine.evaluate(&prepared, &presence)) {
+                    if note(&engine.evaluate(&prepared, &presence)) {
                         grant.last_used = now;
                         return Ok(authorized(has_lease, presence));
                     }
@@ -861,9 +894,12 @@ impl Shared {
         // What could be asked.
         let mut tried: Vec<String> = vec![];
         let mut fresh_allowed = false;
-        for method in [METHOD_PLATFORM] {
+        for method in effective.settings.methods.iter().map(String::as_str) {
+            if method != METHOD_PLATFORM {
+                continue;
+            }
             let presence = crate::policy::Presence::fresh(method);
-            if !note(&self.engine.evaluate(&prepared, &presence)) {
+            if !note(&engine.evaluate(&prepared, &presence)) {
                 continue;
             }
             fresh_allowed = true;
@@ -1426,6 +1462,18 @@ mod tests {
         engine: crate::policy::Engine,
         services: std::sync::Arc<MockServices>,
     ) -> Fixture {
+        fixture_with_policy(
+            crate::policy::files::PolicyFiles::fixed(crate::policy::files::Effective::with_engine(
+                engine,
+            )),
+            services,
+        )
+    }
+
+    fn fixture_with_policy(
+        policy: crate::policy::files::PolicyFiles,
+        services: std::sync::Arc<MockServices>,
+    ) -> Fixture {
         let clock = std::sync::Arc::new(TestClock::default());
         clock.advance(1_000_000);
         // Any live process will do; leases only check that it is alive.
@@ -1439,7 +1487,7 @@ mod tests {
         let process: &'static FakeProcess = Box::leak(Box::default());
         Fixture {
             authorizer: Authorizer::with_clock(
-                engine,
+                policy,
                 services.clone(),
                 sts.clone(),
                 process,
@@ -1936,6 +1984,101 @@ mod tests {
         );
     }
 
+    fn unapproved_fixture(
+        hardened: bool,
+        policy: &str,
+        settings: Option<serde_json::Value>,
+    ) -> Fixture {
+        use crate::policy::files::Content;
+        let effective = crate::policy::files::Effective::build(
+            hardened,
+            &Content::Text(policy.to_owned()),
+            &settings.map_or(Content::Absent, |s| Content::Text(s.to_string())),
+        )
+        .unwrap();
+        fixture_with_policy(
+            crate::policy::files::PolicyFiles::fixed(effective),
+            MockServices::answering(R::Allowed, ""),
+        )
+    }
+
+    const USER_POLICY: &str = r#"
+        @id("allow-all") permit (principal, action, resource);
+        @id("no-prod") forbid (principal, action, resource) when { resource.name == "prod" };
+    "#;
+
+    #[tokio::test]
+    async fn test_unapproved_forbid_applies_and_permit_is_ignored() {
+        let f = unapproved_fixture(true, USER_POLICY, None);
+        let err = f
+            .decide(f.pending(10, Some(TTY), "prod", None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason(), Reason::Forbidden);
+        assert_eq!(err.policy_ids, vec!["no-prod"]);
+        assert_eq!(f.services.prompts(), 0);
+        f.decide(f.pending(10, Some(TTY), "dev", None))
+            .await
+            .unwrap();
+        assert_eq!(f.services.prompts(), 1, "allow-all is ignored");
+    }
+
+    #[tokio::test]
+    async fn test_unapproved_forbid_unhardened() {
+        let f = unapproved_fixture(false, USER_POLICY, None);
+        assert_eq!(
+            reason(f.decide(f.pending(10, Some(TTY), "prod", None)).await),
+            Reason::Forbidden
+        );
+        f.decide(f.pending(10, Some(TTY), "dev", None))
+            .await
+            .unwrap();
+        assert_eq!(f.services.prompts(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_unapproved_grant_retention() {
+        let f = unapproved_fixture(
+            true,
+            "",
+            Some(serde_json::json!({"version": 1, "grant_retention_secs": 600})),
+        );
+        let p = || f.pending(10, Some(TTY), "r", None);
+        f.decide(p()).await.unwrap();
+        f.clock.advance(250);
+        f.decide(p()).await.unwrap();
+        f.clock.advance(250);
+        f.decide(p()).await.unwrap();
+        assert_eq!(f.services.prompts(), 1);
+        f.clock.advance(250);
+        f.decide(p()).await.unwrap();
+        assert_eq!(f.services.prompts(), 2, "the grant is dropped after 600 s");
+    }
+
+    #[tokio::test]
+    async fn test_unapproved_tool_detection() {
+        let f = unapproved_fixture(
+            true,
+            "",
+            Some(serde_json::json!({
+                "version": 1,
+                "tool_detection": {
+                    "ai-agent": {"env_names": ["MY_AGENT"]},
+                    "ci": {"env_names": ["CI"]},
+                },
+            })),
+        );
+        let p = f.peer_pending(
+            10,
+            "r",
+            Some(with_env(exec_context("aws", false), &["MY_AGENT", "CI"])),
+        );
+        assert_eq!(
+            p.detection.tools.iter().collect::<Vec<_>>(),
+            vec!["ai-agent", "ci"]
+        );
+    }
+
     #[tokio::test]
     async fn test_evaluation_error_denies_remembered_grant() {
         // Errors once a grant exists (age > 0); the error must not let the grant through the forbid.
@@ -2276,7 +2419,9 @@ mod tests {
         let sts = std::sync::Arc::new(FakeSts::default());
         let process: &'static FakeProcess = Box::leak(Box::default());
         let authorizer = Authorizer::with_clock(
-            crate::policy::Engine::builtin(false).unwrap(),
+            crate::policy::files::PolicyFiles::fixed(
+                crate::policy::files::Effective::builtin(false).unwrap(),
+            ),
             services.clone(),
             sts.clone(),
             process,

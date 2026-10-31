@@ -85,6 +85,12 @@ pub async fn run(_args: &DoctorArgs) -> Result<(), anyhow::Error> {
         }
     }
 
+    let agent_hardened = agent_status.as_ref().map_or(
+        matches!(state, crate::hardening::HardeningState::Hardened { .. }),
+        |s| s.agent_hardening() == crate::proto::HardeningState::Hardened,
+    );
+    print_policy(agent_hardened);
+
     #[cfg(target_os = "linux")]
     warnings.extend(headless::report(agent_status.as_ref()));
     #[cfg(not(target_os = "linux"))]
@@ -159,6 +165,30 @@ fn print_agent_status(
         for note in &caps.notes {
             println!("  note: {note}");
         }
+    }
+}
+
+/// The policy files as the agent would read them, evaluated here so that no agent RPC is needed.
+fn print_policy(hardened: bool) {
+    let dir = crate::config::config_dir();
+    let (policy, settings) = crate::policy::files::PolicyFiles::read_contents(&dir);
+    match crate::policy::files::Effective::build(hardened, &policy, &settings) {
+        Ok(effective) => {
+            let own = effective
+                .engine
+                .policy_ids()
+                .iter()
+                .filter(|id| !id.starts_with(crate::policy::BUILTIN_PREFIX))
+                .count();
+            println!(
+                "policy   {} ({own} forbid policies of yours apply)",
+                effective.state.as_str()
+            );
+            for note in &effective.notes {
+                println!("  note: {note}");
+            }
+        }
+        Err(e) => println!("policy   error: {e}"),
     }
 }
 

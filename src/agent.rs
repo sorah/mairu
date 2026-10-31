@@ -13,10 +13,10 @@ impl Agent {
     pub fn new(
         shutdown_tx: tokio::sync::oneshot::Sender<()>,
         platform_helper: crate::platform::helper::HelperClient,
-    ) -> Result<Self, crate::policy::PolicyError> {
+    ) -> Result<Self, anyhow::Error> {
         let platform_helper = std::sync::Arc::new(platform_helper);
-        let authorizer = crate::authorization::Authorizer::builtin(platform_helper.clone())?;
-        tracing::info!(authorizer = ?authorizer, "Authorization policy loaded");
+        let authorizer = crate::authorization::Authorizer::from_config(platform_helper.clone())
+            .map_err(|e| anyhow::anyhow!("failed to build the authorization policy: {e}"))?;
         Ok(Self {
             auth_flow_manager: crate::auth_flow_manager::AuthFlowManager::new(),
             session_manager: crate::session_manager::SessionManager::new(),
@@ -627,6 +627,28 @@ impl crate::proto::agent_server::Agent for Agent {
         Ok(tonic::Response::new(RevokeAuthorizationsResponse {
             revoked_grants,
             revoked_leases,
+        }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn get_policy(
+        &self,
+        request: tonic::Request<GetPolicyRequest>,
+    ) -> Result<tonic::Response<GetPolicyResponse>, tonic::Status> {
+        Self::require_trusted(&request)?;
+        let effective = self
+            .authorizer
+            .policy()
+            .map_err(|e| tonic::Status::internal(format!("failed to build the policy: {e}")))?;
+        let integrity = match effective.state {
+            crate::policy::settings::PolicyState::Absent => PolicyIntegrity::Absent,
+            crate::policy::settings::PolicyState::Unapproved => PolicyIntegrity::Unapproved,
+        };
+        Ok(tonic::Response::new(GetPolicyResponse {
+            effective_policies: effective.engine.text().to_owned(),
+            effective_settings_json: effective.settings.to_json(),
+            integrity: integrity.into(),
+            notes: effective.notes.clone(),
         }))
     }
 

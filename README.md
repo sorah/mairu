@@ -306,6 +306,71 @@ The mark covers every command started from that terminal, including those a tool
 
 Labels are a guardrail, not a security boundary: a renamed binary, a double fork or `systemd-run --user` escapes detection, and any program can claim to be a tool.
 
+### Your own policy
+
+The agent decides with [Cedar](https://www.cedarpolicy.com/) policies, with IAM-like semantics: the default is deny, and a `forbid` wins over any `permit`. Write your own in `~/.config/mairu/policy.cedar`; the agent reads the file itself before every decision.
+
+```cedar
+// Never hand production to AI agents, on any server.
+@id("no-ai-prod")
+forbid (principal, action, resource in Mairu::Account::"999999999999")
+when { context.tools.contains("ai-agent") };
+
+// Credentials whose real account is production need a fresh human check, whatever the role is called.
+@id("prod-by-real-account")
+forbid (principal, action == Mairu::Action::"UseCredentials", resource in Mairu::Account::"999999999999")
+unless { context.presence.verified && context.presence.scope == "request" };
+```
+
+Any program running as you can edit this file, so for now the agent applies only its `forbid` policies, on top of the built-in policies. A `forbid` can only take permissions away, so it takes effect as soon as you save it, on hardened and unhardened agents alike; on an unhardened agent that is how you deny a role. `permit` policies are written but ignored until approving a policy is supported. A file that does not parse is ignored as a whole, and a `forbid` that fails validation is dropped; `mairu policy show` lists both.
+
+- `mairu policy init [--force]` writes templates: the hardened built-in policies with comments, and a minimal `authorization.json`.
+- `mairu policy check` validates both files locally, lists every policy, and flags each `permit` that can apply without a human check or depends on a tool label.
+- `mairu policy show` prints what the agent has in force, and why anything was ignored.
+- `mairu policy explain <server> <role> [--tool LABEL] [--exec CMD] [--cwd PATH] [--assume-role ARN] [--age SECS] [--idle SECS]` prints what the policy decides with no check, under a lease, under a session grant, and after a fresh check.
+- `mairu policy schema` prints the schema, for `cedar validate --schema` and similar tools.
+
+A request has `Mairu::User` as principal, `Mairu::Action::"AssumeRole"` (before fetching) or `"UseCredentials"` (once the credentials' real identity is known) as action, and `Mairu::Role::"<server>:<role>"` as resource, which is `in` its `Mairu::Server` and the `Mairu::Account` it names. Not all of `context` is equally trustworthy:
+
+| Attributes | Determined by | Use them to |
+|---|---|---|
+| `presence`, `hardened`, `session`, `tty`, `caller` | the agent | grant |
+| `intent`, `exec_command`, `exec_command_line`, `cwd`, `chained_role_arn` | whoever runs mairu | narrow a `permit` that also requires `context.presence.verified`, or `forbid` |
+| `tools`, `tool_matches` | names any program can produce or avoid | restrict, or grant knowingly |
+
+Callers without a terminal, such as IDEs running `credential-process`, are asked about once an hour under the built-in policies. Once a policy can be approved, this relaxes that for them:
+
+```cedar
+// IDEs and other callers without a tty: reuse a grant for up to 1 hour idle.
+@id("tty-less-callers-1h-idle")
+permit (principal, action == Mairu::Action::"AssumeRole", resource)
+when {
+  !context.tools.contains("ai-agent") &&
+  context.presence.verified &&
+  context.session == "parent" &&
+  context.presence.scope == "session" &&
+  context.presence.idle <= 3600 &&
+  context.presence.age <= 43200
+};
+```
+
+Settings that are not policies live in `~/.config/mairu/authorization.json`. Unknown fields are rejected, and while the file is unapproved only what tightens applies:
+
+```json
+{
+  "version": 1,
+  "tool_detection": {
+    "ai-agent": {"process_names": ["my-agent"], "env_names": ["MY_AGENT_ACTIVE"]},
+    "ci": {"env_names": ["CI", "GITHUB_ACTIONS"]}
+  },
+  "grant_retention_secs": 3600
+}
+```
+
+- `tool_detection` adds labels, or names to the built-in `ai-agent` label, for `context.tools`.
+- `grant_retention_secs` bounds how long an approval is kept at all; the default and maximum is 43200.
+- `methods`, `sts` (the STS region and endpoint) and `network` (`proxy` and `extra_roots`) are accepted and validated, but ignored until the file is approved.
+
 ### Tmux over SSH
 
 Without a desktop session, as over SSH or in tmux, polkit has no authentication agent to show a dialog. mairu then runs polkit's own text agent, `/usr/bin/pkttyagent`, for itself on its terminal, and polkit asks for your login password right there:
