@@ -4,11 +4,16 @@
 const SCHEMA: &str = include_str!("mairu.cedarschema");
 const BUILTIN_HUMAN: &str = include_str!("builtin/human.cedar");
 const BUILTIN_UNHARDENED: &str = include_str!("builtin/unhardened.cedar");
+const BUILTIN_ALWAYS_ON: &str = include_str!("builtin/always_on.cedar");
 
 /// Policy ids starting with this are reserved for the built-in policies.
 pub const BUILTIN_PREFIX: &str = "builtin-";
 
+/// Refuses credentials whose real account differs from the one the role name declares.
+pub const POLICY_CALLER_ACCOUNT_MISMATCH: &str = "builtin-caller-account-mismatch";
+
 const ACTION_ASSUME_ROLE: &str = r#"Mairu::Action::"AssumeRole""#;
+const ACTION_USE_CREDENTIALS: &str = r#"Mairu::Action::"UseCredentials""#;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
@@ -24,7 +29,17 @@ pub enum PolicyError {
 pub struct Engine {
     schema: cedar_policy::Schema,
     policies: cedar_policy::PolicySet,
-    action: cedar_policy::EntityUid,
+    assume_role: cedar_policy::EntityUid,
+    use_credentials: cedar_policy::EntityUid,
+}
+
+/// The gate a request is decided at.
+#[derive(Debug, Clone, Copy)]
+pub enum Action<'a> {
+    /// Gate 1, before anything is fetched.
+    AssumeRole,
+    /// Gate 2, before vending credentials of this caller.
+    UseCredentials(&'a crate::caller_identity::Caller),
 }
 
 impl std::fmt::Debug for Engine {
@@ -45,21 +60,14 @@ impl Engine {
         })
     }
 
-    /// Parses policies whose ids come from their `@id` annotations, and validates them in strict mode.
+    /// Parses policies whose ids come from their `@id` annotations, joins the always-on built-ins, and validates
+    /// them in strict mode.
     pub fn new(source: &str) -> Result<Self, PolicyError> {
         let (schema, _warnings) = cedar_policy::Schema::from_cedarschema_str(SCHEMA)
             .map_err(|e| PolicyError::Schema(e.to_string()))?;
-        let parsed: cedar_policy::PolicySet = source
-            .parse()
-            .map_err(|e: cedar_policy::ParseErrors| PolicyError::Parse(e.to_string()))?;
         let mut policies = cedar_policy::PolicySet::new();
-        for policy in parsed.policies() {
-            let id = policy.annotation("id").ok_or_else(|| {
-                PolicyError::Parse(format!("a policy lacks an @id annotation: {policy}"))
-            })?;
-            policies
-                .add(policy.new_id(cedar_policy::PolicyId::new(id)))
-                .map_err(|e| PolicyError::Parse(e.to_string()))?;
+        for source in [source, BUILTIN_ALWAYS_ON] {
+            Self::add_policies(&mut policies, source)?;
         }
         let validation = cedar_policy::Validator::new(schema.clone())
             .validate(&policies, cedar_policy::ValidationMode::Strict);
@@ -70,14 +78,34 @@ impl Engine {
                 .collect();
             return Err(PolicyError::Validation(errors.join("; ")));
         }
-        let action = ACTION_ASSUME_ROLE
-            .parse()
-            .map_err(|e: cedar_policy::ParseErrors| PolicyError::Schema(e.to_string()))?;
+        let action = |uid: &str| {
+            uid.parse()
+                .map_err(|e: cedar_policy::ParseErrors| PolicyError::Schema(e.to_string()))
+        };
         Ok(Self {
             schema,
             policies,
-            action,
+            assume_role: action(ACTION_ASSUME_ROLE)?,
+            use_credentials: action(ACTION_USE_CREDENTIALS)?,
         })
+    }
+
+    fn add_policies(
+        policies: &mut cedar_policy::PolicySet,
+        source: &str,
+    ) -> Result<(), PolicyError> {
+        let parsed: cedar_policy::PolicySet = source
+            .parse()
+            .map_err(|e: cedar_policy::ParseErrors| PolicyError::Parse(e.to_string()))?;
+        for policy in parsed.policies() {
+            let id = policy.annotation("id").ok_or_else(|| {
+                PolicyError::Parse(format!("a policy lacks an @id annotation: {policy}"))
+            })?;
+            policies
+                .add(policy.new_id(cedar_policy::PolicyId::new(id)))
+                .map_err(|e| PolicyError::Parse(e.to_string()))?;
+        }
+        Ok(())
     }
 
     pub fn policy_ids(&self) -> Vec<String> {
@@ -87,14 +115,19 @@ impl Engine {
             .collect()
     }
 
-    /// The entities of a request; built once and evaluated with each candidate presence.
-    pub fn prepare(&self, facts: &Facts) -> Result<Prepared, String> {
+    /// The entities of a request at a gate; built once and evaluated with each candidate presence. At gate 2 the
+    /// role's `Account` parent is the caller's real account, while `account_id` stays the declared one.
+    pub fn prepare(&self, facts: &Facts, action: Action<'_>) -> Result<Prepared, String> {
         let principal = entity_uid("Mairu::User", &facts.uid.to_string())?;
         let resource = entity_uid(
             "Mairu::Role",
             &format!("{}:{}", facts.server_id, facts.role),
         )?;
         let account_id = account_id(&facts.role);
+        let parent_account = match action {
+            Action::AssumeRole => account_id.clone(),
+            Action::UseCredentials(caller) => Some(caller.account.clone()),
+        };
 
         let mut entities = vec![
             serde_json::json!({
@@ -113,13 +146,15 @@ impl Engine {
             "server": {"__entity": {"type": "Mairu::Server", "id": facts.server_id}},
         });
         let mut parents = vec![serde_json::json!({"type": "Mairu::Server", "id": facts.server_id})];
-        if let Some(account) = &account_id {
+        if let Some(account) = &parent_account {
             entities.push(serde_json::json!({
                 "uid": {"type": "Mairu::Account", "id": account},
                 "attrs": {},
                 "parents": [],
             }));
             parents.push(serde_json::json!({"type": "Mairu::Account", "id": account}));
+        }
+        if let Some(account) = &account_id {
             role_attrs["account_id"] = serde_json::Value::from(account.clone());
         }
         entities.push(serde_json::json!({
@@ -148,8 +183,16 @@ impl Engine {
                 context.insert(key.to_owned(), v.clone().into());
             }
         }
+        let action = match action {
+            Action::AssumeRole => self.assume_role.clone(),
+            Action::UseCredentials(caller) => {
+                context.insert("caller".to_owned(), caller.to_json());
+                self.use_credentials.clone()
+            }
+        };
         Ok(Prepared {
             principal,
+            action,
             resource,
             entities,
             context,
@@ -162,13 +205,13 @@ impl Engine {
         context.insert("presence".to_owned(), presence.to_json());
         let request = cedar_policy::Context::from_json_value(
             serde_json::Value::Object(context),
-            Some((&self.schema, &self.action)),
+            Some((&self.schema, &prepared.action)),
         )
         .map_err(|e| e.to_string())
         .and_then(|context| {
             cedar_policy::Request::new(
                 prepared.principal.clone(),
-                self.action.clone(),
+                prepared.action.clone(),
                 prepared.resource.clone(),
                 context,
                 Some(&self.schema),
@@ -268,6 +311,7 @@ pub struct Facts {
 /// A request's entities and the context apart from `presence`.
 pub struct Prepared {
     principal: cedar_policy::EntityUid,
+    action: cedar_policy::EntityUid,
     resource: cedar_policy::EntityUid,
     entities: cedar_policy::Entities,
     context: serde_json::Map<String, serde_json::Value>,
@@ -277,6 +321,7 @@ impl std::fmt::Debug for Prepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Prepared")
             .field("principal", &self.principal)
+            .field("action", &self.action)
             .field("resource", &self.resource)
             .finish()
     }
@@ -398,7 +443,7 @@ mod tests {
     }
 
     fn allowed(engine: &Engine, presence: Presence) -> bool {
-        let prepared = engine.prepare(&facts()).unwrap();
+        let prepared = engine.prepare(&facts(), Action::AssumeRole).unwrap();
         let eval = engine.evaluate(&prepared, &presence);
         assert!(eval.errors.is_empty(), "{:?}", eval.errors);
         eval.allowed
@@ -406,13 +451,26 @@ mod tests {
 
     #[test]
     fn test_builtins_validate() {
+        let sorted = |engine: Engine| {
+            let mut ids = engine.policy_ids();
+            ids.sort();
+            ids
+        };
         assert_eq!(
-            Engine::builtin(true).unwrap().policy_ids(),
-            vec!["builtin-human"]
+            sorted(Engine::builtin(true).unwrap()),
+            vec![
+                "builtin-caller-account-mismatch",
+                "builtin-human",
+                "builtin-use-credentials"
+            ]
         );
         assert_eq!(
-            Engine::builtin(false).unwrap().policy_ids(),
-            vec!["builtin-unhardened"]
+            sorted(Engine::builtin(false).unwrap()),
+            vec![
+                "builtin-caller-account-mismatch",
+                "builtin-unhardened",
+                "builtin-use-credentials"
+            ]
         );
     }
 
@@ -467,7 +525,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let prepared = engine.prepare(&facts()).unwrap();
+        let prepared = engine.prepare(&facts(), Action::AssumeRole).unwrap();
         let eval = engine.evaluate(&prepared, &Presence::none());
         assert!(!eval.allowed);
         assert_eq!(eval.forbids, vec!["no-admin"]);
@@ -486,7 +544,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let prepared = engine.prepare(&facts()).unwrap();
+        let prepared = engine.prepare(&facts(), Action::AssumeRole).unwrap();
         let eval = engine.evaluate(
             &prepared,
             &Presence::remembered(Scope::Session, "platform", 1, 0),
@@ -521,8 +579,113 @@ mod tests {
         assert!(allowed(&engine, Presence::none()));
         let mut f = facts();
         f.role = "arn:aws:iam::210987654321:role/Admin".to_owned();
-        let prepared = engine.prepare(&f).unwrap();
+        let prepared = engine.prepare(&f, Action::AssumeRole).unwrap();
         assert!(!engine.evaluate(&prepared, &Presence::none()).allowed);
+    }
+
+    fn caller(account: &str) -> crate::caller_identity::Caller {
+        crate::caller_identity::Caller::new(
+            account.to_owned(),
+            format!("arn:aws:sts::{account}:assumed-role/Admin/alice"),
+            "AROAEXAMPLE:alice".to_owned(),
+        )
+    }
+
+    fn evaluate_at_gate2(
+        engine: &Engine,
+        f: &Facts,
+        account: &str,
+        presence: Presence,
+    ) -> Evaluation {
+        let caller = caller(account);
+        let prepared = engine.prepare(f, Action::UseCredentials(&caller)).unwrap();
+        let eval = engine.evaluate(&prepared, &presence);
+        assert!(eval.errors.is_empty(), "{:?}", eval.errors);
+        eval
+    }
+
+    #[test]
+    fn test_gate2_builtins() {
+        let engine = Engine::builtin(true).unwrap();
+        // Open by default, even without any presence.
+        assert!(evaluate_at_gate2(&engine, &facts(), "123456789012", Presence::none()).allowed);
+        // The declared account differs from the real one.
+        let eval = evaluate_at_gate2(
+            &engine,
+            &facts(),
+            "999999999999",
+            Presence::fresh("platform"),
+        );
+        assert!(!eval.allowed);
+        assert_eq!(eval.forbids, vec![POLICY_CALLER_ACCOUNT_MISMATCH]);
+        // An opaque role name declares no account, so any real account passes.
+        let mut f = facts();
+        f.role = "admin".to_owned();
+        assert!(evaluate_at_gate2(&engine, &f, "999999999999", Presence::none()).allowed);
+        // builtin-human applies only at gate 1.
+        let prepared = engine.prepare(&f, Action::AssumeRole).unwrap();
+        assert!(!engine.evaluate(&prepared, &Presence::none()).allowed);
+    }
+
+    const PROD_BY_REAL_ACCOUNT: &str = r#"
+        @id("allow") permit (principal, action == Mairu::Action::"AssumeRole", resource);
+        @id("prod-by-real-account")
+        forbid (principal, action == Mairu::Action::"UseCredentials", resource in Mairu::Account::"999999999999")
+        unless { context.presence.verified && context.presence.scope == "request" };
+    "#;
+
+    #[test]
+    fn test_gate2_real_account_parent() {
+        let engine = Engine::new(PROD_BY_REAL_ACCOUNT).unwrap();
+        let mut f = facts();
+        f.role = "admin".to_owned();
+        let eval = evaluate_at_gate2(
+            &engine,
+            &f,
+            "999999999999",
+            Presence::remembered(Scope::Session, "platform", 10, 10),
+        );
+        assert!(!eval.allowed);
+        assert_eq!(eval.forbids, vec!["prod-by-real-account"]);
+        assert!(
+            evaluate_at_gate2(&engine, &f, "999999999999", Presence::fresh("platform")).allowed
+        );
+        assert!(evaluate_at_gate2(&engine, &f, "111111111111", Presence::none()).allowed);
+        // Gate 1 sees no account for an opaque role name, and the forbid names only gate 2.
+        let prepared = engine.prepare(&f, Action::AssumeRole).unwrap();
+        assert!(engine.evaluate(&prepared, &Presence::none()).allowed);
+    }
+
+    #[test]
+    fn test_unconstrained_action_applies_at_both_gates() {
+        let engine = Engine::new(
+            r#"
+            @id("allow") permit (principal, action, resource);
+            @id("no-prod") forbid (principal, action, resource in Mairu::Account::"999999999999");
+            "#,
+        )
+        .unwrap();
+        let mut f = facts();
+        f.role = "admin".to_owned();
+        let prepared = engine.prepare(&f, Action::AssumeRole).unwrap();
+        assert!(engine.evaluate(&prepared, &Presence::none()).allowed);
+        let eval = evaluate_at_gate2(&engine, &f, "999999999999", Presence::none());
+        assert_eq!(eval.forbids, vec!["no-prod"]);
+    }
+
+    #[test]
+    fn test_caller_attributes() {
+        let engine = Engine::new(
+            r#"
+            @id("allow") permit (principal, action, resource);
+            @id("no-alice") forbid (principal, action, resource)
+            when { context has caller && context.caller.type == "assumed-role" &&
+                   context.caller has session_name && context.caller.session_name == "alice" };
+            "#,
+        )
+        .unwrap();
+        let eval = evaluate_at_gate2(&engine, &facts(), "123456789012", Presence::none());
+        assert_eq!(eval.forbids, vec!["no-alice"]);
     }
 
     #[test]

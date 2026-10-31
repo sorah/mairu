@@ -140,7 +140,6 @@ impl crate::proto::agent_server::Agent for Agent {
         request: tonic::Request<AssumeRoleRequest>,
     ) -> Result<tonic::Response<AssumeRoleResponse>, tonic::Status> {
         Self::require_trusted(&request)?;
-        use crate::client::CredentialVendor;
 
         let query = &request.get_ref().server_id;
         let cacheable = request.get_ref().cached;
@@ -178,93 +177,31 @@ impl crate::proto::agent_server::Agent for Agent {
             return Err(tonic::Status::unauthenticated("authentication needed"));
         };
 
-        // tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-        if cacheable && let Some(cache) = session.credential_cache.get(&rolespec) {
-            tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, assume_role = ?rolespec.assume_role, aws_access_key_id = ?cache.credentials.access_key_id, ext = ?cache.credentials.mairu, "Vending credentials from cache");
-            authorized.vended(Some(cache.credentials.expiration));
-            return Ok(tonic::Response::new(cache.credentials.as_ref().into()));
-        }
-
-        let has_next_role = rolespec.assume_role.is_some();
-        let base_rolespec = rolespec.base();
-
-        let first_hop_cache = if cacheable {
-            session.credential_cache.get(&base_rolespec)
-        } else {
-            None
-        };
-
-        let (session, first_hop) = match first_hop_cache {
-            Some(cached_first_hop) => {
-                tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Using cached first-hop credentials for assume_next_role");
-                (session, Ok(cached_first_hop.credentials.as_ref().clone()))
+        let cache = session.credential_cache.clone();
+        let server_id = session.token.server.id().to_owned();
+        let server_url = session.token.server.url.clone();
+        // Gate 2 runs inside, with the caller identity of whatever is about to be vended.
+        let obtained = self
+            .authorizer
+            .obtain(authorized, &cache, &rolespec, cacheable, || {
+                self.fetch_credentials(session, &rolespec, cacheable)
+            })
+            .await?;
+        let credentials = &obtained.credentials;
+        let caller_arn = obtained.caller.as_ref().map(|c| c.arn.as_str());
+        match obtained.source {
+            crate::authorization::Source::Cache => {
+                tracing::info!(server_id, server_url = %server_url, role = ?role, assume_role = ?rolespec.assume_role, aws_access_key_id = ?credentials.access_key_id, caller_arn, ext = ?credentials.mairu, "Vending credentials from cache")
             }
-            None => {
-                tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Obtaining credentials from server");
-                let session = self.ensure_session_freshness(session).await;
-                let client =
-                    crate::client::make_credential_vendor(&session).map_err(|e| {
-                        tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, err = ?e, "Failed to make_credential_vendor");
-                        tonic::Status::internal(e.to_string())
-                    })?;
-                let r = client.assume_role(&base_rolespec.role).await;
-                if cacheable && let Ok(ref body) = r {
-                    session.credential_cache.store(base_rolespec, body);
-                }
-                (session, r)
+            crate::authorization::Source::Held => {
+                tracing::info!(server_id, server_url = %server_url, role = ?role, assume_role = ?rolespec.assume_role, aws_access_key_id = ?credentials.access_key_id, caller_arn, ext = ?credentials.mairu, "Vending credentials held for a retried authorization")
             }
-        };
-
-        match first_hop {
-            Ok(r) => {
-                let final_credentials = if has_next_role {
-                    tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, assume_role = ?rolespec.assume_role, aws_access_key_id = ?r.access_key_id, ext = ?r.mairu, "calling sts:AssumeRole to the next role using the first hop credentials");
-                    let region = session
-                        .token
-                        .server
-                        .aws_sso
-                        .as_ref()
-                        .map(|s| s.region.as_str());
-                    let second_hop =
-                        assume_next_role(&r, rolespec.assume_role.as_ref().unwrap(), region)
-                            .await?;
-                    if request.get_ref().cached {
-                        session
-                            .credential_cache
-                            .store(rolespec.clone(), &second_hop);
-                    }
-                    second_hop
-                } else {
-                    r
-                };
-                tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, assume_role = ?rolespec.assume_role, aws_access_key_id = ?final_credentials.access_key_id, ext = ?final_credentials.mairu, "Vending credentials");
-                authorized.vended(Some(final_credentials.expiration));
-                Ok(tonic::Response::new((&final_credentials).into()))
-            }
-            Err(crate::Error::RemoteError(crate::client::Error::InvalidArgument(message, _))) => {
-                Err(tonic::Status::invalid_argument(message))
-            }
-            Err(crate::Error::RemoteError(crate::client::Error::Unauthenticated(message, _))) => {
-                Err(tonic::Status::unauthenticated(message))
-            }
-            Err(crate::Error::RemoteError(crate::client::Error::PermissionDenied(message, _))) => {
-                Err(tonic::Status::permission_denied(message))
-            }
-            Err(crate::Error::RemoteError(crate::client::Error::ResourceExhausted(message, _))) => {
-                Err(tonic::Status::resource_exhausted(message))
-            }
-            Err(crate::Error::RemoteError(crate::client::Error::NotFound(message, _))) => {
-                Err(tonic::Status::not_found(message))
-            }
-            Err(crate::Error::RemoteError(crate::client::Error::Unknown(message, _))) => {
-                Err(tonic::Status::unknown(message))
-            }
-            Err(e) => {
-                tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, err = ?e, "assume-role API returned error");
-                Err(tonic::Status::unknown(e.to_string()))
+            crate::authorization::Source::Fetched => {
+                tracing::info!(server_id, server_url = %server_url, role = ?role, assume_role = ?rolespec.assume_role, aws_access_key_id = ?credentials.access_key_id, caller_arn, ext = ?credentials.mairu, "Vending credentials")
             }
         }
+        obtained.authorized.vended(Some(credentials.expiration));
+        Ok(tonic::Response::new(credentials.as_ref().into()))
     }
 
     #[tracing::instrument(skip_all)]
@@ -749,6 +686,92 @@ impl Agent {
             .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Credentials for `rolespec` from the credential server, plus `sts:AssumeRole` for a chained role. Only the
+    /// first hop of a chain is cached here; the caller caches what it vends.
+    async fn fetch_credentials(
+        &self,
+        session: crate::session_manager::Session,
+        rolespec: &crate::proto::Rolespec,
+        cacheable: bool,
+    ) -> Result<crate::client::AssumeRoleResponse, tonic::Status> {
+        use crate::client::CredentialVendor;
+        let role = &rolespec.role;
+        let has_next_role = rolespec.assume_role.is_some();
+        let base_rolespec = rolespec.base();
+
+        let first_hop_cache = if cacheable && has_next_role {
+            session.credential_cache.get(&base_rolespec)
+        } else {
+            None
+        };
+
+        let (session, first_hop) = match first_hop_cache {
+            Some(cached_first_hop) => {
+                tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Using cached first-hop credentials for assume_next_role");
+                (session, Ok(cached_first_hop.credentials.as_ref().clone()))
+            }
+            None => {
+                tracing::debug!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, "Obtaining credentials from server");
+                let session = self.ensure_session_freshness(session).await;
+                let client =
+                    crate::client::make_credential_vendor(&session).map_err(|e| {
+                        tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, err = ?e, "Failed to make_credential_vendor");
+                        tonic::Status::internal(e.to_string())
+                    })?;
+                let r = client.assume_role(&base_rolespec.role).await;
+                if cacheable
+                    && has_next_role
+                    && let Ok(ref body) = r
+                {
+                    session.credential_cache.store(
+                        base_rolespec,
+                        std::sync::Arc::new(body.clone()),
+                        None,
+                    );
+                }
+                (session, r)
+            }
+        };
+
+        match first_hop {
+            Ok(r) => {
+                if !has_next_role {
+                    return Ok(r);
+                }
+                tracing::info!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, assume_role = ?rolespec.assume_role, aws_access_key_id = ?r.access_key_id, ext = ?r.mairu, "calling sts:AssumeRole to the next role using the first hop credentials");
+                let region = session
+                    .token
+                    .server
+                    .aws_sso
+                    .as_ref()
+                    .map(|s| s.region.as_str());
+                assume_next_role(&r, rolespec.assume_role.as_ref().unwrap(), region).await
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::InvalidArgument(message, _))) => {
+                Err(tonic::Status::invalid_argument(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::Unauthenticated(message, _))) => {
+                Err(tonic::Status::unauthenticated(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::PermissionDenied(message, _))) => {
+                Err(tonic::Status::permission_denied(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::ResourceExhausted(message, _))) => {
+                Err(tonic::Status::resource_exhausted(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::NotFound(message, _))) => {
+                Err(tonic::Status::not_found(message))
+            }
+            Err(crate::Error::RemoteError(crate::client::Error::Unknown(message, _))) => {
+                Err(tonic::Status::unknown(message))
+            }
+            Err(e) => {
+                tracing::error!(server_id = ?session.token.server.id(), server_url = %session.token.server.url, role = ?role, err = ?e, "assume-role API returned error");
+                Err(tonic::Status::unknown(e.to_string()))
+            }
+        }
     }
 
     /// Refresh session if necessary and able to do so, using refresh_token.

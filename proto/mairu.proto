@@ -246,6 +246,8 @@ message AuthorizationError {
   Reason reason = 1;
   string detail = 2;
   repeated string policy_ids = 4;        // @id of the determining forbid policies, for REASON_FORBIDDEN
+  string gate = 6;                       // "assume-role" (gate 1) or "use-credentials" (gate 2)
+  string caller_arn = 7;                 // gate 2: the identity the credentials carry
 }
 
 //----- The following is used for mairu-exec subprocess IPC

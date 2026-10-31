@@ -1,4 +1,6 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // minimum_versions() names its own input, which turns off Cargo's default of rerunning on any change.
+    println!("cargo:rerun-if-changed=proto");
     tonic_prost_build::configure()
         .message_attribute("mairu.Credentials", "#[derive(zeroize::ZeroizeOnDrop)]")
         .field_attribute("mairu.Credentials.expiration", "#[zeroize(skip)]")

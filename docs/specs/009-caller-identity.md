@@ -396,18 +396,31 @@ message AuthorizationError {
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented on `hardening/caller-identity`. Gate 2 under the built-in policies verified in Docker against a fake credential server and a fake STS behind a test CA; gate-2 prompts need a user policy (011) and are unit-tested only (see Updates).
 
 ### Checklist
 
-- [ ] `sts:GetCallerIdentity` with the agent's fixed client configuration; environment overrides ignored on hardened agents
-- [ ] Caller identity cached with the credentials; nothing cached when it cannot be obtained
-- [ ] `UseCredentials` action, `Caller` type and `context.caller` in the schema
-- [ ] Gate 2 in `assume_role`, for every vend; the gate-1 presence as a candidate; leases and grants recorded at gate 2
-- [ ] Always-on built-ins: `builtin-use-credentials`, `builtin-caller-account-mismatch`
-- [ ] Held credentials for retried gate-2 checks (60 s)
-- [ ] `AuthorizationError.gate` and `caller_arn`; identity line in the client and `caller` in polkit details
+- [x] `sts:GetCallerIdentity` with the agent's fixed client configuration; environment overrides ignored on hardened agents
+- [x] Caller identity cached with the credentials; nothing cached when it cannot be obtained
+- [x] `UseCredentials` action, `Caller` type and `context.caller` in the schema
+- [x] Gate 2 in `assume_role`, for every vend; the gate-1 presence as a candidate; leases and grants recorded at gate 2
+- [x] Always-on built-ins: `builtin-use-credentials`, `builtin-caller-account-mismatch`
+- [x] Held credentials for retried gate-2 checks (60 s)
+- [x] `AuthorizationError.gate` and `caller_arn`; identity line in the client and `caller` in polkit details
 
 ### Updates
 
 - 2026-10-29: Split out of hardening.md, policy.md and platform-helper.md.
+- 2026-10-31: Implemented. Decisions and deviations:
+  - `Authorizer::obtain` runs everything after gate 1: held credentials, then the cache, then the agent's fetch (credential server plus `sts:AssumeRole`), then the caller identity and gate 2, and caches the credentials with their caller only once gate 2 permits. `agent.rs` passes the fetch as a closure, so the unit tests drive the real sequence with a fake fetch and a fake STS (`caller_identity::Identify`).
+  - The cache entry's caller is `Option<Caller>`. An unhardened agent skips gate 2 and never calls STS, so its entries have none. The first hop of a chain is still cached right after it is fetched, before anyone asks who it belongs to; when such an entry is later vended directly, gate 2 asks STS once and records the answer in the entry. When that call fails the entry stays (it is still needed for chaining) but is not vended.
+  - The STS client is built from `aws_sdk_sts::Config::builder()` with region `us-east-1`, endpoint `https://sts.amazonaws.com`, static credentials, the SDK's default HTTPS client (rustls with `rustls-native-certs`, the system roots) and a 15 s operation timeout. It is used only by hardened agents. The test that `AWS_ENDPOINT_URL_STS`, `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_PROFILE`, `AWS_CONFIG_FILE` and the FIPS/dual-stack switches are ignored runs in a child test process, since setting variables in the multi-threaded test binary would race with other tests.
+  - `Engine::new` joins the always-on built-ins to every policy set, including the unhardened one, where gate 2 never runs; they only apply to `UseCredentials`.
+  - A gate-2 prompt has its own coalescing key (SHA-256 of `"UseCredentials\0"` and the request digest), so it never shares a gate-1 prompt for the same request. Its polkit `message` gains the identity (`… (999999999999 assumed-role/Admin)`), and `details` gain `caller` (`<account> <arn>`). `polkit.rs` needs no change: it forwards `details` as before, which polkit accepts only from root (007), so with the helper running as the user `caller` reaches the agent's request but not polkit.
+  - Held credentials are kept only after `REASON_NO_AUTHENTICATION_AGENT`, the one status a client retries after. They are taken (removed) by the next `obtain` for the key, dropped when gate 1 refuses that key, swept after 60 s, and dropped by `RevokeAuthorizations` (all of them, or those of the caller's session for `SCOPE_CALLER_SESSION`).
+  - The identity line: a client learns the caller only from the gate-2 refusal, so it prints `identity: <account> <type>/<role>` in the `pkttyagent` password notice of the retry (`polkit_tty_agent::with_fallback` now builds the notice from the refusal). The "Authorization may be required" lines printed while a request is pending cannot tell which gate is asking and stay as in 007. A failed fallback (no terminal, untrusted `pkttyagent`) keeps the refusal's gate and caller.
+  - Refusal messages: gate-2 refusals are prefixed `refused at use-credentials: ` and end with `(credentials of <arn>)` unless the detail already names it; gate-1 messages are unchanged. The mismatch detail is `credentials belong to <account> (<arn>), not to the account the role name declares (<declared>)`. `REASON_UNAVAILABLE` at gate 2 without a caller reads "the identity of the credentials could not be checked", followed by the STS error, instead of "no method could ask for approval".
+  - Decisions are logged with `gate`, the `caller_arn` at gate 2, and the scope of the presence that permitted. Vends are logged with their source (cache, held, fetched) and caller ARN.
+  - `build.rs` now declares `rerun-if-changed=proto`: its `rerun-if-changed=Cargo.toml` had turned off Cargo's default, so proto edits did not regenerate code.
+  - Verified in Docker as root (scenario `009-caller-identity`, 26 checks): a hardened agent with a fake credential server (OAuth device code, `assume-role`) and a fake STS on 127.0.0.1:443 as `cred.test` and `sts.amazonaws.com`, trusted through a test CA added with `update-ca-certificates`. An opaque role name is vended after one `GetCallerIdentity` signed for `us-east-1/sts` at `sts.amazonaws.com`, even with `AWS_ENDPOINT_URL_STS`, `AWS_ENDPOINT_URL`, `AWS_REGION` and `AWS_PROFILE` in the client's environment, and gate 2 adds no polkit check; the agent log shows both gates with the caller ARN; a second vend comes from the cache with no fetch and no STS call; `123456789012/Admin` whose credentials belong to 999999999999 is refused with the mismatch message, and the next request fetches and asks STS again; a matching declared account is vended; an STS error is refused with the error and nothing cached, and the next request fetches and asks again (an IAM user caller); after `mairu lock` gate 1 asks again while the cached caller still needs no STS call; an unhardened agent vends a mismatching account and makes no STS call. Scenarios 003, 004, 005-install, 005-ci-script, 006, 007 and 008 still pass.
+  - Not verified end to end: the built-in policies never ask at gate 2, so a gate-2 prompt, the gate-1 presence counting at gate 2 (`prod-by-real-account`), pre-fetches at gate 2, held credentials for a `pkttyagent` retry and the identity line need a user policy (011). They are covered by unit tests with a fake STS and a mock platform. A real STS, other partitions and VPC endpoints were not tried (no network).

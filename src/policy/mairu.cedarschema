@@ -37,7 +37,19 @@ namespace Mairu {
     idle: Long
   };
 
-  action AssumeRole appliesTo {
+  // The identity the credentials really carry, from sts:GetCallerIdentity.
+  type Caller = {
+    account: String,
+    arn: String,
+    user_id: String,
+    // "assumed-role", "user", "federated-user", "root" or "other".
+    type: String,
+    role_name?: String,
+    session_name?: String
+  };
+
+  // AssumeRole is gate 1, before fetching; UseCredentials is gate 2, before vending.
+  action AssumeRole, UseCredentials appliesTo {
     principal: [User],
     resource: [Role],
     context: {
@@ -52,7 +64,9 @@ namespace Mairu {
       exec_command?: String,
       exec_command_line?: String,
       cwd?: String,
-      chained_role_arn?: String
+      chained_role_arn?: String,
+      // Present exactly at gate 2.
+      caller?: Caller
     }
   };
 }
