@@ -57,11 +57,21 @@ fn configured_http(
         builder = builder.proxy(reqwest::Proxy::all(proxy.as_str()).map_err(|e| e.to_string())?);
     }
     for pem in &settings.extra_roots {
-        builder = builder.add_root_certificate(
-            reqwest::Certificate::from_pem(pem.as_bytes()).map_err(|e| e.to_string())?,
-        );
+        builder = builder.add_root_certificate(extra_root(pem)?);
     }
     builder.build().map_err(|e| e.to_string())
+}
+
+// The rustls backend of reqwest accepts input without any certificate, so count them here.
+fn extra_root(pem: &str) -> Result<reqwest::Certificate, String> {
+    let mut certs =
+        reqwest::Certificate::from_pem_bundle(pem.as_bytes()).map_err(|e| e.to_string())?;
+    match certs.len() {
+        1 => Ok(certs.remove(0)),
+        n => Err(format!(
+            "an extra root must hold exactly one certificate, found {n}"
+        )),
+    }
 }
 
 fn configured_sdk(
