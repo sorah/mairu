@@ -275,7 +275,7 @@ pub async fn serve(uds: tokio::net::UnixListener) -> Result<(), anyhow::Error> {
     )
     .await;
     tracing::info!(platform_helper = helper.describe(), "Platform helper");
-    let agent = crate::agent::Agent::new(shutdown_tx, helper);
+    let agent = crate::agent::Agent::new(shutdown_tx, helper)?;
 
     tracing::info!("Agent server starting");
 

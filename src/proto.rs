@@ -41,23 +41,63 @@ impl Session {
 }
 
 impl AuthorizationError {
-    pub fn unverified_peer(detail: impl Into<String>) -> Self {
+    pub fn new(reason: authorization_error::Reason, detail: impl Into<String>) -> Self {
         Self {
-            reason: authorization_error::Reason::UnverifiedPeer.into(),
+            reason: reason.into(),
             detail: detail.into(),
+            policy_ids: vec![],
         }
     }
 
-    /// A non-OK status carrying this error in its binary details. The message repeats the detail for clients that
-    /// do not decode details.
+    pub fn unverified_peer(detail: impl Into<String>) -> Self {
+        Self::new(authorization_error::Reason::UnverifiedPeer, detail)
+    }
+
+    /// A non-OK status carrying this error in its binary details. The message repeats the detail, or the summary
+    /// without one, for clients that do not decode details.
     pub fn into_status(self) -> tonic::Status {
+        use authorization_error::Reason;
         use prost::Message;
         let code = match self.reason() {
-            authorization_error::Reason::UnverifiedPeer => tonic::Code::PermissionDenied,
-            authorization_error::Reason::Unspecified => tonic::Code::PermissionDenied,
+            Reason::Unavailable | Reason::NoAuthenticationAgent | Reason::PresenceRequired => {
+                tonic::Code::FailedPrecondition
+            }
+            Reason::Unspecified
+            | Reason::UnverifiedPeer
+            | Reason::Denied
+            | Reason::Forbidden
+            | Reason::NotPermitted => tonic::Code::PermissionDenied,
         };
-        let message = self.detail.clone();
+        let message = if self.detail.is_empty() {
+            self.user_message()
+        } else {
+            self.detail.clone()
+        };
         tonic::Status::with_details(code, message, self.encode_to_vec().into())
+    }
+
+    /// What a client prints for this refusal.
+    pub fn user_message(&self) -> String {
+        use authorization_error::Reason;
+        let summary = match self.reason() {
+            Reason::Unspecified | Reason::UnverifiedPeer => "the agent refused this request",
+            Reason::Denied => "authorization was denied, or the dialog was dismissed",
+            Reason::Forbidden => "refused by policy",
+            Reason::NotPermitted => "no policy permits this role, even after a human check",
+            Reason::Unavailable => "no method could ask for approval",
+            Reason::NoAuthenticationAgent => {
+                "polkit has no authentication agent for this process, for example outside a desktop session"
+            }
+            Reason::PresenceRequired => "a fresh approval is required",
+        };
+        let mut message = summary.to_owned();
+        if !self.policy_ids.is_empty() {
+            message.push_str(&format!(" (policies: {})", self.policy_ids.join(", ")));
+        }
+        if !self.detail.is_empty() {
+            message.push_str(&format!(": {}", self.detail));
+        }
+        message
     }
 
     pub fn from_status(status: &tonic::Status) -> Option<Self> {
@@ -98,6 +138,7 @@ impl AssumeRoleRequest {
             server_id,
             query: Some(assume_role_request::Query::Role(role)),
             cached,
+            client_context: None,
         }
     }
 }

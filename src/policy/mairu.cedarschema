@@ -1,0 +1,58 @@
+namespace Mairu {
+  // The local Unix user the agent runs for. Entity id: the uid.
+  entity User = {
+    name: String,
+    uid: Long
+  };
+
+  // A credential server from servers.d. Entity id: the server id.
+  entity Server = {
+    url: String
+  };
+
+  // An AWS account named by a role. Entity id: the 12-digit account id, shared across servers.
+  entity Account;
+
+  // A role on a server. Entity id: "<server id>:<role>".
+  // Parents: its Server, and its Account when the role names one.
+  entity Role in [Server, Account] = {
+    name: String,
+    server: Server,
+    account_id?: String
+  };
+
+  type Presence = {
+    // A human check covers this request.
+    verified: Bool,
+    // "none"; "request": checked for this very request; "process": the lease of this running
+    // `mairu exec`; "session": a grant for this terminal session.
+    scope: String,
+    // The method that performed the check, such as "platform"; absent when not verified.
+    method?: String,
+    // Seconds since the covering human check; 0 when not verified.
+    age: Long,
+    // Session grant: seconds since it was last used.
+    // Process lease: seconds since the credentials last obtained on demand expired (0 while valid).
+    // Otherwise 0.
+    idle: Long
+  };
+
+  action AssumeRole appliesTo {
+    principal: [User],
+    resource: [Role],
+    context: {
+      presence: Presence,
+      // "tty", "parent" or "none"; tty is the device path when "tty".
+      session: String,
+      tty?: String,
+      // Whether the agent runs hardened (003).
+      hardened: Bool,
+      // Reported by the client: truthful about what it will do, but chosen by whoever runs it.
+      intent: String,
+      exec_command?: String,
+      exec_command_line?: String,
+      cwd?: String,
+      chained_role_arn?: String
+    }
+  };
+}

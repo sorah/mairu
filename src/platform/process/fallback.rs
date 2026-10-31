@@ -96,6 +96,17 @@ impl crate::platform::ProcessPlatform for FallbackProcess {
         crate::proto::platform::PeerVerification::None
     }
 
+    fn session_identity(
+        &self,
+        _peer: &crate::platform::PeerIdentity,
+    ) -> Option<crate::platform::SessionIdentity> {
+        None
+    }
+
+    fn controlling_tty(&self, _peer: &crate::platform::PeerIdentity) -> Option<String> {
+        None
+    }
+
     fn notes(&self) -> Vec<String> {
         vec!["peer verification is not implemented on this platform".to_owned()]
     }

@@ -53,6 +53,11 @@ mod linux {
     const USERS_DIR: &str = "/var/lib/mairu/users";
     const INSTALLS: &str = "installs";
     const MANIFEST_NAME: &str = ".harden-manifest";
+    const POLKIT_ACTIONS_DIR: &str = "/usr/share/polkit-1/actions";
+    const POLKIT_ACTION_NAME: &str = "co.0w0.mairu.policy";
+    /// The one manifest entry outside the libexec directory.
+    const POLKIT_ACTION_PATH: &str = "/usr/share/polkit-1/actions/co.0w0.mairu.policy";
+    const POLKIT_ACTION: &str = include_str!("../../pkg/polkit/co.0w0.mairu.policy");
     const SETCAP: &[&str] = &["/usr/sbin/setcap", "/usr/bin/setcap"];
 
     /// The image to install, held in memory so that the bytes checked are the bytes written.
@@ -169,6 +174,7 @@ mod linux {
         set_ipc_lock_capability(&binary);
         let mut written = vec!["mairu".to_owned()];
         written.extend(install_helpers(&dir, &source.exe));
+        written.extend(install_polkit_action()?);
 
         prepare_state_dir(group.gid)?;
         write_manifest(&dir, &written)?;
@@ -402,6 +408,32 @@ mod linux {
         written
     }
 
+    /// Writes the polkit actions unless an identical file is there. Returns the manifest entry when written.
+    fn install_polkit_action() -> Result<Option<String>, anyhow::Error> {
+        let dir = std::path::Path::new(POLKIT_ACTIONS_DIR);
+        if !dir.is_dir() {
+            eprintln!(
+                "warning: {POLKIT_ACTIONS_DIR} does not exist; install polkit, or authorization prompts will be unavailable"
+            );
+            return Ok(None);
+        }
+        let path = dir.join(POLKIT_ACTION_NAME);
+        if std::fs::read(&path).is_ok_and(|c| c == POLKIT_ACTION.as_bytes()) {
+            println!("{} is up to date", path.display());
+            return Ok(None);
+        }
+        install_file(
+            dir,
+            POLKIT_ACTION_NAME,
+            POLKIT_ACTION.as_bytes(),
+            nix::unistd::Gid::from_raw(0),
+            0o644,
+        )
+        .with_context(|| format!("failed to install {}", path.display()))?;
+        println!("Installed {}", path.display());
+        Ok(Some(POLKIT_ACTION_PATH.to_owned()))
+    }
+
     fn prepare_state_dir(gid: nix::unistd::Gid) -> Result<(), anyhow::Error> {
         for path in [STATE_DIR, USERS_DIR] {
             let path = std::path::Path::new(path);
@@ -454,12 +486,18 @@ mod linux {
         Ok(parse_manifest(&std::fs::read_to_string(&manifest)?))
     }
 
-    /// Plain file names only, so that a manifest can never name a file outside its directory.
+    /// Plain file names, and the polkit action file, so that a manifest can never name any other file outside its
+    /// directory.
     fn parse_manifest(content: &str) -> Vec<String> {
         content
             .lines()
             .filter(|l| {
-                !l.is_empty() && *l != "." && *l != ".." && !l.contains('/') && !l.contains('\0')
+                *l == POLKIT_ACTION_PATH
+                    || (!l.is_empty()
+                        && *l != "."
+                        && *l != ".."
+                        && !l.contains('/')
+                        && !l.contains('\0'))
             })
             .map(ToOwned::to_owned)
             .collect()
@@ -517,11 +555,17 @@ mod linux {
         purge: bool,
     ) -> Result<(), anyhow::Error> {
         let dir = home.libexec_dir();
+        let home_entry = home.path.to_string_lossy().into_owned();
+        let other_installs = read_installs().iter().any(|e| *e != home_entry);
         if dir.try_exists()? {
             let entries = read_manifest(&dir).map_err(|e| {
                 anyhow::anyhow!("refusing to use the manifest in {}: {e}", dir.display())
             })?;
             for name in entries {
+                if name == POLKIT_ACTION_PATH && other_installs {
+                    println!("Left {name} in place for the other hardened copies");
+                    continue;
+                }
                 let path = dir.join(&name);
                 match std::fs::remove_file(&path) {
                     Ok(()) => println!("Removed {}", path.display()),
@@ -599,6 +643,16 @@ mod linux {
             assert!(group_has_password("mairu", "$6$abc$def", None));
             assert!(!group_has_password("mairu", "", None));
             assert!(!group_has_password("mairu", "!", None));
+        }
+
+        #[test]
+        fn test_parse_manifest_polkit_action() {
+            assert_eq!(
+                parse_manifest(&format!(
+                    "mairu\n{POLKIT_ACTION_PATH}\n/usr/share/polkit-1/actions/other.policy\n"
+                )),
+                vec!["mairu", POLKIT_ACTION_PATH]
+            );
         }
 
         #[test]

@@ -30,8 +30,10 @@ section = "utils"
 default-features = false
 features = ["rustls"]
 depends = ["libcap2-bin"] # postinst
+recommends = "polkitd | policykit-1"
 assets = [
   ["target/release/mairu", "usr/bin/", "755"],
+  ["pkg/polkit/co.0w0.mairu.policy", "usr/share/polkit-1/actions/", "644"],
 ]
 maintainer-scripts = "pkg/debian/"
 
@@ -52,6 +54,7 @@ cli = [
   "dep:aws-smithy-runtime-api",
   "dep:aws-smithy-types",
   "dep:axum",
+  "dep:cedar-policy",
   "dep:clap",
   "dep:daemonize",
   "dep:headers",
@@ -75,7 +78,7 @@ cli = [
 native-tls = ["cli", "reqwest/default-tls", "sigstore-trust-root?/native-tls"]
 rustls = ["cli", "reqwest/rustls-tls-native-roots", "sigstore-trust-root?/rustls"]
 # The platform helper's server and backends. Backend dependencies are enabled here.
-platform-services = []
+platform-services = ["dep:zbus", "dep:zbus_polkit"]
 # The standalone helper binary, built without `cli`.
 platform-helper = ["platform-services"]
 
@@ -101,6 +104,7 @@ aws-sdk-ssooidc = { version = "1.93.0", optional = true }
 aws-smithy-runtime-api = { version = "1.9.3", features = ["client"], optional = true }
 aws-smithy-types = { version = "1.3.5", optional = true }
 axum = { version = "0.8.7", features = ["tracing", "macros", "query"], optional = true }
+cedar-policy = { version = "4.14.0", default-features = false, optional = true }
 base64 = "0.22.1"
 base64ct = { version = "1.8.1", features = ["alloc", "std"] }
 cfg-if = "1.0.4"
@@ -114,7 +118,7 @@ hyper = { version = "1.8.1", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1.19", optional = true }
 indoc = { version = "2.0.7", optional = true }
 libc = "0.2.178"
-nix = { version = "0.30.1", features = ["resource", "process", "ptrace", "mman", "fs", "signal", "hostname", "user", "socket"] }
+nix = { version = "0.30.1", features = ["resource", "process", "ptrace", "mman", "fs", "signal", "hostname", "user", "socket", "time"] }
 oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest"], optional = true }
 once_cell = { version = "1.21.3", features = ["parking_lot"] }
 parking_lot = "0.12.5"
@@ -148,6 +152,9 @@ shadow-rs = { version = "2", default-features = false }
 sigstore-trust-root = { version = "0.15.1", default-features = false, features = ["tuf", "aws-lc-rs"], optional = true }
 sigstore-verify = { version = "0.15.1", default-features = false, features = ["aws-lc-rs"], optional = true }
 snap = { version = "1.1.1", optional = true }
+# The platform helper's polkit backend.
+zbus = { version = "6.2.0", default-features = false, features = ["tokio"], optional = true }
+zbus_polkit = { version = "6.0.0", default-features = false, features = ["tokio"], optional = true }
 
 [target.'cfg(any(target_os = "freebsd", target_os = "dragonfly"))'.dependencies]
 rustix = { version = "1.1.2", default-features = false, features = ["std", "process"] }

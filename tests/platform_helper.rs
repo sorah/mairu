@@ -3,6 +3,8 @@
 use mairu::platform::PlatformServices;
 
 const MAIRU: &str = env!("CARGO_BIN_EXE_mairu");
+/// The polkit backend's answer to a request without an action.
+const BACKEND_REASON: &str = "polkit-unavailable";
 
 fn launcher() -> mairu::platform::helper::Launcher {
     mairu::platform::helper::Launcher::new(MAIRU, ["platform-helper"])
@@ -25,18 +27,19 @@ async fn test_helper_starts_verified_and_serves() {
         description.starts_with("running pid=") && description.ends_with(" verified"),
         "{description}"
     );
+    // Polkit or not depends on the host.
     let caps = helper.capabilities().await;
-    assert_eq!(
+    assert_ne!(
         caps.authorization(),
-        mairu::proto::platform::AuthorizationFacility::None
+        mairu::proto::platform::AuthorizationFacility::Unspecified
     );
-    // The fallback backend answers, not the client's own fail-closed path.
+    // The backend answers, not the client's own fail-closed path.
     let resp = authorize(&helper).await;
     assert_eq!(
         resp.result(),
         mairu::proto::platform::authorize_response::Result::Unavailable
     );
-    assert_eq!(resp.reason, "no-authorization-facility");
+    assert_eq!(resp.reason, BACKEND_REASON);
 }
 
 #[tokio::test]
@@ -62,7 +65,7 @@ async fn test_killed_helper_fails_closed_and_respawns() {
         assert!(tokio::time::Instant::now() < deadline, "not respawned");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert_eq!(authorize(&helper).await.reason, "no-authorization-facility");
+    assert_eq!(authorize(&helper).await.reason, BACKEND_REASON);
 }
 
 /// Runs `mairu platform-helper --fd 3` through `sh`, with `fd` as fd 3. Returns the exit code.

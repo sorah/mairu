@@ -10,7 +10,8 @@ use std::task::Poll;
 //}
 //pub(crate) use puts;
 
-struct Message(String);
+/// The sender is told once the text is written, so that nothing is lost when the process exits right after.
+struct Message(String, tokio::sync::oneshot::Sender<()>);
 
 struct OutputTask {
     tx: tokio::sync::mpsc::Sender<Message>,
@@ -28,8 +29,11 @@ pub async fn send(m: &str) {
     } else {
         format!("{m}\n")
     };
-    match task.tx.send(Message(s)).await {
-        Ok(_) => {}
+    let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+    match task.tx.send(Message(s, written_tx)).await {
+        Ok(_) => {
+            let _ = written_rx.await;
+        }
         Err(e) => {
             tracing::warn!("Failed to send to terminal: {e}; {}", m);
         }
@@ -57,6 +61,7 @@ async fn task(mut output: Output, mut rx: tokio::sync::mpsc::Receiver<Message>) 
                 tracing::warn!("Failed to write to terminal: {e}; {}", m.0);
             }
         }
+        let _ = m.1.send(());
     }
 }
 

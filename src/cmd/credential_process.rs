@@ -49,13 +49,24 @@ pub async fn run(args: &CredentialProcessArgs) -> Result<(), anyhow::Error> {
             args.role.clone(),
         )),
     };
-    let resp = agent
-        .assume_role(crate::proto::AssumeRoleRequest {
-            server_id: args.server.clone(),
-            query,
-            cached: !args.no_cache,
-        })
-        .await;
+    let req = crate::proto::AssumeRoleRequest {
+        server_id: args.server.clone(),
+        query,
+        cached: !args.no_cache,
+        client_context: Some(crate::proto::ClientContext {
+            intent: Some(crate::proto::client_context::Intent::CredentialProcess(
+                crate::proto::CredentialProcessIntent {},
+            )),
+            cwd: crate::cmd::authorization::cwd(),
+            auto_config_path: vec![],
+        }),
+    };
+    // Context lines only on a terminal: stderr of a credential process usually goes to the SDK.
+    let resp = if crate::terminal::is_terminal().await {
+        crate::cmd::authorization::assume_role_with_notice(&mut agent, req, false).await
+    } else {
+        agent.assume_role(req).await
+    };
 
     match resp {
         Ok(r) => match r.into_inner().credentials {
@@ -72,7 +83,12 @@ pub async fn run(args: &CredentialProcessArgs) -> Result<(), anyhow::Error> {
             let product = env!("CARGO_PKG_NAME");
             let server_id = &args.server;
             let role = &args.role;
-            if e.code() == tonic::Code::Unauthenticated {
+            if let Some(refusal) = crate::cmd::authorization::refusal_message(&e) {
+                crate::terminal::send(&format!(
+                    ":: {product} :: ERROR when obtaining AWS credentials [{server_id},{role}]: {refusal}"
+                ))
+                .await;
+            } else if e.code() == tonic::Code::Unauthenticated {
                 crate::terminal::send(&indoc::formatdoc! {"
                     :: {product} :: Authentication Needed to obtain AWS credentials from {server_id} ({role}) :::::::
                     :: {product} :: Run the following command to continue

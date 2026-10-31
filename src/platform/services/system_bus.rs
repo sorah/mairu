@@ -68,11 +68,29 @@ pub fn check_socket_dir(dir: &std::path::Path) -> Result<(), UntrustedAuthority>
     Ok(())
 }
 
-/// The owner of an authority's well-known name, from `org.freedesktop.DBus.GetConnectionUnixUser`, must be root.
-pub fn check_authority_owner(name: &str, owner_uid: u32) -> Result<(), UntrustedAuthority> {
-    if owner_uid != 0 {
+/// Root, and the system user a distribution runs the authority as (polkitd drops to its own user). Never this
+/// process's own uid, which same-user code shares.
+pub fn trusted_owner_uids(service_user: &str) -> Vec<u32> {
+    let own = nix::unistd::geteuid().as_raw();
+    let mut uids = vec![0];
+    if let Ok(Some(user)) = nix::unistd::User::from_name(service_user)
+        && user.uid.as_raw() != own
+    {
+        uids.push(user.uid.as_raw());
+    }
+    uids
+}
+
+/// The owner of an authority's well-known name, from `org.freedesktop.DBus.GetConnectionUnixUser`, must be one of
+/// `trusted` (see [`trusted_owner_uids`]).
+pub fn check_authority_owner(
+    name: &str,
+    owner_uid: u32,
+    trusted: &[u32],
+) -> Result<(), UntrustedAuthority> {
+    if !trusted.contains(&owner_uid) {
         return Err(UntrustedAuthority(format!(
-            "{name} is owned by uid {owner_uid}, not root"
+            "{name} is owned by uid {owner_uid}, not root or its system user"
         )));
     }
     Ok(())
@@ -117,9 +135,19 @@ mod tests {
     }
 
     #[test]
+    fn test_trusted_owner_uids() {
+        assert_eq!(trusted_owner_uids("nonexistent-mairu-test-user"), vec![0]);
+        let own = nix::unistd::User::from_uid(nix::unistd::geteuid())
+            .unwrap()
+            .unwrap();
+        assert!(!trusted_owner_uids(&own.name).contains(&own.uid.as_raw()) || own.uid.is_root());
+    }
+
+    #[test]
     fn test_check_authority_owner() {
-        assert!(check_authority_owner("org.freedesktop.PolicyKit1", 0).is_ok());
-        let resp = check_authority_owner("org.freedesktop.PolicyKit1", 1000)
+        assert!(check_authority_owner("org.freedesktop.PolicyKit1", 0, &[0, 996]).is_ok());
+        assert!(check_authority_owner("org.freedesktop.PolicyKit1", 996, &[0, 996]).is_ok());
+        let resp = check_authority_owner("org.freedesktop.PolicyKit1", 1000, &[0, 996])
             .unwrap_err()
             .into_authorize_response();
         assert_eq!(

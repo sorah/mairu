@@ -66,7 +66,11 @@ pub mod session_manager;
 #[cfg(feature = "cli")]
 pub mod agent;
 #[cfg(feature = "cli")]
+pub mod authorization;
+#[cfg(feature = "cli")]
 pub mod ecs_server;
+#[cfg(feature = "cli")]
+pub mod policy;
 
 #[cfg(any(feature = "cli", feature = "platform-services"))]
 pub mod cmd;

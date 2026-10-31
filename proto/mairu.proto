@@ -41,6 +41,8 @@ service Agent {
   rpc ShutdownAgent(ShutdownAgentRequest) returns (ShutdownAgentResponse);
 
   rpc GetAgentStatus(GetAgentStatusRequest) returns (GetAgentStatusResponse);
+
+  rpc RevokeAuthorizations(RevokeAuthorizationsRequest) returns (RevokeAuthorizationsResponse);
 }
 
 message PingAgentRequest {
@@ -79,9 +81,43 @@ message AssumeRoleRequest {
     Rolespec rolespec = 4;
   }
   bool cached = 3;
+  ClientContext client_context = 5;
 }
 message AssumeRoleResponse {
   Credentials credentials = 1;
+}
+
+// What the client is about to do with the credentials. Reported by a verified client, so it can
+// be shown to the human as fact.
+message ClientContext {
+  oneof intent {
+    ExecIntent exec = 1;
+    CredentialProcessIntent credential_process = 2;
+  }
+  bytes cwd = 3;
+  bytes auto_config_path = 4;      // .mairu.json path when role = auto
+}
+
+message ExecIntent {
+  repeated bytes command = 1;
+  string mode = 2;                 // "ecs" | "static"
+  bool prefetch = 3;               // the sidecar's auto-refresh, not a request by the command
+}
+
+message CredentialProcessIntent {}
+
+message RevokeAuthorizationsRequest {
+  enum Scope {
+    SCOPE_UNSPECIFIED = 0;
+    SCOPE_ALL = 1;
+    SCOPE_CALLER_SESSION = 2;
+  }
+  Scope scope = 1;
+  bool include_leases = 2;
+}
+message RevokeAuthorizationsResponse {
+  uint32 revoked_grants = 1;
+  uint32 revoked_leases = 2;
 }
 
 message ListSessionsRequest {
@@ -180,7 +216,10 @@ message GetAgentStatusResponse {
   HardeningState agent_hardening = 2;
   PeerView caller = 3;
   mairu.platform.Capabilities capabilities = 4;
+  uint32 grants = 6;
+  uint32 leases = 7;
   string platform_helper = 8;  // e.g. "running pid=4321 verified", "unavailable: helper-unverified"
+  repeated string authorization_methods = 9;  // effective order, e.g. ["platform"]
   string profile = 10;  // "default" or "dev"
 }
 
@@ -189,16 +228,24 @@ message PeerView {
   bool verified = 1;
   uint32 pid = 2;
   uint64 start_time = 3;
+  string session = 4;  // e.g. "tty sid=4242 /dev/pts/3", "parent pid=777", "none"
 }
 
-// Carried in the binary details of a non-OK status.
+// Carried as the binary details of a non-OK tonic::Status (grpc-status-details-bin).
 message AuthorizationError {
   enum Reason {
     REASON_UNSPECIFIED = 0;
-    REASON_UNVERIFIED_PEER = 1;  // PERMISSION_DENIED
+    REASON_UNVERIFIED_PEER = 1;          // PERMISSION_DENIED
+    REASON_DENIED = 2;                   // PERMISSION_DENIED: the human said no or cancelled
+    REASON_FORBIDDEN = 3;                // PERMISSION_DENIED: a forbid policy, or disallow_roles
+    REASON_NOT_PERMITTED = 4;            // PERMISSION_DENIED: no permit applies, even after a human check
+    REASON_UNAVAILABLE = 5;              // FAILED_PRECONDITION: no method could ask the human
+    REASON_NO_AUTHENTICATION_AGENT = 7;  // FAILED_PRECONDITION: polkit has no agent for the requesting process
+    REASON_PRESENCE_REQUIRED = 9;        // FAILED_PRECONDITION: pre-fetch needs a fresh check; nobody was asked
   }
   Reason reason = 1;
   string detail = 2;
+  repeated string policy_ids = 4;        // @id of the determining forbid policies, for REASON_FORBIDDEN
 }
 
 //----- The following is used for mairu-exec subprocess IPC

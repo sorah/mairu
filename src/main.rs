@@ -52,6 +52,9 @@ enum Commands {
     /// Install a hardened copy of mairu for this host (run as root)
     Harden(mairu::cmd::harden::HardenArgs),
 
+    /// Make the agent forget remembered approvals, so the next request asks again
+    Lock(mairu::cmd::lock::LockArgs),
+
     /// Serve platform services to the parent agent; started only by the agent
     #[command(hide = true)]
     PlatformHelper {
@@ -98,6 +101,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::KillAgent => enable_log(LogType::Custom),
         Commands::Doctor(_) => enable_log(LogType::Custom),
         Commands::Harden(_) => enable_log(LogType::Custom),
+        Commands::Lock(_) => enable_log(LogType::Custom),
         _ => enable_log(LogType::Default),
     }
     #[cfg(target_os = "linux")]
@@ -117,6 +121,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::SetupSso(args) => mairu::cmd::setup_sso::run(args),
         Commands::Doctor(args) => mairu::cmd::doctor::run(args),
         Commands::Harden(args) => mairu::cmd::harden::run(args),
+        Commands::Lock(args) => mairu::cmd::lock::run(args),
         Commands::PlatformHelper { .. } => unreachable!(),
     };
     match retval {
@@ -126,7 +131,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
             Some(mairu::Error::SilentlyExitWithCode(c)) => Ok(*c),
             _ => match mairu::agent::authorization_error(&e) {
                 Some(authz) => {
-                    eprintln!("Error: the agent refused this request: {}", authz.detail);
+                    eprintln!("Error: {}", authz.user_message());
                     Ok(std::process::ExitCode::FAILURE)
                 }
                 None => Err(e),

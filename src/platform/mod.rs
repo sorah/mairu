@@ -24,6 +24,37 @@ pub trait ProcessPlatform: Send + Sync + std::fmt::Debug {
     /// Platform helper side: checks that the other end of the inherited socket is this process's parent.
     /// Returns the parent's pid.
     fn verify_parent(&self, fd: std::os::fd::BorrowedFd<'_>) -> crate::Result<u32>;
+    /// What remembered human checks of this peer are keyed to; `None` when nothing is.
+    fn session_identity(&self, peer: &PeerIdentity) -> Option<SessionIdentity>;
+    /// The peer's controlling terminal, such as `/dev/pts/3`.
+    fn controlling_tty(&self, peer: &PeerIdentity) -> Option<String>;
+}
+
+/// A terminal session, or the parent of a caller without one. Ids are paired with start times so that a reused
+/// id never matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionIdentity {
+    Tty { sid: i32, leader_start_time: u64 },
+    Parent { ppid: i32, start_time: u64 },
+}
+
+impl SessionIdentity {
+    /// `"tty"` or `"parent"`, as the policy context's `session`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SessionIdentity::Tty { .. } => "tty",
+            SessionIdentity::Parent { .. } => "parent",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionIdentity::Tty { sid, .. } => write!(f, "tty sid={sid}"),
+            SessionIdentity::Parent { ppid, .. } => write!(f, "parent pid={ppid}"),
+        }
+    }
 }
 
 /// The `PlatformHelper` contract as a trait. The agent only holds `HelperClient`; the backends that implement it
@@ -57,7 +88,14 @@ pub trait PlatformServices: Send + Sync + std::fmt::Debug {
 /// The backend for this OS. Runs only inside the platform helper.
 #[cfg(feature = "platform-services")]
 pub fn services() -> &'static dyn PlatformServices {
-    &crate::platform::services::fallback::FallbackServices
+    #[cfg(target_os = "linux")]
+    {
+        &crate::platform::services::linux::LinuxServices
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        &crate::platform::services::fallback::FallbackServices
+    }
 }
 
 /// The credentials the kernel recorded for the creator of the platform helper's socketpair.

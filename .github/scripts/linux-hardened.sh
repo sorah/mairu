@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Integration checks for a hardened Linux host: classification, peer verification both ways, unverified-agent
-# replacement, the platform helper, re-exec and `mairu harden` itself. Runs as a user with passwordless sudo, after
-# `cargo build`.
+# replacement, the platform helper, authorization through polkit, re-exec and `mairu harden` itself. Runs as a user
+# with passwordless sudo, after `cargo build`.
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -63,6 +63,41 @@ done
 check "helper respawned" has "^helper   running pid=[0-9]* verified" "$out"
 capture "$dev" list-sessions
 check "hardened agent refuses an unhardened client" has "the agent refused this request" "$out"
+"$hardened" kill-agent >/dev/null 2>&1
+
+echo "--- authorization through polkit"
+check "polkit actions installed" test -f /usr/share/polkit-1/actions/co.0w0.mairu.policy
+# No credential server: a request that passes authorization stops at "log in".
+mkdir -p ~/.config/mairu/servers.d
+echo '{"id": "ci", "url": "https://ci.invalid/"}' >~/.config/mairu/servers.d/ci.json
+rules=/etc/polkit-1/rules.d/49-mairu-test.rules
+# CI only: answers co.0w0.mairu.* without a human. polkitd reloads rules on change.
+set_rule() {
+  sudo tee "$rules" >/dev/null <<EOF
+polkit.addRule(function (action, subject) {
+  if (action.id.indexOf("co.0w0.mairu.") === 0) {
+    return polkit.Result.$1;
+  }
+});
+EOF
+  sleep 2
+}
+set_rule YES
+capture "$hardened" credential-process ci 123456789012/CI
+check "approved request reaches the credential server step" has "Authentication Needed" "$out"
+capture "$hardened" doctor
+check "approval remembered for this parent process, polkit usable" has "^authorization  grants=1 leases=0 methods=platform" "$out"
+set_rule NO
+capture "$hardened" credential-process ci 123456789012/CI
+check "remembered approval is reused without asking" has "Authentication Needed" "$out"
+capture "$hardened" credential-process ci 123456789012/Other
+check "another role asks, and is denied" has "authorization was denied" "$out"
+capture "$hardened" lock
+check "lock revokes the grant" has "Revoked 1 grant(s) and 0 lease(s)" "$out"
+capture "$hardened" credential-process ci 123456789012/CI
+check "after lock the role asks again" has "authorization was denied" "$out"
+sudo rm -f "$rules"
+rm -f ~/.config/mairu/servers.d/ci.json
 "$hardened" kill-agent >/dev/null 2>&1
 
 echo "--- harden in a scratch home"

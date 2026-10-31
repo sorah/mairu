@@ -10,6 +10,9 @@
 - Other installations (mise, cargo, aqua, tarballs) run the hardened copy when one exists, and warn when its version differs. `MAIRU_NO_HARDENED_REEXEC=1` opts out. Without a hardened copy, mairu suggests `harden` at most once an hour on a terminal (`MAIRU_NO_HARDEN_SUGGESTION=1` or `harden_suggestion` in `config.json`).
 - The Debian package installs `/usr/bin/mairu` setgid to the `mairu` group and creates `/var/lib/mairu`. `pkg/sysusers.d` and `pkg/tmpfiles.d` carry the same for other packagers.
 - `mairu doctor` lists hardened copies and their versions, and warns when `sudo -n true` succeeds or the user is in `docker`, `lxd`, `incus-admin` or `disk`.
+- A hardened agent asks for approval through polkit before vending credentials for a role, once per terminal session (5 minutes idle, 12 hours at most) and once per running `mairu exec`, whose background refresh never prompts. The decision is a built-in [Cedar](https://www.cedarpolicy.com/) policy; an unhardened agent never asks. Approvals are kept in memory only.
+- New `mairu lock` command makes the agent forget approvals: all of them, those of the current terminal session (`--session`), or also those of running `mairu exec` (`--running`).
+- `mairu harden` and the Debian package install the polkit actions `co.0w0.mairu.*` at `/usr/share/polkit-1/actions/co.0w0.mairu.policy`. The Debian package recommends `polkitd`.
 - The agent runs platform services in a child process, `mairu platform-helper`, that holds no tokens. The agent and the helper verify each other, the helper exits with the agent, and a helper that died is restarted within 30 seconds; meanwhile those services fail closed. `mairu doctor` shows the helper's state and capabilities.
 
 ### Miscellaneous
