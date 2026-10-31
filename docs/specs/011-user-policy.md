@@ -426,17 +426,28 @@ message GetPolicyResponse {
 
 ## Current Status
 
-Spec drafted; awaiting review before implementation. Implementors MUST keep this section updated as they work.
+Implemented on `hardening/user-policy`. Implementors MUST keep this section updated as they work.
 
 ### Checklist
 
-- [ ] `policy.cedar` and `authorization.json` read by the agent from `config_dir()`, with the file cache
-- [ ] `authorization.json` schema: `methods`, `tool_detection`, `grant_retention_secs`, `sts`; unknown fields rejected
-- [ ] Effective policy for `ABSENT` and `UNAPPROVED`: built-ins plus `forbid` policies only; tightening settings only; notes for dropped policies
-- [ ] Validation: static policies, strict mode, unique ids, reserved `builtin-` prefix
-- [ ] `GetPolicy` and `PolicyIntegrity`
-- [ ] `mairu policy init|check|show|explain|schema`
+- [x] `policy.cedar` and `authorization.json` read by the agent from `config_dir()`, with the file cache
+- [x] `authorization.json` schema: `methods`, `tool_detection`, `grant_retention_secs`, `sts`; unknown fields rejected
+- [x] Effective policy for `ABSENT` and `UNAPPROVED`: built-ins plus `forbid` policies only; tightening settings only; notes for dropped policies
+- [x] Validation: static policies, strict mode, unique ids, reserved `builtin-` prefix
+- [x] `GetPolicy` and `PolicyIntegrity`
+- [x] `mairu policy init|check|show|explain|schema`
 
 ### Updates
 
 - 2026-10-29: Split out of hardening.md, policy.md and platform-helper.md.
+- 2026-10-31: Implemented.
+  - Parsing, the unapproved `forbid` set and the `check` analysis live in a new `src/policy/user.rs`; `files.rs` holds the cache and the `Effective` policy (engine, settings, labels, state, notes); `mod.rs` builds the engine from the built-ins, the always-on built-ins and the kept `forbid` policies.
+  - Cache: every decision stats both files; a changed `(dev, ino, mtime, size)` reloads at once, otherwise the files are re-read once the last load is 5 s old. Files are read through the opened descriptor, so the key describes exactly what was read. A file that is not a regular file, is unreadable, or exceeds 1 MiB is ignored with a note, and still counts as present (`UNAPPROVED`).
+  - Policy numbering is 1-based in file order (`policy.cedar#1`). Policies without `@id` get `@id("policy.cedar#<n>")` prepended in `effective_policies`, so the text parses back with every id; `explain` relies on that. Every policy whose id is duplicated anywhere in the file is dropped, not only the later ones.
+  - Besides the dropped-policy notes, `GetPolicy.notes` also names the ignored `permit` policies and the ignored `methods`, `sts` and `network` settings, so `show` explains every ignored part.
+  - `effective_settings_json` shows `version`, `methods`, `grant_retention_secs` and the file's `tool_detection` additions (not the built-in `ai-agent` names).
+  - "Can apply without a human check" is decided syntactically and conservatively from Cedar's JSON form: a `permit` is not flagged only when a `when` requires `context.presence.verified` (or `== true`) as a top-level conjunct, or an `unless` names `!context.presence.verified` (or `== false`) as a top-level disjunct.
+  - `explain` takes `--age` and `--idle` (default 0) for the lease and grant candidates, uses the current terminal as `tty`, or `parent` without one, takes the hardening state from the presence of `builtin-unhardened` in the effective set, and also evaluates gate 2 on a hardened agent, for credentials of the account the role (or `--assume-role`) declares.
+  - `caller_identity.rs` and the hardened agent's network setup are unchanged: `sts` and `network` are never taken from an unapproved file, and there is no other state yet, so the effective values are always the defaults. 012 wires them for `APPROVED`.
+  - `mairu doctor` prints the policy state and notes, computed locally from the files (doctor keeps to `PingAgent` and `GetAgentStatus`).
+  - Verified in Docker (`011-user-policy` scenario, hardened install, polkit answering through a rules file, fake credential server and STS): absent state and built-ins in `show`; `init`/`check`; a `forbid` refusing at once with `REASON_FORBIDDEN` and its id, without prompt or fetch; an ignored `permit`; a gate-2 `forbid` by the real account prompting at `use-credentials`; a broken file ignored as a whole; strict-validation, duplicate and `builtin-` drops with notes; `tool_detection` labels and a shorter `grant_retention_secs` taking effect; `methods`/`sts`/`network` ignored (credentials still checked at the default STS endpoint); unknown fields rejected; edits seen by the next request; `doctor`; and a `forbid` on an unhardened agent.
