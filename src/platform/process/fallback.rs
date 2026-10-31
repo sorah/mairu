@@ -118,4 +118,8 @@ impl crate::platform::ProcessPlatform for FallbackProcess {
     fn notes(&self) -> Vec<String> {
         vec!["peer verification is not implemented on this platform".to_owned()]
     }
+
+    fn wsl_interop(&self) -> Option<bool> {
+        None
+    }
 }

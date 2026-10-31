@@ -605,15 +605,21 @@ async fn explain(args: &ExplainArgs) -> Result<(), anyhow::Error> {
         chained_role_arn: args.assume_role.clone(),
         tools: args.tools.iter().cloned().collect(),
         tool_matches: Default::default(),
+        wsl_interop: crate::platform::process().wsl_interop(),
     };
 
     println!(
-        "{} on {} ({} agent, session {}{}, policy {})",
+        "{} on {} ({} agent, session {}{}{}, policy {})",
         args.role,
         args.server,
         if hardened { "hardened" } else { "unhardened" },
         facts.session,
         tty.map(|t| format!(" {t}")).unwrap_or_default(),
+        match facts.wsl_interop {
+            Some(true) => ", WSL2 interop enabled",
+            Some(false) => ", WSL2 interop disabled",
+            None => "",
+        },
         describe_integrity(resp.integrity()),
     );
     let mut candidates = vec![

@@ -37,6 +37,7 @@ pub enum MisconfiguredReason {
     PrimaryGroupIsMarker,
     MarkerMember,
     SuidDumpable,
+    Wsl1,
 }
 
 impl std::fmt::Display for MisconfiguredReason {
@@ -53,6 +54,10 @@ impl std::fmt::Display for MisconfiguredReason {
             MisconfiguredReason::SuidDumpable => write!(
                 f,
                 "fs.suid_dumpable is 1, which leaves setgid processes traceable"
+            ),
+            MisconfiguredReason::Wsl1 => write!(
+                f,
+                "this is WSL1, which translates system calls instead of running a Linux kernel, so hardening is unsupported; use WSL2"
             ),
         }
     }
@@ -79,6 +84,7 @@ pub struct Facts {
     pub supplementary_gids: Vec<u32>,
     pub user_name: Option<String>,
     pub suid_dumpable: Option<u8>,
+    pub wsl1: bool,
 }
 
 impl Facts {
@@ -114,6 +120,11 @@ impl Facts {
         if listed || self.supplementary_gids.contains(&self.egid) {
             return HardeningState::Misconfigured {
                 reason: MisconfiguredReason::MarkerMember,
+            };
+        }
+        if self.wsl1 {
+            return HardeningState::Misconfigured {
+                reason: MisconfiguredReason::Wsl1,
             };
         }
         if self.suid_dumpable == Some(1) {
@@ -209,6 +220,8 @@ impl Hardening {
                 .collect(),
             user_name,
             suid_dumpable: read_sysctl("/proc/sys/fs/suid_dumpable"),
+            wsl1: crate::platform::process::linux::wsl::Wsl::detect()
+                == Some(crate::platform::process::linux::wsl::Wsl::Wsl1),
         })
     }
 
@@ -436,6 +449,7 @@ mod tests {
             supplementary_gids: vec![RGID, 10],
             user_name: Some("alice".to_owned()),
             suid_dumpable: Some(0),
+            wsl1: false,
         }
     }
 
@@ -496,6 +510,21 @@ mod tests {
             facts.classify(),
             misconfigured(MisconfiguredReason::PrimaryGroupIsMarker)
         );
+    }
+
+    #[test]
+    fn test_wsl1() {
+        let facts = Facts {
+            wsl1: true,
+            ..hardened_facts()
+        };
+        assert_eq!(facts.classify(), misconfigured(MisconfiguredReason::Wsl1));
+        let facts = Facts {
+            wsl1: true,
+            at_secure: false,
+            ..hardened_facts()
+        };
+        assert_eq!(facts.classify(), unhardened(None));
     }
 
     #[test]

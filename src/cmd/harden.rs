@@ -167,6 +167,13 @@ mod linux {
             return uninstall(&home, args.purge);
         }
 
+        let wsl = crate::platform::process::linux::wsl::Wsl::detect();
+        if wsl == Some(crate::platform::process::linux::wsl::Wsl::Wsl1) {
+            anyhow::bail!(
+                "this is WSL1, which translates system calls instead of running a Linux kernel, so mairu cannot be hardened here; convert the distribution to WSL2 with `wsl.exe --set-version <distro> 2`"
+            );
+        }
+
         let source = match &args.from {
             Some(path) => Source::from_file(path, args.unattested, args.allow_downgrade)?,
             None => Source::running()?,
@@ -200,7 +207,27 @@ mod linux {
         println!(
             "Other mairu installations on this host now run it. The next mairu command replaces a running unhardened agent; or run `mairu kill-agent` now."
         );
+        if let Some(wsl) = wsl {
+            warn_wsl2(wsl);
+        }
         Ok(())
+    }
+
+    /// Hardening proceeds on WSL2, but is bounded by interop and by the Windows side.
+    fn warn_wsl2(wsl: crate::platform::process::linux::wsl::Wsl) {
+        eprintln!();
+        for note in wsl.notes() {
+            eprintln!("warning: {note}");
+        }
+        if wsl.interop_enabled() == Some(true) {
+            eprintln!();
+            eprint!(
+                "{}",
+                crate::platform::process::linux::wsl::disable_interop_instructions(
+                    std::env::var("WSL_DISTRO_NAME").ok().as_deref()
+                )
+            );
+        }
     }
 
     /// Deletes the strong record of both profiles. The user's Secret Service item stays; once it no longer

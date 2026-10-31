@@ -57,6 +57,7 @@ pub mod platform {
                 ssh: ["SSH_CONNECTION", "SSH_TTY"]
                     .into_iter()
                     .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty())),
+                wsl_interop: var("WSL_INTEROP"),
             }
         }
 
@@ -136,6 +137,7 @@ pub mod platform {
                 wayland_display: wayland.to_owned(),
                 dbus_session_bus_address: String::new(),
                 ssh,
+                ..Default::default()
             };
             assert_eq!(hint(":0", "", false).refusal(), None);
             assert_eq!(hint("", "wayland-0", true).refusal(), None);
