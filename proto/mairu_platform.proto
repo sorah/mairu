@@ -142,6 +142,7 @@ message ApprovalAnchor {
   repeated string methods = 1;             // e.g. "ssh-agent", "windows-hello", "platform"
   repeated string ssh_agent_keys = 2;      // OpenSSH public key lines
   repeated bytes windows_hello_keys = 3;   // DER SubjectPublicKeyInfo
+  string windows_hello_helper_sha256 = 4;  // the approved helper pin, hex; empty for none
 }
 
 message RecordIntegrityRequest {

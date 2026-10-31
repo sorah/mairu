@@ -335,10 +335,13 @@ message AuthorizationError {
 message AuthorizationChallenge {
   bytes challenge_id = 1;          // 16 random bytes
   bytes statement = 2;             // serialized AuthorizationStatement; signed byte-for-byte
-  // Acceptable registered keys: OpenSSH "SHA256:..." fingerprints for ssh-agent.
+  // Acceptable registered keys: OpenSSH "SHA256:..." fingerprints for ssh-agent,
+  // "wh:SHA256:..." (SHA-256 of the SubjectPublicKeyInfo) for Windows Hello.
   repeated string key_fingerprints = 3;
   google.protobuf.Timestamp expires_at = 4;
-  string method = 5;               // "ssh-agent"
+  string method = 5;               // "ssh-agent" | "windows-hello"
+  // windows-hello: the hex SHA-256 of the helper the approved settings pin; empty when they pin none.
+  string windows_hello_helper_sha256 = 6;
 }
 
 // What a challenge's signature approves.
@@ -358,7 +361,10 @@ message AuthorizationResponse {
   bytes challenge_id = 1;
   oneof result {
     bytes sshsig = 2;              // binary SSHSIG blob
-    string declined = 3;           // why the client could not sign: "no-ssh-agent", "no-registered-key", "sign-failed"
+    // Why the client could not sign: "no-ssh-agent", "no-helper", "no-registered-key", "sign-failed", or
+    // "cancelled" when the human cancelled the prompt, which denies the request.
+    string declined = 3;
+    bytes windows_hello_signature = 4;  // RSA PKCS #1 v1.5 SHA-256 signature over the statement
   }
 }
 

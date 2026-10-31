@@ -44,17 +44,60 @@ jobs:
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
 
-  upload-binaries:
+  # Linux archives and debs ship the helper of the matching Windows architecture, so it builds first.
+  windows-hello:
     needs: create-release
+    strategy:
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with: { target: "${{ matrix.target }}" }
+      - run: "cargo build --release --target ${{ matrix.target }} --no-default-features --features windows-hello-helper --bin mairu-windows-hello"
+      - uses: actions/attest-build-provenance@v4
+        id: attest
+        with:
+          subject-path: "target/${{ matrix.target }}/release/mairu-windows-hello.exe"
+      - name: create archive
+        shell: bash
+        env:
+          TARGET: "${{ matrix.target }}"
+          BUNDLE_PATH: "${{ steps.attest.outputs.bundle-path }}"
+        run: |
+          mkdir -p dist
+          cp "target/${TARGET}/release/mairu-windows-hello.exe" dist/
+          cp "$BUNDLE_PATH" dist/mairu-windows-hello.exe.sigstore.json
+          cd dist
+          7z a "../mairu-windows-hello-${TARGET}.zip" mairu-windows-hello.exe mairu-windows-hello.exe.sigstore.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: "mairu-windows-hello-${{ matrix.target }}"
+          path: "target/${{ matrix.target }}/release/mairu-windows-hello.exe"
+          if-no-files-found: error
+      - run: 'gh release upload "${{ github.ref_name }}" "mairu-windows-hello-${{ matrix.target }}.zip"'
+        shell: bash
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+
+  upload-binaries:
+    needs: [create-release, windows-hello]
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             features: rustls
+            windows-hello: x86_64-pc-windows-msvc
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             features: rustls
+            windows-hello: aarch64-pc-windows-msvc
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
@@ -71,6 +114,15 @@ jobs:
       - uses: taiki-e/setup-cross-toolchain-action@v1
         with:
           target: "${{ matrix.target }}"
+      - uses: actions/download-artifact@v4
+        if: "${{ matrix.windows-hello }}"
+        with:
+          name: "mairu-windows-hello-${{ matrix.windows-hello }}"
+          path: target/windows-hello
+      - name: pin the Windows Hello helper
+        if: "${{ matrix.windows-hello }}"
+        shell: bash
+        run: echo "MAIRU_WINDOWS_HELLO_HELPER_SHA256=$(sha256sum target/windows-hello/mairu-windows-hello.exe | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - run: "cargo build --release --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features || 'default' }}"
       - uses: actions/attest-build-provenance@v4
         id: attest
@@ -83,23 +135,30 @@ jobs:
           BUNDLE_PATH: "${{ steps.attest.outputs.bundle-path }}"
         run: |
           mkdir -p dist
+          files=(mairu mairu.sigstore.json)
           cp "target/${TARGET}/release/mairu" dist/
           cp "$BUNDLE_PATH" dist/mairu.sigstore.json
-          tar -C dist -czf "mairu-${TARGET}.tar.gz" mairu mairu.sigstore.json
+          if [ -e target/windows-hello/mairu-windows-hello.exe ]; then
+            install -m 0755 target/windows-hello/mairu-windows-hello.exe dist/
+            files+=(mairu-windows-hello.exe)
+          fi
+          tar -C dist -czf "mairu-${TARGET}.tar.gz" "${files[@]}"
       - run: 'gh release upload "${{ github.ref_name }}" "mairu-${{ matrix.target }}.tar.gz"'
         shell: bash
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
 
   upload-debs:
-    needs: create-release
+    needs: [create-release, windows-hello]
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            windows-hello: x86_64-pc-windows-msvc
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
+            windows-hello: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -120,8 +179,15 @@ jobs:
           echo '[target.${{ matrix.target }}]' >> .cargo/config
           echo 'strip = { path = "${{ matrix.target }}-strip" }' >> .cargo/config
           echo 'objcopy = { path = "${{ matrix.target }}-objcopy" }' >> .cargo/config
+      - uses: actions/download-artifact@v4
+        with:
+          name: "mairu-windows-hello-${{ matrix.windows-hello }}"
+          path: target/windows-hello
+      - name: pin the Windows Hello helper
+        shell: bash
+        run: echo "MAIRU_WINDOWS_HELLO_HELPER_SHA256=$(sha256sum target/windows-hello/mairu-windows-hello.exe | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - run: 'cargo install cargo-deb --locked'
-      - run: 'cargo deb --target=${{ matrix.target }}'
+      - run: 'cargo deb --target=${{ matrix.target }} --variant=release'
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: "target/${{ matrix.target }}/debian/*.deb"

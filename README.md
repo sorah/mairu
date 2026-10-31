@@ -534,6 +534,8 @@ Root can replace the hardened copy and read the agent's memory, so hardening pro
 
 Packages install `/usr/bin/mairu` as `root:mairu 2755` with `cap_ipc_lock` (setcap after chgrp, which clears file capabilities), create `/var/lib/mairu` and `/var/lib/mairu/users` as `root:mairu 2770`, and install [pkg/polkit/co.0w0.mairu.policy](./pkg/polkit/co.0w0.mairu.policy) into `/usr/share/polkit-1/actions/`. [pkg/debian/postinst](./pkg/debian/postinst) does this for the Debian package; [pkg/sysusers.d](./pkg/sysusers.d/mairu.conf) and [pkg/tmpfiles.d](./pkg/tmpfiles.d/mairu.conf) declare the group and directories for systemd distributions.
 
+A package can ship the Windows Hello helper of the same release (from `mairu-windows-hello-<arch>-pc-windows-msvc.zip`, or built with `--features windows-hello-helper`) as `/usr/lib/mairu/mairu-windows-hello.exe`, mode 0755, and build `mairu` with `MAIRU_WINDOWS_HELLO_HELPER_SHA256` set to its SHA-256, so that the client runs it without further setup.
+
 ### WSL2
 
 mairu hardens a WSL2 distribution as any Linux host, with one limit: with Windows interop on, which is the WSL default, any program running as you can become root through `wsl.exe -u root` without a prompt, and bypass mairu. `harden` and `doctor` say so on every WSL2 host.
@@ -542,7 +544,7 @@ mairu hardens a WSL2 distribution as any Linux host, with one limit: with Window
 |---|---|---|
 | Strength | A guardrail against over-eager tools such as AI agents, and against accidents | As native Linux against code inside the distribution |
 | Opening URLs (`agent` mode) | The Windows default browser, through `rundll32.exe url.dll,FileProtocolHandler` | Printed |
-| Approving | Your Windows OpenSSH agent through a relay, or `pkttyagent` | `ssh -A` from Windows into the distribution, or `pkttyagent` |
+| Approving | Windows Hello, your Windows OpenSSH agent through a relay, or `pkttyagent` | `ssh -A` from Windows into the distribution, or `pkttyagent` |
 
 To switch to the isolated profile, add to `/etc/wsl.conf` and restart the distribution from Windows with `wsl.exe --terminate <distro>`:
 
@@ -554,7 +556,7 @@ appendWindowsPath = false
 
 Even then, the Windows account and every other distribution with interop on can become root in this one (`wsl.exe -d <distro> -u root`); they are outside what mairu protects against.
 
-- `mairu doctor` shows the WSL version, whether interop is on, the profile, and whether `$SSH_AUTH_SOCK` reaches an SSH agent.
+- `mairu doctor` shows the WSL version, whether interop is on, the profile, whether `$SSH_AUTH_SOCK` reaches an SSH agent, and the Windows Hello helper and key.
 - `context.wsl_interop` is present only on WSL2, and is true while interop is on. Refuse sensitive accounts with it:
 
   ```cedar
@@ -564,6 +566,7 @@ Even then, the Windows account and every other distribution with interop on can 
   ```
 
 - To approve with your Windows OpenSSH agent in the integrated profile, relay it into the distribution, with [npiperelay](https://github.com/jstarks/npiperelay) and `socat`, or with [wsl2-ssh-agent](https://github.com/mame/wsl2-ssh-agent), and register its key as `ssh_agent_keys` (see [SSH agent](#ssh-agent)). A Windows agent that asks for Windows Hello before each signature works too; mairu sees an ordinary signature.
+- In the integrated profile, Windows Hello can approve requests and policy changes; see [Windows Hello](#windows-hello).
 - WSLg provides no notification daemon. For Windows toasts, use `command` mode with a helper such as [wsl-notify-send](https://github.com/stuartleeks/wsl-notify-send):
 
   ```sh
@@ -578,6 +581,49 @@ Even then, the Windows account and every other distribution with interop on can 
 
 - [WSL-Hello-sudo](https://github.com/nullpo-head/WSL-Hello-sudo) (`pam_wsl_hello`) backs `sudo` with Windows Hello, which closes the `sudo` path to root (see [Root](#root)) but not the interop one.
 - WSL1 is not supported: `harden` refuses it, and a hardened copy there runs as misconfigured.
+
+#### Windows Hello
+
+With interop on, a hardened agent can approve requests by a signature from a Windows Hello key: the PIN, fingerprint or face you use for Windows. The key is created by Windows Hello on your TPM, and every signature asks for the gesture. `mairu-windows-hello.exe` signs the agent's challenge on the Windows side, and the agent verifies the signature against the public key registered in `authorization.json`; nothing the helper says counts on its own.
+
+Linux release archives ship `mairu-windows-hello.exe` next to `mairu`, and the Debian package installs it as `/usr/lib/mairu/mairu-windows-hello.exe`; `mairu harden` copies it next to the hardened copy. These builds pin the helper's SHA-256, and run it only while it matches.
+
+1. Create the key and print its entry:
+
+   ```sh
+   mairu policy enroll-windows-hello
+   ```
+
+2. Add the entry to `windows_hello_keys` in `~/.config/mairu/authorization.json`:
+
+   ```jsonc
+   {
+     "version": 1,
+     // Default: the key-based methods with registered keys, then "platform".
+     "methods": ["windows-hello", "platform"],
+     "windows_hello_keys": [
+       {"name": "desktop", "public_key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA..."}
+     ]
+   }
+   ```
+
+3. Approve it with `mairu policy approve`. The first registration is approved through polkit; from then on, only Windows Hello approves the next policy change.
+
+When a request needs a fresh check, mairu prints the request and `Approve in the Windows Hello dialog …`, and Windows shows the dialog. Cancelling it, or letting it time out, denies the request; no other method asks instead. `context.presence.method` is `"windows-hello"` for a request Windows Hello approved, so a policy can require it, as with [the SSH agent](#ssh-agent).
+
+Builds from source (`cargo install`, AUR `mairu`) ship no helper. Download `mairu-windows-hello-<arch>-pc-windows-msvc.zip` of the same release, point `windows_hello_helper` in `~/.config/mairu/config.json` at the `.exe`, and pin its SHA-256 in `authorization.json` before enrolling, approved like any other setting:
+
+```jsonc
+// ~/.config/mairu/config.json
+{"windows_hello_helper": "/mnt/c/Users/me/AppData/Local/mairu/mairu-windows-hello.exe"}
+```
+
+```jsonc
+// ~/.config/mairu/authorization.json
+{"version": 1, "windows_hello_helper_sha256": "<sha256sum of the .exe>"}
+```
+
+A hardened mairu refuses to run a helper that matches no pin, because a replaced helper could have your Windows Hello gesture sign something else, such as a policy approval. It cannot forge a signature.
 
 ## Credential Server API
 

@@ -14,6 +14,30 @@ pub struct AuthorizationSettings {
     pub sts: Option<StsSettings>,
     pub network: Option<NetworkSettings>,
     pub ssh_agent_keys: Option<Vec<SshAgentKeyEntry>>,
+    pub windows_hello_keys: Option<Vec<WindowsHelloKeyEntry>>,
+    pub windows_hello_helper_sha256: Option<String>,
+}
+
+/// A key registered for the `windows-hello` method.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsHelloKeyEntry {
+    pub name: String,
+    /// A base64 SubjectPublicKeyInfo of an RSA-2048 key.
+    pub public_key: String,
+}
+
+impl WindowsHelloKeyEntry {
+    pub fn parse(&self) -> Result<crate::windows_hello::RegisteredKey, String> {
+        crate::windows_hello::RegisteredKey::parse(&self.name, &self.public_key)
+    }
+
+    fn from_key(key: &crate::windows_hello::RegisteredKey) -> Self {
+        Self {
+            name: key.name.clone(),
+            public_key: key.to_base64(),
+        }
+    }
 }
 
 /// A key registered for the `ssh-agent` method.
@@ -105,17 +129,30 @@ impl AuthorizationSettings {
                 .parse()
                 .map_err(|e| format!("ssh_agent_keys[{i}]: {e}"))?;
         }
+        for (i, entry) in self.windows_hello_keys.iter().flatten().enumerate() {
+            entry
+                .parse()
+                .map_err(|e| format!("windows_hello_keys[{i}]: {e}"))?;
+        }
         // An anchor naming a method without keys could approve nothing until an administrator resets it.
-        if !self.has_keys()
-            && self
-                .approval_methods
-                .iter()
-                .flatten()
-                .any(|m| m == crate::ssh_agent_presence::METHOD)
+        let keyed = self.keyed_methods();
+        for (method, field) in [
+            (crate::ssh_agent_presence::METHOD, "ssh_agent_keys"),
+            (crate::windows_hello::METHOD, "windows_hello_keys"),
+        ] {
+            if !keyed.contains(&method)
+                && self.approval_methods.iter().flatten().any(|m| m == method)
+            {
+                return Err(format!(
+                    "approval_methods: {method:?} needs at least one key in {field}"
+                ));
+            }
+        }
+        if let Some(pin) = &self.windows_hello_helper_sha256
+            && (pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_hexdigit()))
         {
             return Err(format!(
-                "approval_methods: {:?} needs at least one key in ssh_agent_keys",
-                crate::ssh_agent_presence::METHOD
+                "windows_hello_helper_sha256: {pin:?} is not a hex SHA-256"
             ));
         }
         for label in self.tool_detection.iter().flat_map(|t| t.keys()) {
@@ -144,7 +181,32 @@ impl AuthorizationSettings {
     }
 
     fn has_keys(&self) -> bool {
-        self.ssh_agent_keys.as_ref().is_some_and(|k| !k.is_empty())
+        !self.keyed_methods().is_empty()
+    }
+
+    /// The key-based methods with registered keys, in their default order.
+    fn keyed_methods(&self) -> Vec<&'static str> {
+        let mut methods = vec![];
+        if self.ssh_agent_keys.as_ref().is_some_and(|k| !k.is_empty()) {
+            methods.push(crate::ssh_agent_presence::METHOD);
+        }
+        if self
+            .windows_hello_keys
+            .as_ref()
+            .is_some_and(|k| !k.is_empty())
+        {
+            methods.push(crate::windows_hello::METHOD);
+        }
+        methods
+    }
+
+    /// The registered Windows Hello keys; entries that do not parse are skipped, as validation refuses them.
+    pub fn windows_hello_registered_keys(&self) -> Vec<crate::windows_hello::RegisteredKey> {
+        self.windows_hello_keys
+            .iter()
+            .flatten()
+            .filter_map(|e| e.parse().ok())
+            .collect()
     }
 
     /// The registered keys; entries that do not parse are skipped, as validation refuses them.
@@ -160,7 +222,7 @@ impl AuthorizationSettings {
     pub fn approval_methods_or_default(&self) -> Vec<String> {
         self.approval_methods
             .clone()
-            .unwrap_or_else(|| default_approval_methods(self.has_keys()))
+            .unwrap_or_else(|| default_approval_methods(&self.keyed_methods()))
     }
 
     /// What `mairu policy check` warns about beyond validation.
@@ -181,6 +243,7 @@ impl AuthorizationSettings {
 /// The presence methods this binary knows.
 const KNOWN_METHODS: &[&str] = &[
     crate::ssh_agent_presence::METHOD,
+    crate::windows_hello::METHOD,
     crate::authorization::METHOD_PLATFORM,
 ];
 
@@ -261,22 +324,22 @@ impl PolicyState {
 }
 
 /// `approval_methods` when the file has none: the key-based methods with registered keys, else `["platform"]`.
-pub fn default_approval_methods(keys_registered: bool) -> Vec<String> {
-    if keys_registered {
-        vec![crate::ssh_agent_presence::METHOD.to_owned()]
-    } else {
+pub fn default_approval_methods(keyed: &[&str]) -> Vec<String> {
+    if keyed.is_empty() {
         vec![crate::authorization::METHOD_PLATFORM.to_owned()]
+    } else {
+        keyed.iter().map(|m| (*m).to_owned()).collect()
     }
 }
 
 /// `methods` when the file has none: the key-based methods with registered keys, then `"platform"`.
-pub fn default_methods(keys_registered: bool) -> Vec<String> {
-    let mut methods = vec![];
-    if keys_registered {
-        methods.push(crate::ssh_agent_presence::METHOD.to_owned());
-    }
-    methods.push(crate::authorization::METHOD_PLATFORM.to_owned());
-    methods
+pub fn default_methods(keyed: &[&str]) -> Vec<String> {
+    keyed
+        .iter()
+        .copied()
+        .chain([crate::authorization::METHOD_PLATFORM])
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The settings in force.
@@ -300,27 +363,35 @@ pub struct EffectiveSettings {
     /// From an approved file; otherwise the keys of the approval anchor in force.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ssh_agent_keys: Vec<SshAgentKeyEntry>,
+    /// From an approved file; otherwise the keys of the approval anchor in force.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub windows_hello_keys: Vec<WindowsHelloKeyEntry>,
+    /// From an approved file; otherwise the pin of the approval anchor in force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub windows_hello_helper_sha256: Option<String>,
 }
 
 impl Default for EffectiveSettings {
     fn default() -> Self {
         Self {
             version: 1,
-            methods: default_methods(false),
+            methods: default_methods(&[]),
             approval_methods: vec![],
             tool_detection: Default::default(),
             grant_retention_secs: DEFAULT_GRANT_RETENTION_SECS,
             sts: None,
             network: None,
             ssh_agent_keys: vec![],
+            windows_hello_keys: vec![],
+            windows_hello_helper_sha256: None,
         }
     }
 }
 
 impl EffectiveSettings {
-    /// An approved file as it is. Otherwise the defaults with the keys of the approval anchor in force, plus what
-    /// can only tighten: label additions and a shorter grant retention. `methods`, `approval_methods`,
-    /// `ssh_agent_keys`, `sts` and `network` are never taken from a file that is not approved.
+    /// An approved file as it is. Otherwise the defaults with the keys and helper pin of the approval anchor in
+    /// force, plus what can only tighten: label additions and a shorter grant retention. `methods`, `approval_methods`, the keys,
+    /// `windows_hello_helper_sha256`, `sts` and `network` are never taken from a file that is not approved.
     pub fn effective(
         state: PolicyState,
         file: Option<&AuthorizationSettings>,
@@ -332,7 +403,13 @@ impl EffectiveSettings {
                 .iter()
                 .map(SshAgentKeyEntry::from_key)
                 .collect();
-            settings.methods = default_methods(!settings.ssh_agent_keys.is_empty());
+            settings.windows_hello_keys = Self::anchored_windows_hello_keys(anchor)
+                .iter()
+                .map(WindowsHelloKeyEntry::from_key)
+                .collect();
+            settings.windows_hello_helper_sha256 =
+                Some(anchor.windows_hello_helper_sha256.clone()).filter(|s| !s.is_empty());
+            settings.methods = default_methods(&settings.keyed_methods());
         }
         let Some(file) = file else {
             return settings;
@@ -341,10 +418,15 @@ impl EffectiveSettings {
             PolicyState::Absent => {}
             PolicyState::Approved => {
                 settings.ssh_agent_keys = file.ssh_agent_keys.clone().unwrap_or_default();
+                settings.windows_hello_keys = file.windows_hello_keys.clone().unwrap_or_default();
+                settings.windows_hello_helper_sha256 = file
+                    .windows_hello_helper_sha256
+                    .as_deref()
+                    .map(str::to_ascii_lowercase);
                 settings.methods = file
                     .methods
                     .clone()
-                    .unwrap_or_else(|| default_methods(file.has_keys()));
+                    .unwrap_or_else(|| default_methods(&file.keyed_methods()));
                 settings.approval_methods = file.approval_methods_or_default();
                 if let Some(tool_detection) = &file.tool_detection {
                     settings.tool_detection = tool_detection.clone();
@@ -371,7 +453,7 @@ impl EffectiveSettings {
     /// of those methods.
     pub fn anchor(file: Option<&AuthorizationSettings>) -> crate::proto::platform::ApprovalAnchor {
         let methods = file.map_or_else(
-            || default_approval_methods(false),
+            || default_approval_methods(&[]),
             AuthorizationSettings::approval_methods_or_default,
         );
         let ssh_agent_keys = if methods
@@ -386,11 +468,47 @@ impl EffectiveSettings {
         } else {
             vec![]
         };
+        let windows_hello_keys = if methods.iter().any(|m| m == crate::windows_hello::METHOD) {
+            file.map(|f| f.windows_hello_registered_keys())
+                .unwrap_or_default()
+                .iter()
+                .map(|k| k.spki().to_vec())
+                .collect()
+        } else {
+            vec![]
+        };
         crate::proto::platform::ApprovalAnchor {
             methods,
             ssh_agent_keys,
-            windows_hello_keys: vec![],
+            windows_hello_keys,
+            windows_hello_helper_sha256: file
+                .and_then(|f| f.windows_hello_helper_sha256.as_deref())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default(),
         }
+    }
+
+    /// The anchor's Windows Hello keys; keys that do not parse are skipped.
+    pub fn anchored_windows_hello_keys(
+        anchor: &crate::proto::platform::ApprovalAnchor,
+    ) -> Vec<crate::windows_hello::RegisteredKey> {
+        anchor
+            .windows_hello_keys
+            .iter()
+            .enumerate()
+            .filter_map(|(i, der)| {
+                match crate::windows_hello::RegisteredKey::from_der(&format!("anchored-{i}"), der) {
+                    Ok(key) => Some(key),
+                    Err(e) => {
+                        tracing::warn!(
+                            err = e,
+                            "Ignoring an approval anchor key that does not parse"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
     }
 
     /// The anchor's keys; lines that do not parse are skipped.
@@ -420,6 +538,25 @@ impl EffectiveSettings {
             .iter()
             .filter_map(|e| e.parse().ok())
             .collect()
+    }
+
+    pub fn windows_hello_registered_keys(&self) -> Vec<crate::windows_hello::RegisteredKey> {
+        self.windows_hello_keys
+            .iter()
+            .filter_map(|e| e.parse().ok())
+            .collect()
+    }
+
+    /// The key-based methods with registered keys, in their default order.
+    fn keyed_methods(&self) -> Vec<&'static str> {
+        let mut methods = vec![];
+        if !self.ssh_agent_keys.is_empty() {
+            methods.push(crate::ssh_agent_presence::METHOD);
+        }
+        if !self.windows_hello_keys.is_empty() {
+            methods.push(crate::windows_hello::METHOD);
+        }
+        methods
     }
 
     pub fn labels(&self) -> Vec<crate::tool_detection::ToolLabel> {
@@ -502,6 +639,8 @@ XLz4KNOFkg==
                 sts: None,
                 network: None,
                 ssh_agent_keys: None,
+                windows_hello_keys: None,
+                windows_hello_helper_sha256: None,
             }
         );
     }
@@ -572,6 +711,87 @@ XLz4KNOFkg==
         assert!(
             rejects(serde_json::json!({"version": 1, "approval_methods": ["ssh-agent"]}))
                 .contains("needs at least one key")
+        );
+    }
+
+    #[test]
+    fn test_windows_hello_keys() {
+        let key = crate::windows_hello::test_support::key();
+        let entry = serde_json::json!({"name": "desktop", "public_key": key.to_base64()});
+        let pin = "AB".repeat(32);
+        let file = parse(serde_json::json!({
+            "version": 1,
+            "windows_hello_keys": [entry],
+            "windows_hello_helper_sha256": pin,
+        }))
+        .unwrap();
+        let spkis = |keys: Vec<crate::windows_hello::RegisteredKey>| {
+            keys.iter().map(|k| k.spki().to_vec()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            spkis(file.windows_hello_registered_keys()),
+            vec![key.spki().to_vec()]
+        );
+
+        let s = EffectiveSettings::effective(PolicyState::Approved, Some(&file), &anchor());
+        assert_eq!(s.methods, vec!["windows-hello", "platform"]);
+        assert_eq!(s.approval_methods, vec!["windows-hello"]);
+        assert_eq!(
+            spkis(s.windows_hello_registered_keys()),
+            vec![key.spki().to_vec()]
+        );
+        assert_eq!(
+            s.windows_hello_helper_sha256.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+        let anchored = EffectiveSettings::anchor(Some(&file));
+        assert_eq!(anchored.methods, vec!["windows-hello"]);
+        assert_eq!(anchored.windows_hello_keys, vec![key.spki().to_vec()]);
+        assert!(anchored.ssh_agent_keys.is_empty());
+        assert_eq!(
+            EffectiveSettings::anchored_windows_hello_keys(&anchored)[0].spki(),
+            key.spki()
+        );
+
+        // Not approved: the anchor's keys and pin count, the file's do not.
+        assert_eq!(anchored.windows_hello_helper_sha256, "ab".repeat(32));
+        let s = EffectiveSettings::effective(PolicyState::Unapproved, Some(&file), &anchored);
+        assert_eq!(s.methods, vec!["windows-hello", "platform"]);
+        assert_eq!(s.windows_hello_keys.len(), 1);
+        assert_eq!(
+            s.windows_hello_helper_sha256.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+        let s = EffectiveSettings::effective(PolicyState::Unapproved, Some(&file), &anchor());
+        assert_eq!(s.methods, vec!["platform"]);
+        assert!(s.windows_hello_keys.is_empty());
+        assert_eq!(s.windows_hello_helper_sha256, None);
+
+        // Both kinds registered: ssh-agent first.
+        let both = parse(serde_json::json!({
+            "version": 1,
+            "ssh_agent_keys": [{"key": ED25519}],
+            "windows_hello_keys": [{"name": "desktop", "public_key": key.to_base64()}],
+        }))
+        .unwrap();
+        let s = EffectiveSettings::effective(PolicyState::Approved, Some(&both), &anchor());
+        assert_eq!(s.methods, vec!["ssh-agent", "windows-hello", "platform"]);
+        assert_eq!(s.approval_methods, vec!["ssh-agent", "windows-hello"]);
+
+        let rejects = |v: serde_json::Value| parse(v).unwrap_err();
+        assert!(rejects(serde_json::json!({"version": 1, "windows_hello_keys": [{"name": "x", "public_key": "AAAA"}]})).contains("windows_hello_keys[0]"));
+        assert!(rejects(serde_json::json!({"version": 1, "windows_hello_keys": [{"name": "x", "public_key": key.to_base64(), "comment": "x"}]})).contains("unknown field"));
+        assert!(
+            rejects(serde_json::json!({"version": 1, "approval_methods": ["windows-hello"], "ssh_agent_keys": [{"key": ED25519}]}))
+                .contains("needs at least one key in windows_hello_keys")
+        );
+        assert!(
+            rejects(serde_json::json!({"version": 1, "windows_hello_helper_sha256": "abc"}))
+                .contains("not a hex SHA-256")
+        );
+        assert!(
+            parse(serde_json::json!({"version": 1, "methods": ["windows-hello", "platform"]}))
+                .is_ok()
         );
     }
 

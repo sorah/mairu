@@ -181,6 +181,9 @@ pub struct UserConfig {
     /// How this client posts desktop notifications.
     #[serde(default)]
     pub notify: ConvenienceConfig,
+    /// `mairu-windows-hello.exe` to run instead of the one shipped next to mairu; required when none is shipped.
+    #[serde(default)]
+    pub windows_hello_helper: Option<std::path::PathBuf>,
 }
 
 /// `open_url` and `notify` in config.json. `command` is an argv, required when `mode` is `command`.

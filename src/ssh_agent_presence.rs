@@ -14,6 +14,8 @@ pub const ACTION_UNMARK_TOOLS: &str = "unmark-tools";
 pub const DECLINED_NO_SSH_AGENT: &str = "no-ssh-agent";
 pub const DECLINED_NO_REGISTERED_KEY: &str = "no-registered-key";
 pub const DECLINED_SIGN_FAILED: &str = "sign-failed";
+/// The human cancelled the prompt; the agent denies the request instead of trying another method.
+pub const DECLINED_CANCELLED: &str = "cancelled";
 
 pub const CHALLENGE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_CHALLENGES_PER_PEER: usize = 4;
@@ -109,6 +111,11 @@ impl RegisteredKey {
     }
 }
 
+/// The fingerprints a challenge lists for `keys`.
+pub fn fingerprints(keys: &[RegisteredKey]) -> Vec<String> {
+    keys.iter().map(RegisteredKey::fingerprint).collect()
+}
+
 /// `ssh-key` checks the sk- signature but not its flags byte, which leads the trailer it keeps after the signature.
 fn sk_flags(sig: &ssh_key::SshSig) -> Option<u8> {
     let bytes = sig.signature().as_bytes();
@@ -130,6 +137,7 @@ pub struct Binding {
 /// An outstanding challenge, holding `G` until it is answered, expires or is dropped.
 #[derive(Debug)]
 pub struct PendingChallenge<G> {
+    method: &'static str,
     statement: Vec<u8>,
     binding: Binding,
     expires: std::time::Duration,
@@ -145,16 +153,18 @@ impl<G> PendingChallenge<G> {
         self.binding.action
     }
 
-    /// Checks the challenge against the retried request and the signature against `keys`. Returns the key that
-    /// signed.
-    pub fn verify<'k>(
-        &self,
-        binding: &Binding,
-        now: std::time::Duration,
-        sshsig: &[u8],
-        keys: &'k [RegisteredKey],
-    ) -> Result<&'k RegisteredKey, String> {
-        use ssh_encoding::{Decode, Reader};
+    /// The presence method the challenge was issued for.
+    pub fn method(&self) -> &'static str {
+        self.method
+    }
+
+    /// The serialized statement a signature must cover.
+    pub fn statement(&self) -> &[u8] {
+        &self.statement
+    }
+
+    /// Checks that the challenge is live and was issued for the retried request.
+    pub fn check(&self, binding: &Binding, now: std::time::Duration) -> Result<(), String> {
         if now >= self.expires {
             return Err("the challenge expired".to_owned());
         }
@@ -165,6 +175,26 @@ impl<G> PendingChallenge<G> {
             || self.binding.request_digest != binding.request_digest
         {
             return Err("the challenge was issued for another request".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Checks the challenge against the retried request and the signature against `keys`. Returns the key that
+    /// signed.
+    pub fn verify<'k>(
+        &self,
+        binding: &Binding,
+        now: std::time::Duration,
+        sshsig: &[u8],
+        keys: &'k [RegisteredKey],
+    ) -> Result<&'k RegisteredKey, String> {
+        use ssh_encoding::{Decode, Reader};
+        self.check(binding, now)?;
+        if self.method != METHOD {
+            return Err(format!(
+                "an SSHSIG does not answer a {} challenge",
+                self.method
+            ));
         }
         let mut reader = sshsig;
         let sig = ssh_key::SshSig::decode(&mut reader)
@@ -211,12 +241,14 @@ impl<G> Challenges<G> {
         self.pending.is_empty()
     }
 
-    /// Issues a challenge for `binding` that `keys` may answer. Keeps at most a few per peer, evicting the oldest.
-    /// Returns the challenge and what was evicted, for the caller to drop outside any lock.
+    /// Issues a challenge of `method` for `binding` that the keys of `key_fingerprints` may answer. Keeps at most a
+    /// few per peer, evicting the oldest. Returns the challenge and what was evicted, for the caller to drop outside
+    /// any lock.
     pub fn issue(
         &mut self,
         binding: Binding,
-        keys: &[RegisteredKey],
+        method: &'static str,
+        key_fingerprints: Vec<String>,
         now: std::time::Duration,
         guard: Option<G>,
     ) -> (
@@ -260,13 +292,15 @@ impl<G> Challenges<G> {
         let challenge = crate::proto::AuthorizationChallenge {
             challenge_id: challenge_id.to_vec(),
             statement: statement.clone(),
-            key_fingerprints: keys.iter().map(RegisteredKey::fingerprint).collect(),
+            key_fingerprints,
             expires_at: Some(expires_at),
-            method: METHOD.to_owned(),
+            method: method.to_owned(),
+            windows_hello_helper_sha256: String::new(),
         };
         self.pending.insert(
             challenge_id,
             PendingChallenge {
+                method,
                 statement,
                 binding,
                 expires: now + CHALLENGE_LIFETIME,
@@ -331,18 +365,41 @@ pub fn set_response(
 
 /// Whether a request carries a signature, so that the agent will not be asking anyone else.
 pub fn is_signed(response: Option<&crate::proto::AuthorizationResponse>) -> bool {
+    use crate::proto::authorization_response::Result as R;
     matches!(
         response.and_then(|r| r.result.as_ref()),
-        Some(crate::proto::authorization_response::Result::Sshsig(_))
+        Some(R::Sshsig(_) | R::WindowsHelloSignature(_))
     )
 }
 
-/// The client's side: answers challenges through the SSH agent at `$SSH_AUTH_SOCK`. A decline sticks for the rest
-/// of the command, so that a refused or unreachable SSH agent is not asked again after falling back.
+/// Who is about to ask the human, for the lines printed before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signer<'a> {
+    /// The SSH agent, signing with the key of this comment.
+    SshAgent(&'a str),
+    WindowsHello,
+}
+
+impl Signer<'_> {
+    /// What the human does, such as "Approve the signature on your SSH agent (me@laptop)".
+    pub fn instruction(&self) -> String {
+        match self {
+            Signer::SshAgent(comment) => {
+                format!("Approve the signature on your SSH agent ({comment})")
+            }
+            Signer::WindowsHello => "Approve in the Windows Hello dialog".to_owned(),
+        }
+    }
+}
+
+/// The client's side: answers `ssh-agent` challenges through the SSH agent at `$SSH_AUTH_SOCK`, and `windows-hello`
+/// challenges through the Windows Hello helper. A decline sticks for the rest of the command, so that a refused or
+/// unreachable signer is not asked again after falling back.
 #[derive(Debug)]
 pub struct Relay {
     socket: Option<std::path::PathBuf>,
     declined: parking_lot::Mutex<Option<&'static str>>,
+    windows_hello: crate::windows_hello::Relay,
 }
 
 /// At most this many challenges are answered for one RPC; each gate may ask once.
@@ -359,18 +416,26 @@ impl Relay {
     }
 
     pub fn new(socket: Option<std::path::PathBuf>) -> std::sync::Arc<Self> {
+        Self::with_windows_hello(socket, crate::windows_hello::Relay::detect())
+    }
+
+    pub fn with_windows_hello(
+        socket: Option<std::path::PathBuf>,
+        windows_hello: crate::windows_hello::Relay,
+    ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             socket,
             declined: Default::default(),
+            windows_hello,
         })
     }
 
     /// Runs `rpc` with the response to each challenge it is refused with, until it is not refused with one.
-    /// `notice` gives the lines to print before asking the SSH agent, from the refusal and the key's comment; empty
-    /// prints nothing.
+    /// `notice` gives the lines to print before asking the human, from the refusal and the signer; empty prints
+    /// nothing.
     pub async fn with_challenges<T, N, F, Fut>(&self, notice: N, mut rpc: F) -> tonic::Result<T>
     where
-        N: Fn(&crate::proto::AuthorizationError, &str) -> String,
+        N: Fn(&crate::proto::AuthorizationError, Signer<'_>) -> String,
         F: FnMut(Option<crate::proto::AuthorizationResponse>) -> Fut,
         Fut: std::future::Future<Output = tonic::Result<T>>,
     {
@@ -396,25 +461,43 @@ impl Relay {
             };
             rounds += 1;
             response = Some(
-                self.respond(&challenge, |comment| notice(&refusal, comment))
+                self.respond(&challenge, |signer| notice(&refusal, signer))
                     .await,
             );
         }
     }
 
-    /// Signs the challenge's statement with the first registered key the SSH agent holds, or declines.
+    /// Signs the challenge's statement with the signer of its method, or declines.
     pub async fn respond(
         &self,
         challenge: &crate::proto::AuthorizationChallenge,
-        notice: impl FnOnce(&str) -> String,
+        notice: impl FnOnce(Signer<'_>) -> String,
     ) -> crate::proto::AuthorizationResponse {
         use crate::proto::authorization_response::Result as R;
-        let result = match self.sign(challenge, notice).await {
-            Ok(sshsig) => R::Sshsig(sshsig),
-            Err(declined) => {
-                *self.declined.lock() = Some(declined);
-                R::Declined(declined.to_owned())
+        let result = match challenge.method.as_str() {
+            crate::windows_hello::METHOD => {
+                match self
+                    .windows_hello
+                    .sign(challenge, || notice(Signer::WindowsHello))
+                    .await
+                {
+                    Ok(signature) => R::WindowsHelloSignature(signature),
+                    Err(crate::windows_hello::Unsigned::Declined(declined)) => {
+                        R::Declined(declined.to_owned())
+                    }
+                    Err(crate::windows_hello::Unsigned::Denied(detail)) => {
+                        tracing::info!(detail, "Windows Hello did not sign");
+                        R::Declined(DECLINED_CANCELLED.to_owned())
+                    }
+                }
             }
+            _ => match self.sign(challenge, notice).await {
+                Ok(sshsig) => R::Sshsig(sshsig),
+                Err(declined) => {
+                    *self.declined.lock() = Some(declined);
+                    R::Declined(declined.to_owned())
+                }
+            },
         };
         crate::proto::AuthorizationResponse {
             challenge_id: challenge.challenge_id.clone(),
@@ -425,7 +508,7 @@ impl Relay {
     async fn sign(
         &self,
         challenge: &crate::proto::AuthorizationChallenge,
-        notice: impl FnOnce(&str) -> String,
+        notice: impl FnOnce(Signer<'_>) -> String,
     ) -> Result<Vec<u8>, &'static str> {
         if let Some(declined) = *self.declined.lock() {
             return Err(declined);
@@ -458,7 +541,7 @@ impl Relay {
             tracing::info!("The SSH agent holds no registered key; declining the challenge");
             return Err(DECLINED_NO_REGISTERED_KEY);
         };
-        let notice = notice(&identity.comment);
+        let notice = notice(Signer::SshAgent(&identity.comment));
         if !notice.is_empty() {
             crate::terminal::send(&notice).await;
         }
@@ -846,7 +929,9 @@ mod tests {
         keys: &[RegisteredKey],
         binding: Binding,
     ) -> crate::proto::AuthorizationChallenge {
-        store.issue(binding, keys, NOW, None).0
+        store
+            .issue(binding, METHOD, fingerprints(keys), NOW, None)
+            .0
     }
 
     #[test]
@@ -1034,7 +1119,7 @@ mod tests {
         let mut ids = vec![];
         for n in 0..6u32 {
             let at = NOW + std::time::Duration::from_secs(n.into());
-            let (c, evicted) = store.issue(binding(1), &keys, at, Some(n));
+            let (c, evicted) = store.issue(binding(1), METHOD, fingerprints(&keys), at, Some(n));
             ids.push(c.challenge_id);
             let evicted: Vec<u32> = evicted.into_iter().filter_map(|c| c.guard).collect();
             match n {
@@ -1045,7 +1130,8 @@ mod tests {
         assert_eq!(store.len(), 4);
         store.issue(
             binding(2),
-            &keys,
+            METHOD,
+            fingerprints(&keys),
             NOW + std::time::Duration::from_secs(6),
             None,
         );
@@ -1133,11 +1219,14 @@ mod tests {
         let comment = parking_lot::Mutex::new(String::new());
         let resp = relay
             .respond(&c, |k| {
-                *comment.lock() = k.to_owned();
+                *comment.lock() = k.instruction();
                 String::new()
             })
             .await;
-        assert_eq!(*comment.lock(), "me@laptop");
+        assert_eq!(
+            *comment.lock(),
+            "Approve the signature on your SSH agent (me@laptop)"
+        );
         assert_eq!(resp.challenge_id, c.challenge_id);
         let Some(crate::proto::authorization_response::Result::Sshsig(sig)) = resp.result else {
             panic!("{resp:?}");

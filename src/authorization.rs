@@ -12,6 +12,7 @@ const HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
 /// The presence method backed by `PlatformServices::authorize`.
 pub const METHOD_PLATFORM: &str = "platform";
 pub const METHOD_SSH_AGENT: &str = crate::ssh_agent_presence::METHOD;
+pub const METHOD_WINDOWS_HELLO: &str = crate::windows_hello::METHOD;
 
 const COMMAND_DETAIL_LIMIT: usize = 512;
 const COMMAND_LINE_LIMIT: usize = 4096;
@@ -351,7 +352,9 @@ impl Authorizer {
         let mut methods = vec![];
         for method in &verified.effective.settings.methods {
             let usable = match method.as_str() {
-                METHOD_SSH_AGENT => !verified.effective.ssh_agent_keys.is_empty(),
+                METHOD_SSH_AGENT | METHOD_WINDOWS_HELLO => {
+                    KeySet::of(method, &verified.effective).is_some()
+                }
                 METHOD_PLATFORM => self.shared.platform_usable().await.is_ok(),
                 _ => false,
             };
@@ -499,10 +502,17 @@ impl Authorizer {
             .effective
             .clone();
         let response = context.and_then(|c| c.authorization_response.as_ref());
+        let mut answer = Answer::new(
+            response,
+            shared.take_challenge(response, peer.pid, peer.start_time),
+        );
         let mut tried: Vec<String> = vec![];
         for method in effective.settings.methods.iter().map(String::as_str) {
             match method {
-                METHOD_SSH_AGENT if !effective.ssh_agent_keys.is_empty() => {
+                METHOD_SSH_AGENT | METHOD_WINDOWS_HELLO => {
+                    let Some(keys) = KeySet::of(method, &effective) else {
+                        continue;
+                    };
                     let binding = crate::ssh_agent_presence::Binding {
                         pid: peer.pid,
                         start_time: peer.start_time,
@@ -511,18 +521,18 @@ impl Authorizer {
                         rolespec: None,
                         request_digest: unmark_digest(labels, context),
                     };
-                    let challenge = shared.take_challenge(response, peer.pid, peer.start_time);
-                    match shared.ssh_agent_check(
+                    match shared.key_check(
+                        keys,
                         binding,
-                        response,
-                        challenge,
-                        &effective.ssh_agent_keys,
+                        &mut answer,
+                        effective.settings.windows_hello_helper_sha256.as_deref(),
                         || begin_check().map(Some),
                     ) {
                         Ok(KeyCheck::Verified { .. }) => return remove(method),
                         Ok(KeyCheck::Declined(reason)) => {
                             tried.push(format!("{method}: declined ({reason})"));
                         }
+                        Ok(KeyCheck::Skipped) => {}
                         Err(refusal) => {
                             tracing::info!(pid = peer.pid, session = ?session, tools = ?labels, reason = ?refusal.reason(), detail = refusal.detail, "Tool marks kept");
                             return Err(refusal.into_status());
@@ -1040,12 +1050,18 @@ impl Shared {
                 Refusal::new(Reason::CheckPending, Checks::approval_pending(&approval))
             })
         };
+        let response = pending.response.as_ref();
+        let mut answer = Answer::new(
+            response,
+            self.take_challenge(response, pending.pid, pending.start_time),
+        );
         for method in effective.settings.methods.iter().map(String::as_str) {
             let keys = match method {
                 METHOD_PLATFORM => None,
-                METHOD_SSH_AGENT if !effective.ssh_agent_keys.is_empty() => {
-                    Some(&effective.ssh_agent_keys)
-                }
+                METHOD_SSH_AGENT | METHOD_WINDOWS_HELLO => match KeySet::of(method, &effective) {
+                    Some(keys) => Some(keys),
+                    None => continue,
+                },
                 _ => continue,
             };
             let presence = crate::policy::Presence::fresh(method);
@@ -1058,13 +1074,11 @@ impl Shared {
                     None => crate::ssh_agent_presence::ACTION_ASSUME_ROLE,
                     Some(_) => crate::ssh_agent_presence::ACTION_USE_CREDENTIALS,
                 };
-                let response = pending.response.as_ref();
-                let challenge = self.take_challenge(response, pending.pid, pending.start_time);
-                match self.ssh_agent_check(
-                    pending.binding(action),
-                    response,
-                    challenge,
+                match self.key_check(
                     keys,
+                    pending.binding(action),
+                    &mut answer,
+                    effective.settings.windows_hello_helper_sha256.as_deref(),
                     || begin_check().map(Some),
                 )? {
                     KeyCheck::Verified { fingerprint, .. } => {
@@ -1072,8 +1086,10 @@ impl Shared {
                             pid = pending.pid,
                             action,
                             key = fingerprint,
-                            "Verified a signature from the SSH agent"
+                            "{}",
+                            keys.verified_message()
                         );
+                        drop(answer);
                         self.record(&pending, &lease_key, method);
                         // A response answers one challenge; the other gate asks anew.
                         pending.response = None;
@@ -1089,12 +1105,14 @@ impl Shared {
                         tried.push(format!("{method}: declined ({reason})"));
                         continue;
                     }
+                    KeyCheck::Skipped => continue,
                 }
             }
             if let Err(e) = self.platform_usable().await {
                 tried.push(format!("{method}: {e}"));
                 continue;
             }
+            drop(answer.challenge.take());
             let _check = begin_check()?;
             let resp = self.prompt(&pending, caller).await;
             use crate::proto::platform::authorize_response::Result as R;
@@ -1175,49 +1193,87 @@ impl Shared {
             .take_for(&response.challenge_id, pid, start_time)
     }
 
-    /// The ssh-agent method for one request: verifies a signature over `challenge`, which `response` answers, or
-    /// issues a challenge when there is no response. `begin` starts the check a challenge stands for until it is
-    /// answered or expires.
-    fn ssh_agent_check(
+    /// A key-based method for one request: verifies the signature `answer` carries for a challenge of this
+    /// method, or issues a challenge when there is nothing to verify. `begin` starts the check a challenge stands for
+    /// until it is answered or expires.
+    fn key_check(
         &self,
+        keys: KeySet<'_>,
         binding: crate::ssh_agent_presence::Binding,
-        response: Option<&crate::proto::AuthorizationResponse>,
-        challenge: Option<crate::ssh_agent_presence::PendingChallenge<CheckGuard>>,
-        keys: &[crate::ssh_agent_presence::RegisteredKey],
+        answer: &mut Answer<'_>,
+        windows_hello_helper_sha256: Option<&str>,
         begin: impl FnOnce() -> Result<Option<CheckGuard>, Refusal>,
     ) -> Result<KeyCheck, Refusal> {
         use crate::proto::authorization_error::Reason;
         use crate::proto::authorization_response::Result as R;
-        match response.and_then(|r| r.result.as_ref()) {
-            Some(R::Declined(reason)) => {
-                drop(challenge);
-                Ok(KeyCheck::Declined(reason.clone()))
+        let method = keys.method();
+        match answer.response.and_then(|r| r.result.as_ref()) {
+            // The human said no to the prompt of a challenge, which no other method may then ask again.
+            Some(R::Declined(reason))
+                if reason == crate::ssh_agent_presence::DECLINED_CANCELLED =>
+            {
+                drop(answer.challenge.take());
+                let detail = match answer.method {
+                    Some(METHOD_WINDOWS_HELLO) => {
+                        "the Windows Hello dialog was cancelled or timed out".to_owned()
+                    }
+                    Some(m) => format!("the {m} prompt was cancelled"),
+                    None => "the prompt was cancelled".to_owned(),
+                };
+                return Err(Refusal::new(Reason::Denied, detail));
             }
-            Some(R::Sshsig(sshsig)) => {
-                let Some(challenge) = challenge else {
+            Some(R::Declined(reason)) if answer.declines(method) => {
+                return Ok(KeyCheck::Declined(reason.clone()));
+            }
+            Some(signature @ (R::Sshsig(_) | R::WindowsHelloSignature(_))) => {
+                let Some(answered) = answer.method else {
                     return Err(Refusal::new(
                         Reason::InvalidResponse,
                         "the challenge is unknown, expired or already used",
                     ));
                 };
-                match challenge.verify(&binding, self.clock.now(), sshsig, keys) {
-                    Ok(key) => Ok(KeyCheck::Verified {
-                        fingerprint: key.fingerprint(),
-                    }),
-                    Err(e) => Err(Refusal::new(Reason::InvalidResponse, e)),
+                if answered != method {
+                    return Ok(KeyCheck::Skipped);
                 }
+                let Some(challenge) = answer.challenge.take() else {
+                    return Err(Refusal::new(
+                        Reason::InvalidResponse,
+                        "the challenge was already answered",
+                    ));
+                };
+                let now = self.clock.now();
+                let verified = match (keys, signature) {
+                    (KeySet::SshAgent(keys), R::Sshsig(sshsig)) => challenge
+                        .verify(&binding, now, sshsig, keys)
+                        .map(|k| k.fingerprint()),
+                    (KeySet::WindowsHello(keys), R::WindowsHelloSignature(sig)) => {
+                        crate::windows_hello::verify(&challenge, &binding, now, sig, keys)
+                            .map(|k| k.fingerprint())
+                    }
+                    _ => Err(format!("the response does not answer a {method} challenge")),
+                };
+                return match verified {
+                    Ok(fingerprint) => Ok(KeyCheck::Verified { fingerprint }),
+                    Err(e) => Err(Refusal::new(Reason::InvalidResponse, e)),
+                };
             }
-            None => {
-                drop(challenge);
-                let guard = begin()?;
-                let (challenge, evicted) =
-                    self.challenges
-                        .lock()
-                        .issue(binding, keys, self.clock.now(), guard);
-                drop(evicted);
-                Err(Refusal::challenge(challenge))
-            }
+            _ => {}
         }
+        drop(answer.challenge.take());
+        let guard = begin()?;
+        let (mut challenge, evicted) = self.challenges.lock().issue(
+            binding,
+            method,
+            keys.fingerprints(),
+            self.clock.now(),
+            guard,
+        );
+        drop(evicted);
+        if let KeySet::WindowsHello(_) = keys {
+            challenge.windows_hello_helper_sha256 =
+                windows_hello_helper_sha256.unwrap_or_default().to_owned();
+        }
+        Err(Refusal::challenge(challenge))
     }
 
     /// Concurrent identical requests from one process at the same gate share one prompt. Dropping every waiter
@@ -1290,8 +1346,105 @@ impl Shared {
 /// What the ssh-agent method came to, short of a refusal.
 #[derive(Debug)]
 enum KeyCheck {
-    Verified { fingerprint: String },
+    Verified {
+        fingerprint: String,
+    },
     Declined(String),
+    /// The request answers a challenge of another method.
+    Skipped,
+}
+
+/// The registered keys of a key-based method.
+#[derive(Debug, Clone, Copy)]
+enum KeySet<'a> {
+    SshAgent(&'a [crate::ssh_agent_presence::RegisteredKey]),
+    WindowsHello(&'a [crate::windows_hello::RegisteredKey]),
+}
+
+impl<'a> KeySet<'a> {
+    /// The keys of `method` in force; `None` when it has none.
+    fn of(method: &str, effective: &'a crate::policy::files::Effective) -> Option<Self> {
+        Self::from_keys(
+            method,
+            &effective.ssh_agent_keys,
+            &effective.windows_hello_keys,
+        )
+    }
+
+    fn from_keys(
+        method: &str,
+        ssh_agent: &'a [crate::ssh_agent_presence::RegisteredKey],
+        windows_hello: &'a [crate::windows_hello::RegisteredKey],
+    ) -> Option<Self> {
+        match method {
+            METHOD_SSH_AGENT if !ssh_agent.is_empty() => Some(KeySet::SshAgent(ssh_agent)),
+            METHOD_WINDOWS_HELLO if !windows_hello.is_empty() => {
+                Some(KeySet::WindowsHello(windows_hello))
+            }
+            _ => None,
+        }
+    }
+
+    fn method(&self) -> &'static str {
+        match self {
+            KeySet::SshAgent(_) => METHOD_SSH_AGENT,
+            KeySet::WindowsHello(_) => METHOD_WINDOWS_HELLO,
+        }
+    }
+
+    fn fingerprints(&self) -> Vec<String> {
+        match self {
+            KeySet::SshAgent(keys) => crate::ssh_agent_presence::fingerprints(keys),
+            KeySet::WindowsHello(keys) => crate::windows_hello::fingerprints(keys),
+        }
+    }
+
+    fn verified_message(&self) -> &'static str {
+        match self {
+            KeySet::SshAgent(_) => "Verified a signature from the SSH agent",
+            KeySet::WindowsHello(_) => "Verified a Windows Hello signature",
+        }
+    }
+}
+
+/// The response a retried request carries, and the challenge it answers, taken once for every key-based method.
+struct Answer<'r> {
+    response: Option<&'r crate::proto::AuthorizationResponse>,
+    challenge: Option<crate::ssh_agent_presence::PendingChallenge<CheckGuard>>,
+    /// The method of the answered challenge.
+    method: Option<&'static str>,
+    /// Whether the declined method has been passed in the method order.
+    passed: bool,
+}
+
+impl<'r> Answer<'r> {
+    /// A declined challenge is dropped at once, ending its check before the next method asks.
+    fn new(
+        response: Option<&'r crate::proto::AuthorizationResponse>,
+        challenge: Option<crate::ssh_agent_presence::PendingChallenge<CheckGuard>>,
+    ) -> Self {
+        let method = challenge.as_ref().map(|c| c.method());
+        let challenge = challenge.filter(|_| crate::ssh_agent_presence::is_signed(response));
+        Self {
+            response,
+            challenge,
+            method,
+            passed: false,
+        }
+    }
+
+    /// Whether a decline covers `method`: challenges are issued in method order, so a decline covers its own method
+    /// and every one before it. A decline of an unknown challenge covers all.
+    fn declines(&mut self, method: &str) -> bool {
+        match self.method {
+            None => true,
+            Some(_) if self.passed => false,
+            Some(declined) => {
+                self.passed = declined == method;
+                true
+            }
+        }
+    }
 }
 
 /// Human checks waiting for an answer. A policy approval and credential checks are never pending together, so a
@@ -1490,14 +1643,23 @@ impl Authorizer {
         };
         let mut tried = vec![];
         let mut allowed = false;
+        let anchored_ssh_agent =
+            crate::policy::settings::EffectiveSettings::anchored_keys(&decision.anchor);
+        let anchored_windows_hello =
+            crate::policy::settings::EffectiveSettings::anchored_windows_hello_keys(
+                &decision.anchor,
+            );
+        let helper_sha256 =
+            Some(decision.anchor.windows_hello_helper_sha256.clone()).filter(|s| !s.is_empty());
+        let mut answer = Answer::new(response, challenge.take());
         for method in &decision.anchor.methods {
-            if method == METHOD_SSH_AGENT {
-                let keys =
-                    crate::policy::settings::EffectiveSettings::anchored_keys(&decision.anchor);
-                if keys.is_empty() {
+            if method == METHOD_SSH_AGENT || method == METHOD_WINDOWS_HELLO {
+                let Some(keys) =
+                    KeySet::from_keys(method, &anchored_ssh_agent, &anchored_windows_hello)
+                else {
                     tried.push(format!("{method}: the approval anchor holds no key"));
                     continue;
-                }
+                };
                 let binding = crate::ssh_agent_presence::Binding {
                     pid: peer.pid,
                     start_time: peer.start_time,
@@ -1511,7 +1673,7 @@ impl Authorizer {
                     ),
                 };
                 // An outstanding approval challenge keeps the approval pending.
-                match shared.ssh_agent_check(binding, response, challenge.take(), &keys, || {
+                match shared.key_check(keys, binding, &mut answer, helper_sha256.as_deref(), || {
                     Ok(approval_guard.take())
                 }) {
                     Ok(KeyCheck::Verified { fingerprint, .. }) => {
@@ -1519,7 +1681,8 @@ impl Authorizer {
                             pid = peer.pid,
                             origin,
                             key = fingerprint,
-                            "Verified a signature from the SSH agent for the policy approval"
+                            "{} for the policy approval",
+                            keys.verified_message()
                         );
                         allowed = true;
                         break;
@@ -1528,6 +1691,7 @@ impl Authorizer {
                         tried.push(format!("{method}: declined ({reason})"));
                         continue;
                     }
+                    Ok(KeyCheck::Skipped) => continue,
                     Err(refusal) => {
                         if refusal.reason() != Reason::Challenge {
                             tracing::info!(pid = peer.pid, origin, reason = ?refusal.reason(), detail = refusal.detail, "Policy approval refused");
@@ -3789,7 +3953,8 @@ mod tests {
     ) -> Fixture {
         let key = crate::ssh_agent_presence::test_support::key();
         let mut effective = crate::policy::files::Effective::with_engine(engine);
-        effective.settings.methods = crate::policy::settings::default_methods(true);
+        effective.settings.methods =
+            crate::policy::settings::default_methods(&[crate::ssh_agent_presence::METHOD]);
         effective.settings.ssh_agent_keys = vec![crate::policy::settings::SshAgentKeyEntry {
             key: key.to_openssh(),
             require_user_verification: false,
@@ -3985,6 +4150,171 @@ mod tests {
         assert!(refusal.detail.contains("platform"), "{refusal:?}");
     }
 
+    /// The built-in policy with an ssh-agent key, a Windows Hello key or both, in the default order.
+    fn keys_fixture(ssh_agent: bool, windows_hello: bool) -> Fixture {
+        let mut effective = crate::policy::files::Effective::with_engine(
+            crate::policy::Engine::builtin(true).unwrap(),
+        );
+        let mut keyed = vec![];
+        if ssh_agent {
+            let key = crate::ssh_agent_presence::test_support::key();
+            effective.settings.ssh_agent_keys = vec![crate::policy::settings::SshAgentKeyEntry {
+                key: key.to_openssh(),
+                require_user_verification: false,
+            }];
+            effective.ssh_agent_keys = vec![key];
+            keyed.push(crate::ssh_agent_presence::METHOD);
+        }
+        if windows_hello {
+            let key = crate::windows_hello::test_support::key();
+            effective.settings.windows_hello_keys =
+                vec![crate::policy::settings::WindowsHelloKeyEntry {
+                    name: key.name.clone(),
+                    public_key: key.to_base64(),
+                }];
+            effective.settings.windows_hello_helper_sha256 = Some("ab".repeat(32));
+            effective.windows_hello_keys = vec![key];
+            keyed.push(crate::windows_hello::METHOD);
+        }
+        effective.settings.methods = crate::policy::settings::default_methods(&keyed);
+        fixture_with_policy(
+            crate::policy::files::PolicyFiles::fixed(effective),
+            MockServices::answering(R::Allowed, ""),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_windows_hello_challenge() {
+        use crate::windows_hello::test_support::signed;
+        let f = keys_fixture(false, true);
+        assert_eq!(
+            f.authorizer.methods().await,
+            vec!["windows-hello", "platform"]
+        );
+        let ctx = || {
+            Some(crate::proto::ClientContext {
+                intent: Some(crate::proto::client_context::Intent::CredentialProcess(
+                    crate::proto::CredentialProcessIntent {},
+                )),
+                cwd: b"/home/alice".to_vec(),
+                ..Default::default()
+            })
+        };
+        let retry = |r| f.pending(10, None, "admin", ctx().map(|c| responding(c, r)));
+        let c = challenge_of(f.decide(f.pending(10, None, "admin", ctx())).await);
+        assert_eq!(c.method, "windows-hello");
+        assert_eq!(
+            c.key_fingerprints,
+            vec![crate::windows_hello::test_support::key().fingerprint()]
+        );
+        assert_eq!(c.windows_hello_helper_sha256, "ab".repeat(32));
+        let authorized = f.decide(retry(signed(&c))).await.unwrap();
+        assert_eq!(
+            authorized.presence,
+            crate::policy::Presence::fresh("windows-hello")
+        );
+
+        let invalid = |r: Result<Authorized, Refusal>| {
+            assert_eq!(r.unwrap_err().reason(), Reason::InvalidResponse);
+        };
+        // Replayed.
+        invalid(f.decide(retry(signed(&c))).await);
+        // A signature over another statement.
+        let c = challenge_of(f.decide(f.pending(10, None, "admin", ctx())).await);
+        let mut other = c.clone();
+        other.statement = b"x".to_vec();
+        let mut response = signed(&other);
+        response.challenge_id = c.challenge_id.clone();
+        invalid(f.decide(retry(response)).await);
+        // An SSHSIG for a windows-hello challenge.
+        let c = challenge_of(f.decide(f.pending(10, None, "admin", ctx())).await);
+        invalid(
+            f.decide(retry(crate::ssh_agent_presence::test_support::signed(&c)))
+                .await,
+        );
+        assert_eq!(f.services.prompts(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_key_methods_in_order() {
+        use crate::ssh_agent_presence::test_support::declined;
+        let f = keys_fixture(true, true);
+        assert_eq!(
+            f.authorizer.methods().await,
+            vec!["ssh-agent", "windows-hello", "platform"]
+        );
+        let ctx = exec_context("terraform apply", false);
+        let decide = |r: Option<crate::proto::AuthorizationResponse>| {
+            let ctx = ctx.clone();
+            let f = &f;
+            async move {
+                let ctx = match r {
+                    Some(r) => responding(ctx, r),
+                    None => ctx,
+                };
+                f.decide(f.pending(10, Some(TTY), "admin", Some(ctx))).await
+            }
+        };
+        // ssh-agent first; its decline leads to windows-hello, whose signature permits.
+        let c = challenge_of(decide(None).await);
+        assert_eq!(c.method, "ssh-agent");
+        let c = challenge_of(decide(Some(declined(&c))).await);
+        assert_eq!(c.method, "windows-hello");
+        let authorized = decide(Some(crate::windows_hello::test_support::signed(&c)))
+            .await
+            .unwrap();
+        assert_eq!(authorized.presence.method.as_deref(), Some("windows-hello"));
+        assert_eq!(f.services.prompts(), 0);
+
+        // Declining windows-hello too moves on to the platform, not back to ssh-agent.
+        let f = keys_fixture(true, true);
+        let decide = |r: Option<crate::proto::AuthorizationResponse>| {
+            let ctx = ctx.clone();
+            let f = &f;
+            async move {
+                let ctx = match r {
+                    Some(r) => responding(ctx, r),
+                    None => ctx,
+                };
+                f.decide(f.pending(10, Some(TTY), "admin", Some(ctx))).await
+            }
+        };
+        let c = challenge_of(decide(None).await);
+        let c = challenge_of(decide(Some(declined(&c))).await);
+        assert_eq!(c.method, "windows-hello");
+        let authorized = decide(Some(declined(&c))).await.unwrap();
+        assert_eq!(authorized.presence.method.as_deref(), Some("platform"));
+        assert_eq!(f.services.prompts(), 1);
+        assert!(f.authorizer.shared.challenges.lock().is_empty());
+
+        // A cancelled prompt denies, with no other method asking, and ends the check.
+        let f = keys_fixture(true, true);
+        let decide = |r: Option<crate::proto::AuthorizationResponse>| {
+            let ctx = ctx.clone();
+            let f = &f;
+            async move {
+                let ctx = match r {
+                    Some(r) => responding(ctx, r),
+                    None => ctx,
+                };
+                f.decide(f.pending(10, Some(TTY), "admin", Some(ctx))).await
+            }
+        };
+        let c = challenge_of(decide(None).await);
+        let c = challenge_of(decide(Some(declined(&c))).await);
+        let cancelled = crate::proto::AuthorizationResponse {
+            challenge_id: c.challenge_id.clone(),
+            result: Some(crate::proto::authorization_response::Result::Declined(
+                crate::ssh_agent_presence::DECLINED_CANCELLED.to_owned(),
+            )),
+        };
+        let refusal = decide(Some(cancelled)).await.unwrap_err();
+        assert_eq!(refusal.reason(), Reason::Denied);
+        assert!(refusal.detail.contains("Windows Hello"), "{refusal:?}");
+        assert_eq!(f.services.prompts(), 0);
+        assert!(f.authorizer.shared.challenges.lock().is_empty());
+    }
+
     #[tokio::test]
     async fn test_ssh_agent_prefetch_never_challenged() {
         let f = key_fixture(
@@ -4145,7 +4475,7 @@ mod tests {
         record.approval = Some(crate::proto::platform::ApprovalAnchor {
             methods: vec!["ssh-agent".to_owned()],
             ssh_agent_keys: vec![key.to_anchor_line()],
-            windows_hello_keys: vec![],
+            ..Default::default()
         });
         services.stores.strong.lock().record = Some(record);
         let f = dir_fixture(&dir, services.clone()).await;

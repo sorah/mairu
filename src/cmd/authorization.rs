@@ -52,11 +52,11 @@ pub fn context_lines(
 }
 
 /// The lines of "What the human sees" before the SSH agent is asked to sign with the key named `comment`.
-pub fn ssh_agent_lines(
+pub fn signer_lines(
     server: &str,
     role: &str,
     context: &crate::proto::ClientContext,
-    comment: &str,
+    signer: crate::ssh_agent_presence::Signer<'_>,
     caller_arn: Option<&str>,
     tools: Option<&str>,
 ) -> String {
@@ -67,9 +67,7 @@ pub fn ssh_agent_lines(
         context,
         caller_arn,
         tools,
-        &format!(
-            "Approve the signature on your SSH agent ({comment}) to authorize {role} on {server}"
-        ),
+        &format!("{} to authorize {role} on {server}", signer.instruction()),
     )
 }
 
@@ -174,9 +172,11 @@ pub async fn assume_role_with_notice(
         let req = req.clone();
         let relay = relay.clone();
         async move {
-            let signature_notice = |refusal: &crate::proto::AuthorizationError, comment: &str| {
-                ssh_agent_notice(&req, refusal, comment)
-            };
+            let signature_notice =
+                |refusal: &crate::proto::AuthorizationError,
+                 signer: crate::ssh_agent_presence::Signer<'_>| {
+                    signer_notice(&req, refusal, signer)
+                };
             relay
                 .with_challenges(signature_notice, |response| {
                     let mut agent = agent.clone();
@@ -236,16 +236,16 @@ pub async fn assume_role_quietly(
     resp
 }
 
-fn ssh_agent_notice(
+fn signer_notice(
     req: &crate::proto::AssumeRoleRequest,
     refusal: &crate::proto::AuthorizationError,
-    comment: &str,
+    signer: crate::ssh_agent_presence::Signer<'_>,
 ) -> String {
-    ssh_agent_lines(
+    signer_lines(
         &req.server_id,
         &req.rolespec().role,
         &req.client_context.clone().unwrap_or_default(),
-        comment,
+        signer,
         Some(&refusal.caller_arn),
         tools_summary(&refusal.tools).as_deref(),
     )

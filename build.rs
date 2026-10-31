@@ -1,6 +1,11 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // minimum_versions() names its own input, which turns off Cargo's default of rerunning on any change.
     println!("cargo:rerun-if-changed=proto");
+    windows_hello_helper_sha256()?;
+    // On Windows only mairu-windows-hello builds, and the library is empty.
+    if std::env::var("CARGO_CFG_TARGET_FAMILY").as_deref() != Ok("unix") {
+        return Ok(());
+    }
     tonic_prost_build::configure()
         .message_attribute("mairu.Credentials", "#[derive(zeroize::ZeroizeOnDrop)]")
         .field_attribute("mairu.Credentials.expiration", "#[zeroize(skip)]")
@@ -56,5 +61,20 @@ fn minimum_versions() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or_else(|| format!("Cargo.toml lacks package.metadata.mairu.{key}"))?;
         println!("cargo:rustc-env={env}={value}");
     }
+    Ok(())
+}
+
+/// Re-exports `MAIRU_WINDOWS_HELLO_HELPER_SHA256`, the SHA-256 of the helper a release ships, after checking its form.
+fn windows_hello_helper_sha256() -> Result<(), Box<dyn std::error::Error>> {
+    const NAME: &str = "MAIRU_WINDOWS_HELLO_HELPER_SHA256";
+    println!("cargo:rerun-if-env-changed={NAME}");
+    let Ok(value) = std::env::var(NAME) else {
+        return Ok(());
+    };
+    let value = value.trim().to_ascii_lowercase();
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("{NAME} is not a hex SHA-256: {value:?}").into());
+    }
+    println!("cargo:rustc-env={NAME}={value}");
     Ok(())
 }

@@ -64,6 +64,21 @@ jobs:
       - run: cargo build --target ${{ matrix.target }} --no-default-features --features platform-helper --bin mairu-platform-helper
       - run: cargo clippy --target ${{ matrix.target }} --no-default-features --features platform-helper --all-targets -- -D warnings
 
+  windows-hello-helper:
+    name: cargo build (Windows Hello helper)
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with: { target: "${{ matrix.target }}" }
+      - run: rustup component add clippy
+      - run: cargo build --target ${{ matrix.target }} --no-default-features --features windows-hello-helper --bin mairu-windows-hello
+      - run: cargo clippy --target ${{ matrix.target }} --no-default-features --features windows-hello-helper --all-targets -- -D warnings
+
   linux-hardened:
     name: linux-hardened
     runs-on: ubuntu-latest

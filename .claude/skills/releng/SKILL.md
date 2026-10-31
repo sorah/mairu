@@ -40,7 +40,7 @@ If signing fails with `Inappropriate ioctl for device`, ask the user to unlock t
 
 ## 4. Release workflow
 
-The tag triggers `.github/workflows/release.yml`: test -> create-release (DRAFT, checks the tag matches `Cargo.toml`) -> upload-binaries (linux musl x86_64/aarch64 with rustls, x86_64/aarch64 apple-darwin; each archive holds `mairu` and its attestation `mairu.sigstore.json`) and upload-debs (attested too) -> publish-crate (crates.io trusted publishing, runs last).
+The tag triggers `.github/workflows/release.yml`: test -> create-release (DRAFT, checks the tag matches `Cargo.toml`) -> upload-binaries (linux musl x86_64/aarch64 with rustls, x86_64/aarch64 apple-darwin; each archive holds `mairu` and its attestation `mairu.sigstore.json`) and upload-debs (attested too), both after windows-hello (builds `mairu-windows-hello.exe` for x86_64/aarch64-pc-windows-msvc, attests it, uploads `mairu-windows-hello-<target>.zip`; the Linux archives and debs ship the matching `.exe` and record its SHA-256) -> publish-crate (crates.io trusted publishing, runs last).
 
 Watch it (`gh run watch`). (user) The user publishes the draft release.
 

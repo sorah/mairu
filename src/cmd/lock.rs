@@ -110,11 +110,13 @@ pub async fn run_unlock(args: &UnlockArgs) -> Result<(), anyhow::Error> {
         )
     };
     let relay = crate::ssh_agent_presence::Relay::from_env();
-    let signature_notice = |_: &crate::proto::AuthorizationError, comment: &str| {
-        format!(
-            ":: {product} :: Approve the signature on your SSH agent ({comment}) to remove the tool marks of {tty} ({labels})\n"
-        )
-    };
+    let signature_notice =
+        |_: &crate::proto::AuthorizationError, signer: crate::ssh_agent_presence::Signer<'_>| {
+            format!(
+                ":: {product} :: {} to remove the tool marks of {tty} ({labels})\n",
+                signer.instruction()
+            )
+        };
     let resp = crate::polkit_tty_agent::with_fallback(notice, |_| {
         let agent = agent.clone();
         let req = req.clone();

@@ -89,9 +89,10 @@ pub async fn run(_args: &DoctorArgs) -> Result<(), anyhow::Error> {
         matches!(state, crate::hardening::HardeningState::Hardened { .. }),
         |s| s.agent_hardening() == crate::proto::HardeningState::Hardened,
     );
-    let (policy_warnings, ssh_agent_keys) = print_policy(agent_hardened, agent_status.as_ref());
+    let (policy_warnings, keys) = print_policy(agent_hardened, agent_status.as_ref());
     warnings.extend(policy_warnings);
-    warnings.extend(ssh_agent::report(&ssh_agent_keys).await);
+    warnings.extend(ssh_agent::report(&keys.ssh_agent).await);
+    warnings.extend(windows_hello::report(&keys).await);
 
     #[cfg(target_os = "linux")]
     warnings.extend(headless::report(agent_status.as_ref()));
@@ -200,39 +201,38 @@ fn print_agent_status(
     }
 }
 
+/// The keys and helper pin in force, as the client computes them.
+#[derive(Debug, Default)]
+pub struct Keys {
+    pub ssh_agent: Vec<crate::ssh_agent_presence::RegisteredKey>,
+    pub windows_hello: Vec<crate::windows_hello::RegisteredKey>,
+    pub windows_hello_helper_sha256: Option<String>,
+}
+
+impl Keys {
+    pub fn of(effective: &crate::policy::files::Effective) -> Self {
+        Self {
+            ssh_agent: effective.ssh_agent_keys.clone(),
+            windows_hello: effective.windows_hello_keys.clone(),
+            windows_hello_helper_sha256: effective.settings.windows_hello_helper_sha256.clone(),
+        }
+    }
+}
+
 /// The policy files evaluated here, for the state the agent reports, or as unapproved without an agent. Returns
-/// warnings and the keys registered for the ssh-agent method.
+/// warnings and the keys registered for the key-based methods.
 fn print_policy(
     hardened: bool,
     status: Option<&crate::proto::GetAgentStatusResponse>,
-) -> (Vec<String>, Vec<crate::ssh_agent_presence::RegisteredKey>) {
+) -> (Vec<String>, Keys) {
     use crate::policy::settings::PolicyState;
     let mut warnings = vec![];
     let dir = crate::config::config_dir();
-    let (policy, settings) = crate::policy::files::PolicyFiles::read_contents(&dir);
-    let state = match status.map(|s| s.policy_integrity()) {
-        Some(crate::proto::PolicyIntegrity::Approved) => Some(PolicyState::Approved),
-        Some(crate::proto::PolicyIntegrity::Unapproved) => Some(PolicyState::Unapproved),
-        Some(crate::proto::PolicyIntegrity::Tampered) => Some(PolicyState::Tampered),
-        Some(crate::proto::PolicyIntegrity::Absent) => Some(PolicyState::Absent),
-        _ => None,
-    };
-    let built = match state {
-        Some(state) => crate::policy::files::Effective::build_for(
-            state,
-            hardened,
-            &policy,
-            &settings,
-            &status
-                .and_then(|s| s.approval_anchor.clone())
-                .unwrap_or_else(crate::policy::integrity_state::default_anchor),
-        ),
-        None => crate::policy::files::Effective::build(hardened, &policy, &settings),
-    };
-    let mut keys = vec![];
+    let (state, built) = crate::policy::files::Effective::for_status(&dir, hardened, status);
+    let mut keys = Keys::default();
     match built {
         Ok(effective) => {
-            keys = effective.ssh_agent_keys.clone();
+            keys = Keys::of(&effective);
             let own = effective
                 .engine
                 .policy_ids()
@@ -292,6 +292,97 @@ fn print_policy(
         }
     }
     (warnings, keys)
+}
+
+/// Whether the Windows Hello helper can run here, matches its pin, and holds a registered key.
+mod windows_hello {
+    /// Prints the windows-hello section when Windows Hello is in play here; returns warnings.
+    pub async fn report(keys: &super::Keys) -> Vec<String> {
+        let mut warnings = vec![];
+        let interop = crate::windows_hello::interop_available();
+        if !interop {
+            if !keys.windows_hello.is_empty() {
+                warnings.push("windows_hello_keys are registered, and Windows Hello needs WSL2 with interop, which this is not, so the next method asks instead".to_owned());
+            }
+            return warnings;
+        }
+        println!("windows-hello");
+        let config = crate::config::UserConfig::load().await.unwrap_or_default();
+        let source = if config.windows_hello_helper.is_some() {
+            "windows_hello_helper"
+        } else {
+            "shipped"
+        };
+        let Some(path) = crate::windows_hello::Helper::locate(&config) else {
+            println!(
+                "  helper        not found (no {} next to mairu, no windows_hello_helper in config.json)",
+                crate::windows_hello::HELPER_FILE_NAME
+            );
+            print_registered(keys, None);
+            if !keys.windows_hello.is_empty() {
+                warnings.push(format!("windows_hello_keys are registered, and there is no {}, so the windows-hello method declines; set windows_hello_helper in config.json to the helper from the release", crate::windows_hello::HELPER_FILE_NAME));
+            }
+            return warnings;
+        };
+        let helper = crate::windows_hello::Helper {
+            path,
+            pin: crate::windows_hello::Pin::resolve(keys.windows_hello_helper_sha256.as_deref()),
+            hardened: crate::hardening::Hardening::marker().is_some(),
+        };
+        println!("  helper        {} ({source})", helper.path.display());
+        match crate::windows_hello::digest(&helper.path) {
+            Ok(actual) => println!("  sha256        {actual}"),
+            Err(e) => println!("  sha256        unreadable ({e})"),
+        }
+        println!("  pin           {}", helper.pin);
+        if let Err(e) = helper.check() {
+            println!("  check         {e}");
+            print_registered(keys, None);
+            warnings.push(format!("the Windows Hello helper is not run: {e}"));
+            return warnings;
+        }
+        let key = match helper.public_key().await {
+            Ok(spki) => {
+                let fingerprint = crate::windows_hello::fingerprint(&spki);
+                println!("  key           {fingerprint}");
+                Some(fingerprint)
+            }
+            Err(e) if e.is_not_enrolled() => {
+                println!("  key           none; `mairu policy enroll-windows-hello` creates it");
+                None
+            }
+            Err(e) => {
+                println!("  key           unknown; the helper failed ({e})");
+                warnings.push(format!(
+                    "the Windows Hello helper at {} failed: {e}",
+                    helper.path.display()
+                ));
+                None
+            }
+        };
+        print_registered(keys, key.as_deref());
+        if !keys.windows_hello.is_empty()
+            && !key
+                .as_deref()
+                .is_some_and(|k| keys.windows_hello.iter().any(|r| r.fingerprint() == k))
+        {
+            warnings.push("no registered windows_hello_keys entry matches the Windows Hello key here, so the windows-hello method declines and the next method asks".to_owned());
+        }
+        warnings
+    }
+
+    fn print_registered(keys: &super::Keys, held: Option<&str>) {
+        if keys.windows_hello.is_empty() {
+            println!("  registered    none");
+        }
+        for key in &keys.windows_hello {
+            let state = match held {
+                Some(k) if k == key.fingerprint() => " (this Windows Hello key)",
+                _ => "",
+            };
+            println!("  registered    {} {}{state}", key.fingerprint(), key.name);
+        }
+    }
 }
 
 /// Whether `$SSH_AUTH_SOCK` reaches an SSH agent, and which registered keys it holds.
