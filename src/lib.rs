@@ -71,6 +71,8 @@ pub mod authorization;
 pub mod ecs_server;
 #[cfg(feature = "cli")]
 pub mod policy;
+#[cfg(feature = "cli")]
+pub mod polkit_tty_agent;
 
 #[cfg(any(feature = "cli", feature = "platform-services"))]
 pub mod cmd;

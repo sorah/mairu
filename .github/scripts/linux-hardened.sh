@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Integration checks for a hardened Linux host: classification, peer verification both ways, unverified-agent
-# replacement, the platform helper, authorization through polkit, re-exec and `mairu harden` itself. Runs as a user
-# with passwordless sudo, after `cargo build`.
+# replacement, the platform helper, authorization through polkit and pkttyagent, re-exec and `mairu harden` itself.
+# Runs as a user with passwordless sudo, after `cargo build`.
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -97,6 +97,33 @@ check "lock revokes the grant" has "Revoked 1 grant(s) and 0 lease(s)" "$out"
 capture "$hardened" credential-process ci 123456789012/CI
 check "after lock the role asks again" has "authorization was denied" "$out"
 sudo rm -f "$rules"
+sleep 2
+
+echo "--- password prompt through pkttyagent"
+# polkit's defaults ask for the user's password, and no authentication agent covers a CI process: the client
+# registers pkttyagent on its terminal. expect provides the terminal and types the password.
+password="mairu-ci-$RANDOM$RANDOM"
+echo "$(id -un):$password" | sudo chpasswd
+prompt_exp="$(mktemp)"
+cat >"$prompt_exp" <<'EOF'
+set timeout 30
+spawn {*}$argv
+expect {
+  "Password:" { sleep 0.5; send "$env(PW)\r"; exp_continue }
+  eof
+}
+EOF
+capture env PW="$password" expect "$prompt_exp" "$hardened" credential-process ci 123456789012/Tty
+check "the client prints the context and asks for the password" has "Enter your password below" "$out"
+check "the prompt is polkit's text agent" has "AUTHENTICATING FOR co.0w0.mairu.assume-role" "$out"
+check "right password: approved" has "Authentication Needed" "$out"
+# shellcheck disable=SC2016
+check "pkttyagent is gone afterwards" bash -c '! pgrep -u "$(id -u)" -x pkttyagent'
+capture env PW=wrong-password expect "$prompt_exp" "$hardened" credential-process ci 123456789012/TtyWrong
+check "wrong password: denied" has "authorization was denied" "$out"
+capture setsid -w "$hardened" credential-process ci 123456789012/NoTty </dev/null
+check "no terminal: refused with guidance" has "no terminal to ask for a password on" "$out"
+rm -f "$prompt_exp"
 rm -f ~/.config/mairu/servers.d/ci.json
 "$hardened" kill-agent >/dev/null 2>&1
 

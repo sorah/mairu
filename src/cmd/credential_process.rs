@@ -65,7 +65,7 @@ pub async fn run(args: &CredentialProcessArgs) -> Result<(), anyhow::Error> {
     let resp = if crate::terminal::is_terminal().await {
         crate::cmd::authorization::assume_role_with_notice(&mut agent, req, false).await
     } else {
-        agent.assume_role(req).await
+        crate::cmd::authorization::assume_role_quietly(&mut agent, req).await
     };
 
     match resp {

@@ -276,7 +276,30 @@ Callers without a terminal, such as an IDE running `credential-process`, are rem
 
 `mairu lock` makes the agent forget every approval; `--session` forgets only those of the current terminal session, and `--running` also those of running `mairu exec`, which then ask again on their next refresh.
 
-Without a polkit authentication agent for the requesting process, as in tmux over SSH without a desktop session, prompts cannot be shown and requests that need one fail. An unhardened agent never asks. `mairu doctor` shows the remembered approvals and whether polkit can be used.
+An unhardened agent never asks. `mairu doctor` shows the remembered approvals and whether polkit can be used.
+
+### Tmux over SSH
+
+Without a desktop session, as over SSH or in tmux, polkit has no authentication agent to show a dialog. mairu then runs polkit's own text agent, `/usr/bin/pkttyagent`, for itself on its terminal, and polkit asks for your login password right there:
+
+```
+:: mairu :: Authorization required: 123456789012/Admin on contoso
+:: mairu ::   command: terraform apply
+:: mairu ::   cwd:     /home/u/src/infra
+:: mairu ::   from:    /dev/pts/3 (zsh, tmux pane)
+:: mairu :: Enter your password below.
+==== AUTHENTICATING FOR co.0w0.mairu.assume-role ====
+Authentication is required to provide AWS credentials to a mairu command
+Authenticating as: u
+Password:
+```
+
+- Each tmux pane is its own terminal session: an approval covers one pane, survives detaching and reattaching from a new SSH connection, and a new pane asks again.
+- `pkttyagent` is used only from `/usr/bin/pkttyagent`, root-owned and not writable by others, never through `PATH`.
+- A command without a terminal, such as a cron job or an AI tool's shell command, cannot be asked, and is refused when it needs approval.
+- `mairu doctor` shows the terminal, SSH, polkit and `pkttyagent` state, and warns when a prompt could not be shown.
+
+Typing a password into a terminal has the same exposure as `sudo` in that terminal: echo is off, so capturing the pane's output does not reveal it, but programs running as you can capture keystrokes by reading the pty, through tmux key bindings, by printing a fake prompt first, or with ptrace when `kernel.yama.ptrace_scope` is 0. polkit asks for the same password as `sudo`, so where you type the sudo password into tmux, such programs can already become root. Prefer a PAM setup a captured password cannot satisfy (see [Root](#root)).
 
 ### Harden home
 
@@ -310,7 +333,7 @@ Until a host is hardened, mairu suggests it at most once an hour on a terminal. 
 Root can replace the hardened copy and read the agent's memory, so hardening protects your credentials only as well as root is protected from programs running as you. `mairu doctor` warns when `sudo -n true` succeeds or you are in `docker`, `lxd`, `incus-admin` or `disk`.
 
 - Avoid `NOPASSWD` sudo rules and root-equivalent groups for your user.
-- Back `sudo` and polkit's `polkit-1` PAM stack with something a captured password cannot replay, such as `pam_u2f` locally, or `pam_ssh_agent_auth` with an approval-protected key over SSH.
+- Back `sudo` and polkit's `polkit-1` PAM stack (`/etc/pam.d/polkit-1`) with something a captured password cannot replay, such as `pam_u2f` locally, or `pam_ssh_agent_auth` with an approval-protected key over SSH. On a local machine, `pam_fprintd` or `pam_u2f` in `polkit-1` makes the prompt ask for a fingerprint or a security key instead of a password.
 
 ### Packaging
 
