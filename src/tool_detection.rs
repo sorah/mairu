@@ -56,6 +56,38 @@ impl ToolLabel {
         }]
     }
 
+    /// The built-in labels plus `tool_detection` from `authorization.json`; names for an existing label extend it.
+    pub fn effective(
+        additions: &std::collections::BTreeMap<String, crate::policy::settings::ToolDetectionEntry>,
+    ) -> Vec<Self> {
+        let mut labels = Self::builtin();
+        for (name, entry) in additions {
+            let index = match labels.iter().position(|l| &l.name == name) {
+                Some(i) => i,
+                None => {
+                    labels.push(Self {
+                        name: name.clone(),
+                        process_names: vec![],
+                        env_names: vec![],
+                    });
+                    labels.len() - 1
+                }
+            };
+            let label = &mut labels[index];
+            for n in &entry.process_names {
+                if !label.process_names.contains(n) {
+                    label.process_names.push(n.clone());
+                }
+            }
+            for n in &entry.env_names {
+                if !label.env_names.contains(n) {
+                    label.env_names.push(n.clone());
+                }
+            }
+        }
+        labels
+    }
+
     pub fn is_valid_name(name: &str) -> bool {
         !name.is_empty()
             && name

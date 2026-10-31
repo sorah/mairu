@@ -23,6 +23,8 @@ pub mod login;
 #[cfg(feature = "platform-services")]
 pub mod platform_helper;
 #[cfg(feature = "cli")]
+pub mod policy;
+#[cfg(feature = "cli")]
 pub mod refresh;
 #[cfg(feature = "cli")]
 pub mod setup_sso;

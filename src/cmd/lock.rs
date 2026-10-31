@@ -20,7 +20,7 @@ pub struct UnlockArgs {
     tools: Vec<String>,
 }
 
-fn parse_label(s: &str) -> Result<String, String> {
+pub fn parse_label(s: &str) -> Result<String, String> {
     if crate::tool_detection::ToolLabel::is_valid_name(s) {
         Ok(s.to_owned())
     } else {

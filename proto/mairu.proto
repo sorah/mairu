@@ -45,6 +45,8 @@ service Agent {
   rpc RevokeAuthorizations(RevokeAuthorizationsRequest) returns (RevokeAuthorizationsResponse);
   // Always asks the human.
   rpc UnmarkTools(UnmarkToolsRequest) returns (UnmarkToolsResponse);
+  // The policy and settings in force; needs a trusted peer and no authorization.
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
 }
 
 message PingAgentRequest {
@@ -130,6 +132,23 @@ message UnmarkToolsRequest {
 }
 message UnmarkToolsResponse {
   repeated string remaining = 1;   // labels still marked on the caller's session
+}
+
+enum PolicyIntegrity {
+  POLICY_INTEGRITY_UNSPECIFIED = 0;
+  POLICY_INTEGRITY_ABSENT = 1;
+  POLICY_INTEGRITY_APPROVED = 2;    // reserved for approval records
+  POLICY_INTEGRITY_UNAPPROVED = 3;
+  POLICY_INTEGRITY_TAMPERED = 4;    // reserved for approval records
+}
+
+message GetPolicyRequest {}
+message GetPolicyResponse {
+  string effective_policies = 1;       // Cedar text actually in force, built-ins included
+  string effective_settings_json = 2;  // authorization.json as in force
+  PolicyIntegrity integrity = 3;
+  reserved 4, 5, 7;                    // integrity details
+  repeated string notes = 6;           // e.g. "dropped forbid policy.cedar#3: validation error ..."
 }
 
 message ListSessionsRequest {
