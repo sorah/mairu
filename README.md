@@ -322,11 +322,20 @@ forbid (principal, action == Mairu::Action::"UseCredentials", resource in Mairu:
 unless { context.presence.verified && context.presence.scope == "request" };
 ```
 
-Any program running as you can edit this file, so for now the agent applies only its `forbid` policies, on top of the built-in policies. A `forbid` can only take permissions away, so it takes effect as soon as you save it, on hardened and unhardened agents alike; on an unhardened agent that is how you deny a role. `permit` policies are written but ignored until approving a policy is supported. A file that does not parse is ignored as a whole, and a `forbid` that fails validation is dropped; `mairu policy show` lists both.
+Any program running as you can edit this file, so until you approve it the agent applies only its `forbid` policies, on top of the built-in policies. A `forbid` can only take permissions away, so it takes effect as soon as you save it, on hardened and unhardened agents alike; on an unhardened agent that is how you deny a role. A file that does not parse is ignored as a whole, and a `forbid` that fails validation is dropped; `mairu policy show` lists both.
+
+`mairu policy approve` puts the whole file in force, `permit` policies and settings included. It prints both files, every server config in `servers.d` and an approval digest, asks `Proceed to authorize this policy? [y/N]` on the terminal (or takes `--confirm <approval digest>` instead), and only then asks for approval through polkit. The agent records a digest of the files and of each server config where same-user code cannot write it: `/var/lib/mairu/users/<uid>` on a hardened host, and a Secret Service item (GNOME Keyring, KeePassXC) as a weaker copy. An unhardened agent approves through the Secret Service item alone; without one its policy stays unapproved.
+
+- Editing either file after approval means **lockdown** until you approve again: every request needs a fresh approval, AI agents are refused, and the file's `forbid` policies still apply. Every mairu command prints a warning meanwhile, and `mairu doctor` shows each store's status.
+- A server whose config changed since approval is refused until approved again, and a server added later gets the built-in policies for its roles. The digest is of the config your session logged in with, so log in again after approving a server change.
+- The next approval asks through the `approval_methods` recorded by the last one, never through what the files say now.
+- Only one approval runs at a time, and never while a credential prompt is pending: a request that would prompt during an approval is refused with "a policy approval is pending from /dev/pts/N".
+- If you can no longer approve, root removes the record with `sudo mairu harden --reset-policy-record --user <name>`; the next approval then asks through polkit again.
 
 - `mairu policy init [--force]` writes templates: the hardened built-in policies with comments, and a minimal `authorization.json`.
 - `mairu policy check` validates both files locally, lists every policy, and flags each `permit` that can apply without a human check or depends on a tool label.
-- `mairu policy show` prints what the agent has in force, and why anything was ignored.
+- `mairu policy show` prints what the agent has in force, the policy state, each integrity store's status, each server's state, and why anything was ignored.
+- `mairu policy approve [--confirm DIGEST]` approves the files and server configs.
 - `mairu policy explain <server> <role> [--tool LABEL] [--exec CMD] [--cwd PATH] [--assume-role ARN] [--age SECS] [--idle SECS]` prints what the policy decides with no check, under a lease, under a session grant, and after a fresh check.
 - `mairu policy schema` prints the schema, for `cedar validate --schema` and similar tools.
 
@@ -338,7 +347,7 @@ A request has `Mairu::User` as principal, `Mairu::Action::"AssumeRole"` (before 
 | `intent`, `exec_command`, `exec_command_line`, `cwd`, `chained_role_arn` | whoever runs mairu | narrow a `permit` that also requires `context.presence.verified`, or `forbid` |
 | `tools`, `tool_matches` | names any program can produce or avoid | restrict, or grant knowingly |
 
-Callers without a terminal, such as IDEs running `credential-process`, are asked about once an hour under the built-in policies. Once a policy can be approved, this relaxes that for them:
+Callers without a terminal, such as IDEs running `credential-process`, are asked about once an hour under the built-in policies. An approved policy can relax that for them:
 
 ```cedar
 // IDEs and other callers without a tty: reuse a grant for up to 1 hour idle.
@@ -354,7 +363,7 @@ when {
 };
 ```
 
-Settings that are not policies live in `~/.config/mairu/authorization.json`. Unknown fields are rejected, and while the file is unapproved only what tightens applies:
+Settings that are not policies live in `~/.config/mairu/authorization.json`. Unknown fields are rejected, and until the file is approved only what tightens applies:
 
 ```json
 {
@@ -368,8 +377,9 @@ Settings that are not policies live in `~/.config/mairu/authorization.json`. Unk
 ```
 
 - `tool_detection` adds labels, or names to the built-in `ai-agent` label, for `context.tools`.
-- `grant_retention_secs` bounds how long an approval is kept at all; the default and maximum is 43200.
-- `methods`, `sts` (the STS region and endpoint) and `network` (`proxy` and `extra_roots`) are accepted and validated, but ignored until the file is approved.
+- `grant_retention_secs` bounds how long an approval is kept at all; the default is 43200, which is also the maximum until the file is approved.
+- `methods`, `approval_methods` (who may approve the next change; `["platform"]` for now) and `sts` (the region and endpoint of `sts:GetCallerIdentity`, also per server) apply once the file is approved.
+- `network` (`proxy` and `extra_roots`) is accepted and validated, but not supported yet.
 
 ### Tmux over SSH
 

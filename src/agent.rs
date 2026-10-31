@@ -9,13 +9,14 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Needs a Tokio runtime.
-    pub fn new(
+    /// Verifies the policy files once before serving.
+    pub async fn new(
         shutdown_tx: tokio::sync::oneshot::Sender<()>,
         platform_helper: crate::platform::helper::HelperClient,
     ) -> Result<Self, anyhow::Error> {
         let platform_helper = std::sync::Arc::new(platform_helper);
         let authorizer = crate::authorization::Authorizer::from_config(platform_helper.clone())
+            .await
             .map_err(|e| anyhow::anyhow!("failed to build the authorization policy: {e}"))?;
         Ok(Self {
             auth_flow_manager: crate::auth_flow_manager::AuthFlowManager::new(),
@@ -37,6 +38,71 @@ impl Agent {
         capabilities.notes = notes;
         capabilities
     }
+
+    /// The policy state, or `UNSPECIFIED` when not even the built-ins could be built.
+    async fn policy_integrity(&self) -> PolicyIntegrity {
+        self.authorizer
+            .policy()
+            .await
+            .map_or(PolicyIntegrity::Unspecified, |v| v.state.to_proto())
+    }
+
+    /// The digest of a server's config captured in its session, or of its file when not logged in.
+    fn captured_server_digest(
+        &self,
+        server: &crate::config::Server,
+    ) -> (crate::policy::integrity_state::Digest, bool) {
+        match self.session_manager.get(server.id()) {
+            Ok(session) if session.server().id() == server.id() => (
+                crate::policy::integrity_state::server_digest(session.server()),
+                true,
+            ),
+            _ => (crate::policy::integrity_state::server_digest(server), false),
+        }
+    }
+
+    /// Every server of `servers.d` and every logged-in server, with the digest that decides its state.
+    async fn server_integrity(
+        &self,
+        verified: &crate::policy::files::Verified,
+    ) -> Result<Vec<ServerIntegrity>, tonic::Status> {
+        let servers = crate::config::Server::find_all_from_fs()
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut entries = vec![];
+        for server in &servers {
+            seen.insert(server.id().to_owned());
+            let (digest, logged_in) = self.captured_server_digest(server);
+            entries.push((server.id().to_owned(), digest, logged_in));
+        }
+        for session in self.session_manager.list() {
+            if seen.insert(session.server().id().to_owned()) {
+                entries.push((
+                    session.server().id().to_owned(),
+                    crate::policy::integrity_state::server_digest(session.server()),
+                    true,
+                ));
+            }
+        }
+        Ok(entries
+            .into_iter()
+            .map(|(server_id, digest, logged_in)| {
+                use crate::policy::integrity_state::ServerState;
+                let state = match verified.server_state(&server_id, &digest) {
+                    ServerState::Approved => server_integrity::State::Approved,
+                    ServerState::Unapproved => server_integrity::State::Unapproved,
+                    ServerState::Changed => server_integrity::State::Changed,
+                };
+                ServerIntegrity {
+                    server_id,
+                    state: state.into(),
+                    digest: digest.to_vec(),
+                    logged_in,
+                }
+            })
+            .collect())
+    }
 }
 
 impl std::fmt::Debug for Agent {
@@ -54,6 +120,7 @@ impl crate::proto::agent_server::Agent for Agent {
     ) -> Result<tonic::Response<PingAgentResponse>, tonic::Status> {
         Ok(tonic::Response::new(PingAgentResponse {
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            policy_integrity: self.policy_integrity().await.into(),
         }))
     }
 
@@ -84,6 +151,7 @@ impl crate::proto::agent_server::Agent for Agent {
                 }
             });
         let (grants, leases) = self.authorizer.counts();
+        let verified = self.authorizer.policy().await.ok();
         let agent_hardening = match crate::hardening::Hardening::state() {
             crate::hardening::HardeningState::Unhardened { .. } => HardeningState::Unhardened,
             crate::hardening::HardeningState::Hardened { .. } => HardeningState::Hardened,
@@ -99,6 +167,15 @@ impl crate::proto::agent_server::Agent for Agent {
             platform_helper: self.platform_helper.describe(),
             authorization_methods: self.authorizer.methods().await,
             profile: crate::config::Profile::current().name().to_owned(),
+            policy_integrity: verified
+                .as_ref()
+                .map_or(PolicyIntegrity::Unspecified, |v| v.state.to_proto())
+                .into(),
+            policy_stores: verified
+                .as_ref()
+                .map(|v| v.stores.clone())
+                .unwrap_or_default(),
+            approval_anchor: verified.as_ref().map(|v| v.anchor.clone()),
         }))
     }
 
@@ -172,12 +249,14 @@ impl crate::proto::agent_server::Agent for Agent {
             .extensions()
             .get::<std::sync::Arc<crate::platform::PeerIdentity>>()
             .cloned();
+        let (server_digest, _) = self.captured_server_digest(&server_config);
         // Before the session and cache lookups, so that a refused request fetches nothing.
         let authorized = self
             .authorizer
             .authorize_assume_role(crate::authorization::Request {
                 peer: peer.as_deref(),
                 server: &server_config,
+                server_digest,
                 user_config: &user_config,
                 rolespec: &rolespec,
                 client_context: request.get_ref().client_context.as_ref(),
@@ -636,20 +715,88 @@ impl crate::proto::agent_server::Agent for Agent {
         request: tonic::Request<GetPolicyRequest>,
     ) -> Result<tonic::Response<GetPolicyResponse>, tonic::Status> {
         Self::require_trusted(&request)?;
-        let effective = self
+        let verified = self
             .authorizer
             .policy()
+            .await
             .map_err(|e| tonic::Status::internal(format!("failed to build the policy: {e}")))?;
-        let integrity = match effective.state {
-            crate::policy::settings::PolicyState::Absent => PolicyIntegrity::Absent,
-            crate::policy::settings::PolicyState::Unapproved => PolicyIntegrity::Unapproved,
+        let servers = self.server_integrity(&verified).await?;
+        let server_id = &request.get_ref().server_id;
+        let mut notes = verified.notes();
+        let effective = if server_id.is_empty() {
+            verified.effective.clone()
+        } else {
+            // A server the agent does not know is not in the record either.
+            let state = servers
+                .iter()
+                .find(|s| &s.server_id == server_id)
+                .and_then(|entry| entry.digest.as_slice().try_into().ok())
+                .map_or(
+                    crate::policy::integrity_state::ServerState::Unapproved,
+                    |digest| verified.server_state(server_id, &digest),
+                );
+            match verified.for_server(state) {
+                Some(effective) => {
+                    if !std::sync::Arc::ptr_eq(&effective, &verified.effective) {
+                        notes = effective.notes.clone();
+                        notes.insert(
+                            0,
+                            format!("server '{server_id}' is not approved, so its roles get the unapproved policy"),
+                        );
+                    }
+                    effective
+                }
+                None => {
+                    return Err(tonic::Status::failed_precondition(format!(
+                        "server '{server_id}' changed since the policy was approved, so its roles are refused"
+                    )));
+                }
+            }
         };
         Ok(tonic::Response::new(GetPolicyResponse {
             effective_policies: effective.engine.text().to_owned(),
             effective_settings_json: effective.settings.to_json(),
-            integrity: integrity.into(),
-            notes: effective.notes.clone(),
+            integrity: verified.state.to_proto().into(),
+            digest: verified.digest.to_vec(),
+            stores: verified.stores.clone(),
+            notes,
+            servers,
+            approval_anchor: Some(verified.anchor.clone()),
         }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn approve_policy(
+        &self,
+        request: tonic::Request<ApprovePolicyRequest>,
+    ) -> Result<tonic::Response<ApprovePolicyResponse>, tonic::Status> {
+        Self::require_trusted(&request)?;
+        let peer = request
+            .extensions()
+            .get::<std::sync::Arc<crate::platform::PeerIdentity>>()
+            .cloned();
+        let servers = crate::config::Server::find_all_from_fs()
+            .await
+            .map_err(|e| tonic::Status::failed_precondition(e.to_string()))?;
+        let req = request.get_ref();
+        let resp = self
+            .authorizer
+            .approve_policy(crate::authorization::Approval {
+                peer: peer.as_deref(),
+                expected_digest: &req.expected_digest,
+                expected_server_digests: &req.expected_server_digests,
+                server_digests: servers
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.id().to_owned(),
+                            crate::policy::integrity_state::server_digest(s),
+                        )
+                    })
+                    .collect(),
+            })
+            .await?;
+        Ok(tonic::Response::new(resp))
     }
 
     #[tracing::instrument(skip_all)]
@@ -1180,14 +1327,16 @@ pub async fn connect_to_agent_with_path(
         trust: identity.trust,
     });
     let ping = client.ping_agent(tonic::Request::new(crate::proto::PingAgentRequest {}));
-    let version = if identity.trust == crate::platform::AgentTrust::Unverified {
+    let (version, policy_integrity) = if identity.trust == crate::platform::AgentTrust::Unverified {
         // A squatter may never answer. It is replaced either way, so its version is informational.
         match tokio::time::timeout(UNVERIFIED_PING_TIMEOUT, ping).await {
-            Ok(Ok(pong)) => pong.into_inner().version,
-            _ => String::new(),
+            Ok(Ok(pong)) => (pong.into_inner().version, PolicyIntegrity::Unspecified),
+            _ => (String::new(), PolicyIntegrity::Unspecified),
         }
     } else {
-        ping.await?.into_inner().version
+        let pong = ping.await?.into_inner();
+        let integrity = pong.policy_integrity();
+        (pong.version, integrity)
     };
     let conn = AgentConn {
         client,
@@ -1209,6 +1358,16 @@ pub async fn connect_to_agent_with_path(
                 client_version = crate::version::VERSION,
             )
         ).await;
+    }
+
+    if policy_integrity == PolicyIntegrity::Tampered {
+        tracing::warn!("the policy is in lockdown");
+        let product = env!("CARGO_PKG_NAME");
+        crate::terminal::send(&format!(
+            ":: {product} :: Warning | {}",
+            crate::policy::files::LOCKDOWN_WARNING
+        ))
+        .await;
     }
 
     Ok(conn)

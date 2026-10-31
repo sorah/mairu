@@ -89,7 +89,7 @@ pub async fn run(_args: &DoctorArgs) -> Result<(), anyhow::Error> {
         matches!(state, crate::hardening::HardeningState::Hardened { .. }),
         |s| s.agent_hardening() == crate::proto::HardeningState::Hardened,
     );
-    print_policy(agent_hardened);
+    warnings.extend(print_policy(agent_hardened, agent_status.as_ref()));
 
     #[cfg(target_os = "linux")]
     warnings.extend(headless::report(agent_status.as_ref()));
@@ -168,11 +168,30 @@ fn print_agent_status(
     }
 }
 
-/// The policy files as the agent would read them, evaluated here so that no agent RPC is needed.
-fn print_policy(hardened: bool) {
+/// The policy files evaluated here, for the state the agent reports, or as unapproved without an agent. Returns
+/// warnings.
+fn print_policy(
+    hardened: bool,
+    status: Option<&crate::proto::GetAgentStatusResponse>,
+) -> Vec<String> {
+    use crate::policy::settings::PolicyState;
+    let mut warnings = vec![];
     let dir = crate::config::config_dir();
     let (policy, settings) = crate::policy::files::PolicyFiles::read_contents(&dir);
-    match crate::policy::files::Effective::build(hardened, &policy, &settings) {
+    let state = match status.map(|s| s.policy_integrity()) {
+        Some(crate::proto::PolicyIntegrity::Approved) => Some(PolicyState::Approved),
+        Some(crate::proto::PolicyIntegrity::Unapproved) => Some(PolicyState::Unapproved),
+        Some(crate::proto::PolicyIntegrity::Tampered) => Some(PolicyState::Tampered),
+        Some(crate::proto::PolicyIntegrity::Absent) => Some(PolicyState::Absent),
+        _ => None,
+    };
+    let built = match state {
+        Some(state) => {
+            crate::policy::files::Effective::build_for(state, hardened, &policy, &settings)
+        }
+        None => crate::policy::files::Effective::build(hardened, &policy, &settings),
+    };
+    match built {
         Ok(effective) => {
             let own = effective
                 .engine
@@ -180,16 +199,59 @@ fn print_policy(hardened: bool) {
                 .iter()
                 .filter(|id| !id.starts_with(crate::policy::BUILTIN_PREFIX))
                 .count();
-            println!(
-                "policy   {} ({own} forbid policies of yours apply)",
-                effective.state.as_str()
-            );
+            let state = state.unwrap_or(effective.state);
+            let detail = match effective.state {
+                PolicyState::Approved => format!("{own} policies of yours apply"),
+                _ => format!("{own} forbid policies of yours apply"),
+            };
+            let detail = if state == PolicyState::Tampered {
+                format!("lockdown; {detail}")
+            } else {
+                detail
+            };
+            println!("policy   {} ({detail})", state.as_str());
             for note in &effective.notes {
                 println!("  note: {note}");
+            }
+            if state == PolicyState::Tampered {
+                warnings.push(crate::policy::files::LOCKDOWN_WARNING.to_owned());
             }
         }
         Err(e) => println!("policy   error: {e}"),
     }
+    let Some(status) = status else {
+        return warnings;
+    };
+    for store in &status.policy_stores {
+        let detail = if store.detail.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", store.detail)
+        };
+        let generation = store
+            .stored
+            .as_ref()
+            .map(|r| format!(" generation {}", r.generation))
+            .unwrap_or_default();
+        println!(
+            "  store: {} {}{generation}{detail}",
+            crate::platform::integrity::store_name(store.store()),
+            crate::platform::integrity::status_name(store.status()),
+        );
+    }
+    if let Some(anchor) = &status.approval_anchor {
+        println!("  approval: {}", anchor.methods.join(", "));
+        let has_keys = !anchor.ssh_agent_keys.is_empty() || !anchor.windows_hello_keys.is_empty();
+        if has_keys
+            && anchor
+                .methods
+                .iter()
+                .any(|m| m == crate::authorization::METHOD_PLATFORM)
+        {
+            warnings.push("the approval anchor allows \"platform\" while keys are registered, so a captured password can approve a policy that registers someone else's key; remove it from approval_methods and approve again".to_owned());
+        }
+    }
+    warnings
 }
 
 fn describe_capabilities(caps: &crate::proto::platform::Capabilities) -> String {

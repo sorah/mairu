@@ -144,6 +144,7 @@ message RecordIntegrityRequest {
   string name = 1;   // "policy"
   uint32 uid = 2;
   IntegrityRecord record = 3;
+  repeated IntegrityStoreKind stores = 4;  // only these stores; every available store when empty
 }
 message RecordIntegrityResponse { repeated IntegrityStoreResult results = 1; }
 

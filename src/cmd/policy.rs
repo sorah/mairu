@@ -17,8 +17,14 @@ enum PolicyCommand {
     },
     /// Validate the policy files, list their policies and flag risky permits (no agent involved)
     Check,
-    /// Show the policies and settings the agent has in force
+    /// Show the policies and settings the agent has in force, the integrity stores and each server's state
     Show,
+    /// Approve the policy files and server configs, so that the agent applies them in full
+    Approve {
+        /// Skip the confirmation question when DIGEST is the approval digest this command prints
+        #[arg(long, value_name = "DIGEST")]
+        confirm: Option<String>,
+    },
     /// Show what the agent's policy decides for a request, for each way it could be covered
     Explain(ExplainArgs),
     /// Print the Cedar schema policies are validated against
@@ -65,6 +71,7 @@ pub fn run(args: &PolicyArgs) -> Result<(), anyhow::Error> {
         PolicyCommand::Init { force } => init(*force),
         PolicyCommand::Check => check(),
         PolicyCommand::Show => show(),
+        PolicyCommand::Approve { confirm } => approve(confirm.as_deref()),
         PolicyCommand::Explain(a) => explain(a),
         PolicyCommand::Schema => {
             print!("{}", crate::policy::schema_text());
@@ -97,7 +104,7 @@ fn init(force: bool) -> Result<(), anyhow::Error> {
         println!("Wrote {}", path.display());
     }
     println!(
-        "Edit them, then run `mairu policy check`. Until the files are approved, only their forbid policies apply."
+        "Edit them, then run `mairu policy check` and `mairu policy approve`. Until the files are approved, only their forbid policies apply."
     );
     Ok(())
 }
@@ -156,7 +163,8 @@ fn check() -> Result<(), anyhow::Error> {
                     .any(|p| p.effect() == cedar_policy::Effect::Permit)
                 {
                     warnings.push(
-                        "permit policies are ignored while the policy is unapproved".to_owned(),
+                        "permit policies apply only once approved with `mairu policy approve`"
+                            .to_owned(),
                     );
                 }
             }
@@ -171,18 +179,24 @@ fn check() -> Result<(), anyhow::Error> {
                 Err(e) => errors.push(format!("{}: {e}", settings_path.display())),
                 Ok(s) => {
                     println!("{}  valid", settings_path.display());
-                    let ignored: Vec<&str> = [
+                    let relaxing: Vec<&str> = [
                         ("methods", s.methods.is_some()),
+                        ("approval_methods", s.approval_methods.is_some()),
                         ("sts", s.sts.is_some()),
-                        ("network", s.network.is_some()),
                     ]
                     .into_iter()
                     .filter_map(|(name, set)| set.then_some(name))
                     .collect();
-                    if !ignored.is_empty() {
+                    if !relaxing.is_empty() {
                         warnings.push(format!(
-                            "{} in {} are ignored while it is unapproved",
-                            ignored.join(", "),
+                            "{} in {} apply only once approved",
+                            relaxing.join(", "),
+                            crate::policy::files::SETTINGS_FILE_NAME
+                        ));
+                    }
+                    if s.network.is_some() {
+                        warnings.push(format!(
+                            "network in {} is not supported by this mairu yet and is ignored",
                             crate::policy::files::SETTINGS_FILE_NAME
                         ));
                     }
@@ -204,23 +218,62 @@ fn check() -> Result<(), anyhow::Error> {
     }
 }
 
-async fn get_policy() -> Result<crate::proto::GetPolicyResponse, anyhow::Error> {
+async fn get_policy(server_id: &str) -> Result<crate::proto::GetPolicyResponse, anyhow::Error> {
     let mut agent = crate::cmd::agent::connect_or_start().await?;
     Ok(agent
-        .get_policy(crate::proto::GetPolicyRequest {})
+        .get_policy(crate::proto::GetPolicyRequest {
+            server_id: server_id.to_owned(),
+        })
         .await?
         .into_inner())
 }
 
 #[tokio::main]
 async fn show() -> Result<(), anyhow::Error> {
-    let resp = get_policy().await?;
+    let resp = get_policy("").await?;
     let detail = match resp.integrity() {
         crate::proto::PolicyIntegrity::Absent => " (built-in policies only)",
         crate::proto::PolicyIntegrity::Unapproved => " (built-ins plus your forbid policies)",
-        _ => "",
+        crate::proto::PolicyIntegrity::Approved => " (your policy.cedar and authorization.json)",
+        crate::proto::PolicyIntegrity::Tampered => " (lockdown plus your forbid policies)",
+        crate::proto::PolicyIntegrity::Unspecified => "",
     };
     println!("policy   {}{detail}", describe_integrity(resp.integrity()));
+    if !resp.digest.is_empty() {
+        println!("digest   {}", crate::platform::integrity::hex(&resp.digest));
+    }
+    for store in &resp.stores {
+        let generation = store
+            .stored
+            .as_ref()
+            .map(|r| format!(" generation {}", r.generation))
+            .unwrap_or_default();
+        let detail = if store.detail.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", store.detail)
+        };
+        println!(
+            "store    {} {}{generation}{detail}",
+            crate::platform::integrity::store_name(store.store()),
+            crate::platform::integrity::status_name(store.status()),
+        );
+    }
+    if let Some(anchor) = &resp.approval_anchor {
+        println!("approval {}", anchor.methods.join(", "));
+    }
+    for server in &resp.servers {
+        let state = match server.state() {
+            crate::proto::server_integrity::State::Approved => "approved",
+            crate::proto::server_integrity::State::Unapproved => "unapproved",
+            crate::proto::server_integrity::State::Changed => {
+                "changed (refused until approved again)"
+            }
+            crate::proto::server_integrity::State::Unspecified => "unknown",
+        };
+        let source = if server.logged_in { "session" } else { "file" };
+        println!("server   {} {state} ({source})", server.server_id);
+    }
     for note in &resp.notes {
         println!("note     {note}");
     }
@@ -231,6 +284,230 @@ async fn show() -> Result<(), anyhow::Error> {
     println!("# Policies in force");
     println!("{}", resp.effective_policies.trim_end());
     Ok(())
+}
+
+/// Each server of `servers.d`, with its counted fields and digest.
+async fn server_files() -> Result<
+    Vec<(
+        crate::config::Server,
+        crate::policy::integrity_state::Digest,
+    )>,
+    anyhow::Error,
+> {
+    Ok(crate::config::Server::find_all_from_fs()
+        .await?
+        .into_iter()
+        .map(|s| {
+            let d = crate::policy::integrity_state::server_digest(&s);
+            (s, d)
+        })
+        .collect())
+}
+
+#[tokio::main]
+async fn approve(confirm: Option<&str>) -> Result<(), anyhow::Error> {
+    use crate::platform::integrity::hex;
+    use crate::policy::files::Content;
+    let product = env!("CARGO_PKG_NAME");
+    check()?;
+    let dir = crate::config::config_dir();
+    let (policy, settings) = crate::policy::files::PolicyFiles::read_contents(&dir);
+    for (path, content) in [
+        (
+            crate::policy::files::PolicyFiles::policy_path(&dir),
+            &policy,
+        ),
+        (
+            crate::policy::files::PolicyFiles::settings_path(&dir),
+            &settings,
+        ),
+    ] {
+        println!();
+        match content {
+            Content::Absent => println!("# {} (absent)", path.display()),
+            Content::Text(text) => {
+                println!("# {}", path.display());
+                println!("{}", text.trim_end());
+            }
+            Content::Unreadable(e) => anyhow::bail!("{}: {e}", path.display()),
+        }
+    }
+    let servers = server_files().await?;
+    println!();
+    println!("# Servers ({})", dir.join("servers.d").display());
+    if servers.is_empty() {
+        println!("(none)");
+    }
+    for (server, digest) in &servers {
+        println!("{}  {}", server.id(), hex(digest));
+        println!(
+            "    {}",
+            crate::policy::integrity_state::server_counted_json(server)
+        );
+    }
+    let digest = crate::policy::integrity_state::policy_digest(&policy, &settings);
+    let server_digests: std::collections::BTreeMap<String, crate::policy::integrity_state::Digest> =
+        servers
+            .iter()
+            .map(|(s, d)| (s.id().to_owned(), *d))
+            .collect();
+    let approval_digest = hex(&crate::policy::integrity_state::approval_digest(
+        &digest,
+        &server_digests,
+    ));
+    println!();
+    println!("policy digest    {}", hex(&digest));
+    println!("approval digest  {approval_digest}");
+
+    let mut agent = crate::cmd::agent::connect_or_start().await?;
+    let current = agent
+        .get_policy(crate::proto::GetPolicyRequest::default())
+        .await?
+        .into_inner();
+    println!(
+        "current state    {}",
+        describe_integrity(current.integrity())
+    );
+    let mut relogin = vec![];
+    for server in &current.servers {
+        if server.logged_in
+            && let Some(file) = server_digests.get(&server.server_id)
+            && server.digest.as_slice() != file.as_slice()
+        {
+            println!(
+                "warning  the session of server '{}' holds another config than servers.d; log in to it again after approving",
+                server.server_id
+            );
+            relogin.push(server.server_id.clone());
+        }
+    }
+    println!();
+
+    let instruction = format!(
+        "To approve without the question, run:\n    {product} policy approve --confirm {approval_digest}"
+    );
+    match confirm {
+        Some(given) if given == approval_digest => {}
+        Some(_) => {
+            eprintln!("The policy differs from the digest given to --confirm. {instruction}");
+            return Err(crate::Error::FailureButSilentlyExit.into());
+        }
+        None => match ask_to_proceed().await? {
+            Some(true) => {}
+            Some(false) => {
+                eprintln!("Not approved.");
+                return Err(crate::Error::FailureButSilentlyExit.into());
+            }
+            None => {
+                eprintln!("There is no terminal to ask on. {instruction}");
+                return Err(crate::Error::FailureButSilentlyExit.into());
+            }
+        },
+    }
+
+    let req = crate::proto::ApprovePolicyRequest {
+        expected_digest: digest.to_vec(),
+        client_context: Some(crate::proto::ClientContext {
+            env_names: crate::tool_detection::env_names(),
+            ..Default::default()
+        }),
+        expected_server_digests: server_digests
+            .iter()
+            .map(|(id, d)| (id.clone(), d.to_vec()))
+            .collect(),
+    };
+    let notice = |_: &crate::proto::AuthorizationError| {
+        format!(
+            ":: {product} :: Policy approval required: {approval_digest}\n:: {product} :: Enter your password below.\n"
+        )
+    };
+    let resp = crate::polkit_tty_agent::with_fallback(notice, |attempt| {
+        let mut agent = agent.clone();
+        let req = req.clone();
+        async move {
+            match attempt {
+                crate::polkit_tty_agent::Attempt::First => {
+                    approve_while_waiting(&mut agent, req).await
+                }
+                crate::polkit_tty_agent::Attempt::Retry => agent.approve_policy(req).await,
+            }
+        }
+    })
+    .await;
+    let resp = match resp {
+        Ok(r) => r.into_inner(),
+        Err(status) => {
+            let message = crate::cmd::authorization::refusal_message(&status)
+                .unwrap_or_else(|| status.message().to_owned());
+            eprintln!("Not approved: {message}");
+            return Err(crate::Error::FailureButSilentlyExit.into());
+        }
+    };
+    println!(
+        "Approved; the policy is {}.",
+        describe_integrity(resp.integrity())
+    );
+    for store in &resp.stores {
+        let detail = if store.detail.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", store.detail)
+        };
+        let status = match store.status() {
+            crate::proto::platform::IntegrityStatus::Matched => "recorded",
+            _ => "skipped",
+        };
+        println!(
+            "store    {} {status}{detail}",
+            crate::platform::integrity::store_name(store.store())
+        );
+    }
+    for id in relogin {
+        println!(
+            "Log in to '{id}' again (`{product} login {id}`) so that its session uses the approved config."
+        );
+    }
+    Ok(())
+}
+
+/// Prints that the agent waits for the approval, not for credentials, once it takes long enough to be prompting.
+async fn approve_while_waiting(
+    agent: &mut crate::agent::AgentConn,
+    req: crate::proto::ApprovePolicyRequest,
+) -> tonic::Result<tonic::Response<crate::proto::ApprovePolicyResponse>> {
+    let product = env!("CARGO_PKG_NAME");
+    let resp = agent.approve_policy(req);
+    let notice = tokio::time::sleep(std::time::Duration::from_millis(500));
+    tokio::pin!(resp, notice);
+    let mut noticed = false;
+    loop {
+        tokio::select! {
+            retval = &mut resp => return retval,
+            _ = &mut notice, if !noticed => {
+                noticed = true;
+                crate::terminal::send(&format!(":: {product} :: Waiting for the policy approval (not for AWS credentials). Approve in the system dialog if one appears.")).await;
+            }
+        }
+    }
+}
+
+/// `Proceed to authorize this policy? [y/N]` on the terminal; `None` without one.
+async fn ask_to_proceed() -> Result<Option<bool>, anyhow::Error> {
+    use tokio::io::AsyncBufReadExt;
+    if !crate::terminal::is_terminal().await {
+        return Ok(None);
+    }
+    let Ok(tty) = std::fs::OpenOptions::new().read(true).open("/dev/tty") else {
+        return Ok(None);
+    };
+    let mut reader = tokio::io::BufReader::with_capacity(16, tokio::fs::File::from_std(tty));
+    crate::terminal::send("Proceed to authorize this policy? [y/N] \0").await;
+    let mut answer = String::new();
+    reader.read_line(&mut answer).await?;
+    Ok(Some(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    )))
 }
 
 fn describe_integrity(integrity: crate::proto::PolicyIntegrity) -> &'static str {
@@ -245,7 +522,7 @@ fn describe_integrity(integrity: crate::proto::PolicyIntegrity) -> &'static str 
 
 #[tokio::main]
 async fn explain(args: &ExplainArgs) -> Result<(), anyhow::Error> {
-    let resp = get_policy().await?;
+    let resp = get_policy(&args.server).await?;
     let engine = crate::policy::Engine::from_text(&resp.effective_policies)?;
     let settings: serde_json::Value = serde_json::from_str(&resp.effective_settings_json)?;
     let methods: Vec<String> = settings["methods"]

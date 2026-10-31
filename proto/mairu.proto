@@ -47,12 +47,16 @@ service Agent {
   rpc UnmarkTools(UnmarkToolsRequest) returns (UnmarkToolsResponse);
   // The policy and settings in force; needs a trusted peer and no authorization.
   rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
+  // Records the policy files and server configs after asking the human; needs a trusted peer.
+  rpc ApprovePolicy(ApprovePolicyRequest) returns (ApprovePolicyResponse);
 }
 
 message PingAgentRequest {
 }
 message PingAgentResponse {
   string version = 1;
+  // Lets every client warn about lockdown without an extra RPC.
+  PolicyIntegrity policy_integrity = 2;
 }
 
 message GetServerRequest {
@@ -137,18 +141,47 @@ message UnmarkToolsResponse {
 enum PolicyIntegrity {
   POLICY_INTEGRITY_UNSPECIFIED = 0;
   POLICY_INTEGRITY_ABSENT = 1;
-  POLICY_INTEGRITY_APPROVED = 2;    // reserved for approval records
+  POLICY_INTEGRITY_APPROVED = 2;
   POLICY_INTEGRITY_UNAPPROVED = 3;
-  POLICY_INTEGRITY_TAMPERED = 4;    // reserved for approval records
+  POLICY_INTEGRITY_TAMPERED = 4;
 }
 
-message GetPolicyRequest {}
+message GetPolicyRequest {
+  // When set, effective_policies and effective_settings_json are those in force for this server's roles.
+  string server_id = 1;
+}
 message GetPolicyResponse {
   string effective_policies = 1;       // Cedar text actually in force, built-ins included
   string effective_settings_json = 2;  // authorization.json as in force
   PolicyIntegrity integrity = 3;
-  reserved 4, 5, 7;                    // integrity details
+  bytes digest = 4;                    // digest of the files as read
+  repeated mairu.platform.IntegrityStoreResult stores = 5;
   repeated string notes = 6;           // e.g. "dropped forbid policy.cedar#3: validation error ..."
+  repeated ServerIntegrity servers = 7;
+  mairu.platform.ApprovalAnchor approval_anchor = 8;  // the anchor in force
+}
+
+message ServerIntegrity {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_APPROVED = 1;
+    STATE_UNAPPROVED = 2;
+    STATE_CHANGED = 3;
+  }
+  string server_id = 1;
+  State state = 2;
+  bytes digest = 3;                    // of the config captured in the session, or of the file when not logged in
+  bool logged_in = 4;
+}
+
+message ApprovePolicyRequest {
+  bytes expected_digest = 1;
+  ClientContext client_context = 2;
+  map<string, bytes> expected_server_digests = 3;   // server id -> server digest
+}
+message ApprovePolicyResponse {
+  PolicyIntegrity integrity = 1;
+  repeated mairu.platform.IntegrityStoreResult stores = 2;
 }
 
 message ListSessionsRequest {
@@ -253,6 +286,9 @@ message GetAgentStatusResponse {
   string platform_helper = 8;  // e.g. "running pid=4321 verified", "unavailable: helper-unverified"
   repeated string authorization_methods = 9;  // effective order, e.g. ["platform"]
   string profile = 10;  // "default" or "dev"
+  PolicyIntegrity policy_integrity = 5;
+  repeated mairu.platform.IntegrityStoreResult policy_stores = 11;
+  mairu.platform.ApprovalAnchor approval_anchor = 12;  // the anchor in force
 }
 
 // A client as the agent sees it.
@@ -277,6 +313,7 @@ message AuthorizationError {
     REASON_UNAVAILABLE = 5;              // FAILED_PRECONDITION: no method could ask the human
     REASON_NO_AUTHENTICATION_AGENT = 7;  // FAILED_PRECONDITION: polkit has no agent for the requesting process
     REASON_PRESENCE_REQUIRED = 9;        // FAILED_PRECONDITION: pre-fetch needs a fresh check; nobody was asked
+    REASON_CHECK_PENDING = 10;           // FAILED_PRECONDITION: a policy approval waits for its check; the detail names its terminal
   }
   Reason reason = 1;
   string detail = 2;

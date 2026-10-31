@@ -3,6 +3,7 @@
 
 #[cfg(feature = "cli")]
 pub mod helper;
+pub mod integrity;
 pub mod process;
 #[cfg(feature = "platform-services")]
 pub mod services;

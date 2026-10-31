@@ -125,6 +125,7 @@ type FlightKey = (u32, u64, [u8; 32]);
 
 struct Shared {
     policy: crate::policy::files::PolicyFiles,
+    checks: std::sync::Arc<parking_lot::Mutex<Checks>>,
     services: std::sync::Arc<dyn crate::platform::PlatformServices>,
     identifier: std::sync::Arc<dyn crate::caller_identity::Identify>,
     process: &'static dyn crate::platform::ProcessPlatform,
@@ -166,6 +167,8 @@ impl std::fmt::Debug for Authorizer {
 pub struct Request<'a> {
     pub peer: Option<&'a crate::platform::PeerIdentity>,
     pub server: &'a crate::config::Server,
+    /// Of the config captured in the server's session, or of its file when not logged in.
+    pub server_digest: crate::policy::integrity_state::Digest,
     pub user_config: &'a crate::config::UserConfig,
     pub rolespec: &'a crate::proto::Rolespec,
     pub client_context: Option<&'a crate::proto::ClientContext>,
@@ -188,6 +191,8 @@ struct Pending {
     command_detail: Option<String>,
     digest: [u8; 32],
     detection: crate::tool_detection::Detection,
+    /// What is in force for this request's server, at both gates.
+    effective: std::sync::Arc<crate::policy::files::Effective>,
 }
 
 /// A permitted request. Report what was vended through [`Authorized::vended`].
@@ -285,26 +290,35 @@ impl Authorizer {
                 process,
                 clock,
                 hardened,
+                checks: Default::default(),
                 state: Default::default(),
                 inflight: Default::default(),
             }),
         }
     }
 
-    /// The policy files in `config_dir()` and the built-ins for this process's hardening state. Fails only when
-    /// the built-ins cannot be built.
-    pub fn from_config(
+    /// The policy files in `config_dir()`, verified against the stores of the platform helper, and the built-ins for
+    /// this process's hardening state. Fails only when the built-ins cannot be built.
+    pub async fn from_config(
         services: std::sync::Arc<dyn crate::platform::PlatformServices>,
     ) -> Result<Self, String> {
         let hardened = crate::hardening::Hardening::marker().is_some();
-        let policy = crate::policy::files::PolicyFiles::new(crate::config::config_dir(), hardened);
-        policy.load()?;
+        let policy = crate::policy::files::PolicyFiles::new(
+            crate::config::config_dir(),
+            hardened,
+            crate::policy::files::Stores {
+                services: services.clone(),
+                uid: nix::unistd::geteuid().as_raw(),
+                name: crate::policy::integrity_state::record_name().to_owned(),
+            },
+        );
+        policy.load().await?;
         Ok(Self::new(policy, services, hardened))
     }
 
-    /// The policy and settings in force now.
-    pub fn policy(&self) -> Result<std::sync::Arc<crate::policy::files::Effective>, String> {
-        self.shared.policy.load()
+    /// The policy and settings in force now, verified.
+    pub async fn policy(&self) -> Result<std::sync::Arc<crate::policy::files::Verified>, String> {
+        self.shared.policy.load().await
     }
 
     /// Live grants and leases.
@@ -321,11 +335,11 @@ impl Authorizer {
 
     /// The effective methods that could ask a human right now, in order.
     pub async fn methods(&self) -> Vec<String> {
-        let Ok(effective) = self.shared.policy.load() else {
+        let Ok(verified) = self.shared.policy.load().await else {
             return vec![];
         };
         let mut methods = vec![];
-        for method in &effective.settings.methods {
+        for method in &verified.effective.settings.methods {
             if method == METHOD_PLATFORM && self.shared.platform_usable().await.is_ok() {
                 methods.push(method.clone());
             }
@@ -380,7 +394,14 @@ impl Authorizer {
         peer: &crate::platform::PeerIdentity,
         env_names: &[String],
     ) -> (crate::tool_detection::Detection, Vec<String>) {
-        let detection = self.shared.detect(Some(peer), env_names);
+        let labels = self
+            .shared
+            .policy
+            .last()
+            .map_or_else(crate::tool_detection::ToolLabel::builtin, |v| {
+                v.effective.labels.clone()
+            });
+        let detection = self.shared.detect(Some(peer), env_names, &labels);
         let marks = self
             .shared
             .process
@@ -440,6 +461,12 @@ impl Authorizer {
                 format!("no method could ask for approval; tried {METHOD_PLATFORM}: {e}"),
             );
         }
+        let _check = match Checks::begin_check(&shared.checks, tty.clone()) {
+            Ok(guard) => guard,
+            Err(approval) => {
+                return refuse(Reason::CheckPending, Checks::approval_pending(&approval));
+            }
+        };
         let resp = shared.services.authorize(request).await;
         match resp.result() {
             R::Allowed => {
@@ -464,7 +491,33 @@ impl Authorizer {
     /// Gate 1. Decides; asks a human when the policy would permit the request after a check and nothing
     /// remembered does.
     pub async fn authorize_assume_role(&self, req: Request<'_>) -> Result<Authorized, Refusal> {
-        let pending = self.shared.pending(&req);
+        use crate::proto::authorization_error::Reason;
+        let verified = self.shared.policy.load().await.map_err(|e| {
+            Refusal::new(
+                Reason::NotPermitted,
+                format!("the authorization policy could not be built: {e}"),
+            )
+        })?;
+        let server_state = verified.server_state(req.server.id(), &req.server_digest);
+        let Some(effective) = verified.for_server(server_state) else {
+            tracing::warn!(
+                server_id = req.server.id(),
+                server_url = %req.server.url,
+                role = req.rolespec.role,
+                "Refused: the server changed since the policy was approved"
+            );
+            let mut refusal = Refusal::new(
+                Reason::Forbidden,
+                format!(
+                    "server '{}' ({}) changed since the policy was approved; review it and run `mairu policy approve`, then log in to it again",
+                    req.server.id(),
+                    req.server.url
+                ),
+            );
+            refusal.gate = crate::proto::GATE_ASSUME_ROLE.to_owned();
+            return Err(refusal);
+        };
+        let pending = self.shared.pending(&req, effective);
         if req
             .user_config
             .is_role_disallowed(req.server, &req.rolespec.role)
@@ -508,7 +561,7 @@ impl Authorizer {
         gate1: Authorized,
         caller: &crate::caller_identity::Caller,
     ) -> Result<Authorized, Refusal> {
-        if !self.shared.hardened {
+        if !gate1.pending.gate2(self.shared.hardened) {
             return Ok(gate1);
         }
         let result = self
@@ -561,7 +614,7 @@ impl Authorizer {
             (std::sync::Arc::new(fetch().await?), None, Source::Fetched)
         };
 
-        if !self.shared.hardened {
+        if !gate1.pending.gate2(self.shared.hardened) {
             if cacheable && source == Source::Fetched {
                 cache.store(rolespec.clone(), credentials.clone(), None);
             }
@@ -575,7 +628,12 @@ impl Authorizer {
 
         let caller = match caller {
             Some(caller) => caller,
-            None => match self.shared.identifier.identify(&credentials).await {
+            None => match self
+                .shared
+                .identifier
+                .identify(&credentials, &gate1.pending.sts_target())
+                .await
+            {
                 Ok(caller) => {
                     if source == Source::Cache {
                         cache.set_caller(rolespec, &credentials, caller.clone());
@@ -676,19 +734,23 @@ fn log_decision(
 
 impl Shared {
     fn grant_retention(&self) -> std::time::Duration {
-        self.policy.load().map_or_else(
-            |_| crate::policy::settings::EffectiveSettings::default().grant_retention(),
-            |e| e.settings.grant_retention(),
+        self.policy.last().map_or_else(
+            || crate::policy::settings::EffectiveSettings::default().grant_retention(),
+            |v| v.effective.settings.grant_retention(),
         )
     }
 
-    fn pending(&self, req: &Request<'_>) -> Pending {
+    fn pending(
+        &self,
+        req: &Request<'_>,
+        effective: std::sync::Arc<crate::policy::files::Effective>,
+    ) -> Pending {
         let platform = self.process;
         let env_names = req
             .client_context
             .map(|c| c.env_names.as_slice())
             .unwrap_or_default();
-        let detection = self.detect(req.peer, env_names);
+        let detection = self.detect(req.peer, env_names, &effective.labels);
         let session = req.peer.and_then(|p| platform.session_identity(p));
         let tty = req.peer.and_then(|p| platform.controlling_tty(p));
         let uid = req
@@ -711,6 +773,7 @@ impl Shared {
             },
             self.hardened,
             detection,
+            effective,
         );
         pending.pidfd = pidfd;
         pending
@@ -721,19 +784,16 @@ impl Shared {
         &self,
         peer: Option<&crate::platform::PeerIdentity>,
         env_names: &[String],
+        labels: &[crate::tool_detection::ToolLabel],
     ) -> crate::tool_detection::Detection {
         let ancestry = peer
             .map(|p| self.process.ancestry(p.pid, p.start_time, p.uid))
             .unwrap_or_default();
-        let labels = self.policy.load().map_or_else(
-            |_| crate::tool_detection::ToolLabel::builtin(),
-            |e| e.labels.clone(),
-        );
         crate::tool_detection::Detection::detect(
             &ancestry,
             env_names,
             &self.state.lock().marks,
-            &labels,
+            labels,
         )
     }
 
@@ -791,12 +851,7 @@ impl Shared {
             crate::policy::Action::AssumeRole => None,
             crate::policy::Action::UseCredentials(caller) => Some(caller),
         };
-        let effective = self.policy.load().map_err(|e| {
-            Refusal::new(
-                Reason::NotPermitted,
-                format!("the authorization policy could not be built: {e}"),
-            )
-        })?;
+        let effective = pending.effective.clone();
         let engine = &effective.engine;
         let retention = effective.settings.grant_retention();
         let prepared = engine.prepare(&pending.facts, action).map_err(|e| {
@@ -907,6 +962,14 @@ impl Shared {
                 tried.push(format!("{method}: {e}"));
                 continue;
             }
+            let origin = pending
+                .facts
+                .tty
+                .clone()
+                .unwrap_or_else(|| format!("pid {}", pending.pid));
+            let _check = Checks::begin_check(&self.checks, origin).map_err(|approval| {
+                Refusal::new(Reason::CheckPending, Checks::approval_pending(&approval))
+            })?;
             let resp = self.prompt(&pending, caller).await;
             use crate::proto::platform::authorize_response::Result as R;
             match resp.result() {
@@ -1033,6 +1096,329 @@ impl Shared {
     }
 }
 
+/// Human checks waiting for an answer. A policy approval and credential checks are never pending together, so a
+/// human expecting a credential prompt is never handed an approval prompt instead.
+#[derive(Debug, Default)]
+struct Checks {
+    next: u64,
+    approval: Option<(u64, String)>,
+    checks: std::collections::HashMap<u64, String>,
+}
+
+/// What kept an approval from starting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Busy {
+    Approval(String),
+    Check(String),
+}
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Busy::Approval(origin) => write!(f, "another policy approval is pending from {origin}"),
+            Busy::Check(origin) => write!(f, "a credential check is pending from {origin}"),
+        }
+    }
+}
+
+/// Ends its check when dropped.
+#[derive(Debug)]
+struct CheckGuard {
+    checks: std::sync::Arc<parking_lot::Mutex<Checks>>,
+    id: u64,
+}
+
+impl Drop for CheckGuard {
+    fn drop(&mut self) {
+        let mut checks = self.checks.lock();
+        checks.checks.remove(&self.id);
+        if checks
+            .approval
+            .as_ref()
+            .is_some_and(|(id, _)| *id == self.id)
+        {
+            checks.approval = None;
+        }
+    }
+}
+
+impl Checks {
+    /// A check that is not an approval; `Err` names the terminal of the pending approval.
+    fn begin_check(
+        checks: &std::sync::Arc<parking_lot::Mutex<Checks>>,
+        origin: String,
+    ) -> Result<CheckGuard, String> {
+        let mut c = checks.lock();
+        if let Some((_, approval)) = &c.approval {
+            return Err(approval.clone());
+        }
+        c.next += 1;
+        let id = c.next;
+        c.checks.insert(id, origin);
+        Ok(CheckGuard {
+            checks: checks.clone(),
+            id,
+        })
+    }
+
+    fn begin_approval(
+        checks: &std::sync::Arc<parking_lot::Mutex<Checks>>,
+        origin: String,
+    ) -> Result<CheckGuard, Busy> {
+        let mut c = checks.lock();
+        if let Some((_, approval)) = &c.approval {
+            return Err(Busy::Approval(approval.clone()));
+        }
+        if let Some(check) = c.checks.values().next() {
+            return Err(Busy::Check(check.clone()));
+        }
+        c.next += 1;
+        let id = c.next;
+        c.approval = Some((id, origin));
+        Ok(CheckGuard {
+            checks: checks.clone(),
+            id,
+        })
+    }
+
+    fn approval_pending(origin: &str) -> String {
+        format!(
+            "a policy approval is pending from {origin}; if you did not start it, something else is trying to approve the policy"
+        )
+    }
+}
+
+/// An `ApprovePolicy` request, with what the agent read itself.
+#[derive(Debug)]
+pub struct Approval<'a> {
+    pub peer: Option<&'a crate::platform::PeerIdentity>,
+    pub expected_digest: &'a [u8],
+    pub expected_server_digests: &'a std::collections::HashMap<String, Vec<u8>>,
+    /// Of each server in `servers.d`, as the files are now.
+    pub server_digests: std::collections::BTreeMap<String, crate::policy::integrity_state::Digest>,
+}
+
+impl Authorizer {
+    /// Records the policy files and server configs after asking the human through the approval anchor in force.
+    /// Never uses or records grants.
+    pub async fn approve_policy(
+        &self,
+        approval: Approval<'_>,
+    ) -> Result<crate::proto::ApprovePolicyResponse, tonic::Status> {
+        use crate::proto::authorization_error::Reason;
+        use crate::proto::platform::authorize_response::Result as R;
+        let shared = &self.shared;
+        let (Some(dir), Some(stores)) = (shared.policy.dir(), shared.policy.stores()) else {
+            return Err(tonic::Status::failed_precondition(
+                "this agent has no policy files to approve",
+            ));
+        };
+        let Some(peer) = approval.peer else {
+            return Err(tonic::Status::failed_precondition(
+                "the requesting process could not be identified",
+            ));
+        };
+        let origin = shared
+            .process
+            .controlling_tty(peer)
+            .unwrap_or_else(|| format!("pid {}", peer.pid));
+        let _approval = Checks::begin_approval(&shared.checks, origin.clone()).map_err(|busy| {
+            tracing::warn!(pid = peer.pid, origin, busy = %busy, "Refused a policy approval");
+            tonic::Status::failed_precondition(busy.to_string())
+        })?;
+
+        let (policy, settings) = crate::policy::files::PolicyFiles::read_contents(dir);
+        let digest = crate::policy::integrity_state::policy_digest(&policy, &settings);
+        let servers_match = approval.expected_server_digests.len() == approval.server_digests.len()
+            && approval.server_digests.iter().all(|(id, d)| {
+                approval.expected_server_digests.get(id).map(Vec::as_slice) == Some(d.as_slice())
+            });
+        if approval.expected_digest != digest.as_slice() || !servers_match {
+            return Err(tonic::Status::failed_precondition(
+                "policy changed while approving; run `mairu policy approve` again",
+            ));
+        }
+        let file_settings = Self::validate_for_approval(&policy, &settings)
+            .map_err(|errors| tonic::Status::invalid_argument(errors.join("; ")))?;
+
+        let files_absent = policy == crate::policy::files::Content::Absent
+            && settings == crate::policy::files::Content::Absent;
+        let decision = crate::policy::integrity_state::Decision::decide(
+            stores.verify(&digest).await,
+            &digest,
+            files_absent,
+            shared.hardened,
+        );
+        let servers: std::collections::BTreeMap<String, crate::policy::integrity_state::Digest> =
+            approval.server_digests.clone();
+        let approval_digest = crate::policy::integrity_state::approval_digest(&digest, &servers);
+        let mut details = std::collections::HashMap::new();
+        details.insert(
+            "policy_digest".to_owned(),
+            crate::platform::integrity::hex(&approval_digest),
+        );
+        details.insert("tty".to_owned(), origin.clone());
+        let request = crate::proto::platform::AuthorizeRequest {
+            action: crate::proto::platform::authorize_request::Action::ApprovePolicy.into(),
+            subject: Some(subject(
+                peer.pid,
+                peer.start_time,
+                peer.uid,
+                peer.exe.as_deref(),
+            )),
+            message: format!(
+                "Approve the mairu policy {}",
+                &crate::platform::integrity::hex(&approval_digest)[..16]
+            ),
+            details,
+        };
+        let refuse = |reason: Reason, detail: String| {
+            tracing::info!(pid = peer.pid, origin, reason = ?reason, detail, "Policy approval refused");
+            Err(Refusal::new(reason, detail).into_status())
+        };
+        let mut tried = vec![];
+        let mut allowed = false;
+        for method in &decision.anchor.methods {
+            if method != METHOD_PLATFORM {
+                tried.push(format!("{method}: not supported by this mairu"));
+                continue;
+            }
+            if let Err(e) = shared.platform_usable().await {
+                tried.push(format!("{method}: {e}"));
+                continue;
+            }
+            tracing::info!(
+                pid = peer.pid,
+                origin,
+                digest = crate::platform::integrity::hex(&digest),
+                "Asking to approve the policy"
+            );
+            let resp = shared.services.authorize(request.clone()).await;
+            match resp.result() {
+                R::Allowed => {
+                    allowed = true;
+                    break;
+                }
+                R::Denied | R::Cancelled => return refuse(Reason::Denied, resp.reason),
+                R::Unavailable if resp.reason == REASON_NO_AUTHENTICATION_AGENT => {
+                    return refuse(Reason::NoAuthenticationAgent, String::new());
+                }
+                R::Unavailable | R::Unspecified => {
+                    tried.push(format!("{method}: {}: {}", resp.reason, resp.detail));
+                }
+            }
+        }
+        if !allowed {
+            return refuse(
+                Reason::Unavailable,
+                format!(
+                    "no method of the approval anchor could ask for approval; tried {}",
+                    tried.join(", ")
+                ),
+            );
+        }
+
+        let record = crate::proto::platform::IntegrityRecord {
+            digest: digest.to_vec(),
+            approval: Some(crate::policy::settings::EffectiveSettings::anchor(
+                file_settings.as_ref(),
+            )),
+            generation: 1 + decision.strong.as_ref().map_or(0, |r| r.generation),
+            server_digests: servers
+                .iter()
+                .map(|(id, d)| (id.clone(), d.to_vec()))
+                .collect(),
+        };
+        let results = stores.record(record.clone(), vec![]).await;
+        let written = results
+            .iter()
+            .any(|r| r.status() == crate::proto::platform::IntegrityStatus::Matched);
+        shared.policy.invalidate().await;
+        if !written {
+            tracing::warn!(stores = ?results, "No integrity store could record the approval");
+            let details: Vec<String> = results
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}: {}",
+                        crate::platform::integrity::store_name(r.store()),
+                        r.detail
+                    )
+                })
+                .collect();
+            return Err(tonic::Status::failed_precondition(format!(
+                "no integrity store is available to record the approval ({})",
+                if details.is_empty() {
+                    "none reachable".to_owned()
+                } else {
+                    details.join("; ")
+                }
+            )));
+        }
+        let verified = shared
+            .policy
+            .load()
+            .await
+            .map_err(tonic::Status::internal)?;
+        tracing::info!(
+            pid = peer.pid,
+            origin,
+            generation = record.generation,
+            digest = crate::platform::integrity::hex(&digest),
+            servers = ?servers.keys().collect::<Vec<_>>(),
+            state = verified.state.as_str(),
+            "Policy approved"
+        );
+        Ok(crate::proto::ApprovePolicyResponse {
+            integrity: verified.state.to_proto().into(),
+            stores: results,
+        })
+    }
+
+    /// The checks of `mairu policy check` that fail an approval. Returns the parsed settings.
+    fn validate_for_approval(
+        policy: &crate::policy::files::Content,
+        settings: &crate::policy::files::Content,
+    ) -> Result<Option<crate::policy::settings::AuthorizationSettings>, Vec<String>> {
+        use crate::policy::files::Content;
+        let mut errors = vec![];
+        match policy {
+            Content::Absent => {}
+            Content::Unreadable(e) => {
+                errors.push(format!("{}: {e}", crate::policy::user::FILE_NAME))
+            }
+            Content::Text(source) => match crate::policy::user::PolicyFile::parse(source) {
+                Err(e) => errors.push(format!("{}: {e}", crate::policy::user::FILE_NAME)),
+                Ok(file) => match crate::policy::schema() {
+                    Ok(schema) => errors.extend(file.errors(&schema)),
+                    Err(e) => errors.push(e.to_string()),
+                },
+            },
+        }
+        let parsed = match settings {
+            Content::Absent => None,
+            Content::Unreadable(e) => {
+                errors.push(format!("{}: {e}", crate::policy::files::SETTINGS_FILE_NAME));
+                None
+            }
+            Content::Text(source) => {
+                match crate::policy::settings::AuthorizationSettings::parse(source) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", crate::policy::files::SETTINGS_FILE_NAME));
+                        None
+                    }
+                }
+            }
+        };
+        if errors.is_empty() {
+            Ok(parsed)
+        } else {
+            Err(errors)
+        }
+    }
+}
+
 /// Tool marks belong to a terminal session.
 pub const NO_TERMINAL_SESSION: &str = "tool marks need a terminal session, and this process has none; run `mairu lock --tool` in the terminal that starts the tool";
 
@@ -1051,6 +1437,7 @@ impl Pending {
         tty: Option<String>,
         hardened: bool,
         detection: crate::tool_detection::Detection,
+        effective: std::sync::Arc<crate::policy::files::Effective>,
     ) -> Self {
         let context = req.client_context.cloned().unwrap_or_default();
         let exec = match &context.intent {
@@ -1112,7 +1499,21 @@ impl Pending {
             digest: request_digest(req.server.id(), req.rolespec, &context),
             facts,
             detection,
+            effective,
         }
+    }
+
+    /// Gate 2 is skipped only on an unhardened agent without an approved policy, where everything is permitted
+    /// anyway.
+    fn gate2(&self, hardened: bool) -> bool {
+        hardened || self.effective.state == crate::policy::settings::PolicyState::Approved
+    }
+
+    fn sts_target(&self) -> crate::caller_identity::StsTarget {
+        crate::caller_identity::StsTarget::from_settings(
+            self.effective.settings.sts.as_ref(),
+            &self.server_id,
+        )
     }
 
     /// Identifies the request; also the key of its held credentials.
@@ -1150,7 +1551,10 @@ impl Pending {
         if !self.detection.is_empty() {
             details.insert("tools".to_owned(), self.detection.summary());
         }
-        let mut message = format!("Provide AWS credentials for {} on {}", f.role, f.server_id);
+        let mut message = format!(
+            "Provide AWS credentials for {} on {} ({})",
+            f.role, f.server_id, f.server_url
+        );
         if let Some(caller) = caller {
             details.insert(
                 "caller".to_owned(),
@@ -1289,10 +1693,20 @@ mod tests {
         answer: parking_lot::Mutex<crate::proto::platform::AuthorizeResponse>,
         prompts: std::sync::atomic::AtomicUsize,
         delay: std::time::Duration,
+        stores: std::sync::Arc<crate::policy::files::test_support::MemoryStores>,
+        last_request: parking_lot::Mutex<Option<crate::proto::platform::AuthorizeRequest>>,
     }
 
     impl MockServices {
         fn answering(result: R, reason: &str) -> std::sync::Arc<Self> {
+            Self::answering_after(result, reason, std::time::Duration::ZERO)
+        }
+
+        fn answering_after(
+            result: R,
+            reason: &str,
+            delay: std::time::Duration,
+        ) -> std::sync::Arc<Self> {
             std::sync::Arc::new(Self {
                 facility: crate::proto::platform::AuthorizationFacility::Polkit,
                 answer: parking_lot::Mutex::new(crate::proto::platform::AuthorizeResponse {
@@ -1301,7 +1715,9 @@ mod tests {
                     detail: String::new(),
                 }),
                 prompts: Default::default(),
-                delay: std::time::Duration::ZERO,
+                delay,
+                stores: crate::policy::files::test_support::MemoryStores::new(true, true),
+                last_request: Default::default(),
             })
         }
 
@@ -1320,8 +1736,9 @@ mod tests {
         }
         async fn authorize(
             &self,
-            _req: crate::proto::platform::AuthorizeRequest,
+            req: crate::proto::platform::AuthorizeRequest,
         ) -> crate::proto::platform::AuthorizeResponse {
+            *self.last_request.lock() = Some(req);
             self.prompts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
@@ -1341,15 +1758,15 @@ mod tests {
         }
         async fn record_integrity(
             &self,
-            _req: crate::proto::platform::RecordIntegrityRequest,
+            req: crate::proto::platform::RecordIntegrityRequest,
         ) -> crate::proto::platform::RecordIntegrityResponse {
-            Default::default()
+            self.stores.record(req)
         }
         async fn verify_integrity(
             &self,
-            _req: crate::proto::platform::VerifyIntegrityRequest,
+            req: crate::proto::platform::VerifyIntegrityRequest,
         ) -> crate::proto::platform::VerifyIntegrityResponse {
-            Default::default()
+            self.stores.verify(req)
         }
     }
 
@@ -1357,6 +1774,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeSts {
         caller: parking_lot::Mutex<Option<crate::caller_identity::Caller>>,
+        target: parking_lot::Mutex<Option<crate::caller_identity::StsTarget>>,
         calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -1375,7 +1793,9 @@ mod tests {
         async fn identify(
             &self,
             _credentials: &crate::client::AssumeRoleResponse,
+            target: &crate::caller_identity::StsTarget,
         ) -> Result<crate::caller_identity::Caller, String> {
+            *self.target.lock() = Some(target.clone());
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.caller
                 .lock()
@@ -1537,6 +1957,16 @@ mod tests {
     }
 
     impl Fixture {
+        fn effective(&self) -> std::sync::Arc<crate::policy::files::Effective> {
+            self.authorizer
+                .shared
+                .policy
+                .last()
+                .expect("a fixed policy")
+                .effective
+                .clone()
+        }
+
         fn pending(
             &self,
             pid: u32,
@@ -1550,6 +1980,7 @@ mod tests {
             let req = Request {
                 peer: None,
                 server: &server,
+                server_digest: [0; 32],
                 user_config: &user_config,
                 rolespec: &rs,
                 client_context: context.as_ref(),
@@ -1561,6 +1992,7 @@ mod tests {
                 None,
                 true,
                 crate::tool_detection::Detection::default(),
+                self.effective(),
             );
             p.pid = pid;
             p.start_time = 1;
@@ -1582,11 +2014,12 @@ mod tests {
             let req = Request {
                 peer: Some(&peer),
                 server: &server,
+                server_digest: [0; 32],
                 user_config: &user_config,
                 rolespec: &rs,
                 client_context: context.as_ref(),
             };
-            let mut p = self.authorizer.shared.pending(&req);
+            let mut p = self.authorizer.shared.pending(&req, self.effective());
             p.pidfd = Some(self.pidfd.clone());
             p
         }
@@ -2501,5 +2934,484 @@ mod tests {
         assert_eq!(truncate("abc", 2), "ab");
         assert_eq!(truncate("aé", 2), "a");
         assert_eq!(truncate("abc", 5), "abc");
+    }
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("mairu-test-authz-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const READONLY_FREE: &str = r#"@id("readonly-free") permit (principal, action == Mairu::Action::"AssumeRole", resource == Mairu::Role::"contoso:123456789012/ReadOnly");"#;
+
+    /// A fixture reading `dir`, with the stores of `services`.
+    async fn dir_fixture(dir: &TempDir, services: std::sync::Arc<MockServices>) -> Fixture {
+        let f = fixture_with_policy(
+            crate::policy::files::PolicyFiles::new(
+                dir.0.clone(),
+                true,
+                crate::policy::files::test_support::stores(services.clone()),
+            ),
+            services,
+        );
+        f.authorizer.policy().await.unwrap();
+        f
+    }
+
+    impl Fixture {
+        async fn approve(
+            &self,
+            dir: &TempDir,
+            peer: &crate::platform::PeerIdentity,
+            servers: &[(&str, crate::policy::integrity_state::Digest)],
+        ) -> Result<crate::proto::ApprovePolicyResponse, tonic::Status> {
+            let (policy, settings) = crate::policy::files::PolicyFiles::read_contents(&dir.0);
+            let digest = crate::policy::integrity_state::policy_digest(&policy, &settings);
+            let expected: std::collections::HashMap<String, Vec<u8>> = servers
+                .iter()
+                .map(|(id, d)| (id.to_string(), d.to_vec()))
+                .collect();
+            self.authorizer
+                .approve_policy(Approval {
+                    peer: Some(peer),
+                    expected_digest: &digest,
+                    expected_server_digests: &expected,
+                    server_digests: servers.iter().map(|(id, d)| (id.to_string(), *d)).collect(),
+                })
+                .await
+        }
+
+        async fn assume_role(
+            &self,
+            role: &str,
+            server_digest: crate::policy::integrity_state::Digest,
+        ) -> Result<Authorized, Refusal> {
+            let server = server();
+            let rs = rolespec(role);
+            let user_config = crate::config::UserConfig::default();
+            let peer = peer(10);
+            self.authorizer
+                .authorize_assume_role(Request {
+                    peer: Some(&peer),
+                    server: &server,
+                    server_digest,
+                    user_config: &user_config,
+                    rolespec: &rs,
+                    client_context: None,
+                })
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_approve_policy() {
+        use crate::policy::settings::PolicyState;
+        let dir = TempDir::new("approve");
+        let policy_path = crate::policy::files::PolicyFiles::policy_path(&dir.0);
+        std::fs::write(&policy_path, READONLY_FREE).unwrap();
+        let services = MockServices::answering(R::Allowed, "");
+        let f = dir_fixture(&dir, services.clone()).await;
+        assert_eq!(
+            f.authorizer.policy().await.unwrap().state,
+            PolicyState::Unapproved
+        );
+        let peer = peer(10);
+
+        // Approve race: the files changed after the client read them.
+        let wrong: std::collections::HashMap<String, Vec<u8>> = Default::default();
+        let status = f
+            .authorizer
+            .approve_policy(Approval {
+                peer: Some(&peer),
+                expected_digest: &[0; 32],
+                expected_server_digests: &wrong,
+                server_digests: Default::default(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("changed while approving"));
+        // A server the client did not see.
+        let status = f
+            .approve(&dir, &peer, &[])
+            .await
+            .map(|_| ())
+            .and(
+                f.authorizer
+                    .approve_policy(Approval {
+                        peer: Some(&peer),
+                        expected_digest: &[0; 32],
+                        expected_server_digests: &wrong,
+                        server_digests: [("contoso".to_owned(), [1; 32])].into(),
+                    })
+                    .await
+                    .map(|_| ()),
+            )
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(services.prompts(), 1, "only the valid request asked");
+
+        // First approval: through the bootstrap anchor, never grants.
+        let request = services.last_request.lock().clone().unwrap();
+        assert_eq!(
+            request.action(),
+            crate::proto::platform::authorize_request::Action::ApprovePolicy
+        );
+        assert_eq!(request.details["tty"], "/dev/pts/7");
+        assert_eq!(request.details["policy_digest"].len(), 64);
+        let record = services.stores.strong.lock().record.clone().unwrap();
+        assert_eq!(record.generation, 1);
+        assert_eq!(record.approval.unwrap().methods, vec!["platform"]);
+        assert_eq!(
+            services
+                .stores
+                .weak
+                .lock()
+                .record
+                .as_ref()
+                .unwrap()
+                .generation,
+            1
+        );
+        let v = f.authorizer.policy().await.unwrap();
+        assert_eq!(v.state, PolicyState::Approved);
+        assert!(f.authorizer.counts() == (0, 0));
+
+        // Not in the record: the server's roles get the unapproved policy, which asks.
+        let prompts = services.prompts();
+        f.assume_role("123456789012/ReadOnly", [1; 32])
+            .await
+            .unwrap();
+        assert_eq!(services.prompts(), prompts + 1);
+        let resp = f
+            .approve(&dir, &peer, &[("contoso", [1; 32])])
+            .await
+            .unwrap();
+        assert_eq!(resp.integrity(), crate::proto::PolicyIntegrity::Approved);
+        assert_eq!(
+            services
+                .stores
+                .strong
+                .lock()
+                .record
+                .as_ref()
+                .unwrap()
+                .generation,
+            2
+        );
+        let prompts = services.prompts();
+        f.assume_role("123456789012/ReadOnly", [1; 32])
+            .await
+            .unwrap();
+        assert_eq!(services.prompts(), prompts);
+
+        // Hand edit: tampered, re-approval restores.
+        std::fs::write(&policy_path, format!("{READONLY_FREE}\n// edited")).unwrap();
+        assert_eq!(
+            f.authorizer.policy().await.unwrap().state,
+            PolicyState::Tampered
+        );
+        f.approve(&dir, &peer, &[("contoso", [1; 32])])
+            .await
+            .unwrap();
+        assert_eq!(
+            f.authorizer.policy().await.unwrap().state,
+            PolicyState::Approved
+        );
+        assert_eq!(
+            services
+                .stores
+                .strong
+                .lock()
+                .record
+                .as_ref()
+                .unwrap()
+                .generation,
+            3
+        );
+
+        // An invalid file is never approved, and nobody is asked.
+        std::fs::write(&policy_path, "permit (").unwrap();
+        let prompts = services.prompts();
+        let status = f.approve(&dir, &peer, &[]).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(services.prompts(), prompts);
+
+        // A denial records nothing.
+        std::fs::write(&policy_path, READONLY_FREE).unwrap();
+        *services.answer.lock() = crate::proto::platform::AuthorizeResponse {
+            result: R::Denied.into(),
+            reason: String::new(),
+            detail: String::new(),
+        };
+        let status = f.approve(&dir, &peer, &[]).await.unwrap_err();
+        assert_eq!(
+            crate::proto::AuthorizationError::from_status(&status)
+                .unwrap()
+                .reason(),
+            Reason::Denied
+        );
+        assert_eq!(
+            services
+                .stores
+                .strong
+                .lock()
+                .record
+                .as_ref()
+                .unwrap()
+                .generation,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_approve_without_stores() {
+        let dir = TempDir::new("nostores");
+        std::fs::write(
+            crate::policy::files::PolicyFiles::policy_path(&dir.0),
+            READONLY_FREE,
+        )
+        .unwrap();
+        let services = MockServices::answering(R::Allowed, "");
+        services.stores.strong.lock().available = false;
+        services.stores.weak.lock().available = false;
+        let f = dir_fixture(&dir, services.clone()).await;
+        let status = f.approve(&dir, &peer(10), &[]).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().contains("no integrity store"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_approve_uses_the_anchor() {
+        let dir = TempDir::new("anchor");
+        std::fs::write(
+            crate::policy::files::PolicyFiles::policy_path(&dir.0),
+            READONLY_FREE,
+        )
+        .unwrap();
+        let services = MockServices::answering(R::Allowed, "");
+        // The last approval anchored a method this mairu cannot use: the files' own methods do not count.
+        let mut record = crate::policy::files::test_support::record_of(&dir.0, 4, &[]);
+        record.digest = vec![0; 32];
+        record.approval = Some(crate::proto::platform::ApprovalAnchor {
+            methods: vec!["ssh-agent".to_owned()],
+            ..Default::default()
+        });
+        services.stores.strong.lock().record = Some(record);
+        let f = dir_fixture(&dir, services.clone()).await;
+        let status = f.approve(&dir, &peer(10), &[]).await.unwrap_err();
+        let refusal = crate::proto::AuthorizationError::from_status(&status).unwrap();
+        assert_eq!(refusal.reason(), Reason::Unavailable);
+        assert!(refusal.detail.contains("ssh-agent"), "{refusal:?}");
+        assert_eq!(services.prompts(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_one_approval_at_a_time() {
+        let dir = TempDir::new("one");
+        std::fs::write(
+            crate::policy::files::PolicyFiles::policy_path(&dir.0),
+            r#"@id("human") permit (principal, action, resource) when { context.presence.verified };"#,
+        )
+        .unwrap();
+        let services =
+            MockServices::answering_after(R::Allowed, "", std::time::Duration::from_millis(300));
+        let f = dir_fixture(&dir, services.clone()).await;
+        *f.process.session.lock() = Some(TTY);
+        let peer = peer(10);
+
+        // A credential check while an approval waits is refused, naming the approval's terminal.
+        let (approved, refused, second) = tokio::join!(
+            f.approve(&dir, &peer, &[]),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                f.decide(f.peer_pending(20, "r", None)).await
+            },
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                f.approve(&dir, &peer, &[]).await
+            },
+        );
+        approved.unwrap();
+        let refusal = refused.unwrap_err();
+        assert_eq!(refusal.reason(), Reason::CheckPending);
+        assert!(refusal.detail.contains("/dev/pts/7"), "{refusal:?}");
+        let status = second.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status
+                .message()
+                .contains("another policy approval is pending from /dev/pts/7")
+        );
+        assert_eq!(services.prompts(), 1);
+
+        // An approval while a credential check waits is refused.
+        let (checked, approval) =
+            tokio::join!(f.decide(f.pending(30, None, "other", None)), async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                f.approve(&dir, &peer, &[]).await
+            },);
+        checked.unwrap();
+        let status = approval.unwrap_err();
+        assert!(
+            status
+                .message()
+                .contains("a credential check is pending from pid 30"),
+            "{status:?}"
+        );
+        // Afterwards both work again.
+        f.approve(&dir, &peer, &[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_states() {
+        use crate::policy::settings::PolicyState;
+        let dir = TempDir::new("servers");
+        std::fs::write(
+            crate::policy::files::PolicyFiles::policy_path(&dir.0),
+            READONLY_FREE,
+        )
+        .unwrap();
+        let services = MockServices::answering(R::Allowed, "");
+        services.stores.strong.lock().record = Some(crate::policy::files::test_support::record_of(
+            &dir.0,
+            1,
+            &[("contoso", [1; 32])],
+        ));
+        let f = dir_fixture(&dir, services.clone()).await;
+        assert_eq!(
+            f.authorizer.policy().await.unwrap().state,
+            PolicyState::Approved
+        );
+
+        f.assume_role("123456789012/ReadOnly", [1; 32])
+            .await
+            .unwrap();
+        assert_eq!(services.prompts(), 0);
+        // A changed server is refused before anything else, without a prompt.
+        let refusal = f
+            .assume_role("123456789012/ReadOnly", [2; 32])
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.reason(), Reason::Forbidden);
+        assert!(
+            refusal
+                .detail
+                .contains("server 'contoso' (https://contoso.awsapps.com/start) changed"),
+            "{refusal:?}"
+        );
+        assert_eq!(services.prompts(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_unapproved_server() {
+        let dir = TempDir::new("newserver");
+        std::fs::write(
+            crate::policy::files::PolicyFiles::policy_path(&dir.0),
+            READONLY_FREE,
+        )
+        .unwrap();
+        let services = MockServices::answering(R::Allowed, "");
+        // The record does not hold contoso, so its roles get the built-ins and forbids only.
+        services.stores.strong.lock().record = Some(crate::policy::files::test_support::record_of(
+            &dir.0,
+            1,
+            &[],
+        ));
+        let f = dir_fixture(&dir, services.clone()).await;
+        f.assume_role("123456789012/ReadOnly", [1; 32])
+            .await
+            .unwrap();
+        assert_eq!(
+            services.prompts(),
+            1,
+            "the permit does not apply to an unapproved server"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lockdown() {
+        let services = MockServices::answering(R::Allowed, "");
+        let f = fixture_with_policy(
+            crate::policy::files::PolicyFiles::fixed(
+                crate::policy::files::Effective::build_for(
+                    crate::policy::settings::PolicyState::Tampered,
+                    true,
+                    &crate::policy::files::Content::Absent,
+                    &crate::policy::files::Content::Absent,
+                )
+                .unwrap(),
+            ),
+            services.clone(),
+        );
+        // A fresh check permits; the session grant it leaves does not.
+        f.decide(f.pending(10, Some(TTY), "r", None)).await.unwrap();
+        f.decide(f.pending(11, Some(TTY), "r", None)).await.unwrap();
+        assert_eq!(services.prompts(), 2);
+        // A lease of a running exec still counts.
+        let ctx = Some(exec_context("terraform plan", false));
+        f.decide(f.pending(12, Some(TTY), "r", ctx.clone()))
+            .await
+            .unwrap();
+        f.decide(f.pending(12, Some(TTY), "r", ctx)).await.unwrap();
+        assert_eq!(services.prompts(), 3);
+        // AI agents are refused outright.
+        let mut p = f.pending(13, Some(TTY), "r", None);
+        p.facts.tools.insert("ai-agent".to_owned());
+        let refusal = f.decide(p).await.unwrap_err();
+        assert_eq!(refusal.reason(), Reason::Forbidden);
+        assert_eq!(refusal.policy_ids, vec!["builtin-lockdown-no-ai"]);
+        assert_eq!(services.prompts(), 3);
+    }
+
+    #[test]
+    fn test_gate2_and_sts_of_approved_settings() {
+        let settings = crate::policy::files::Content::Text(
+            r#"{"version": 1, "sts": {"region": "eu-west-1"}}"#.to_owned(),
+        );
+        let approved = crate::policy::files::Effective::build_for(
+            crate::policy::settings::PolicyState::Approved,
+            false,
+            &crate::policy::files::Content::Absent,
+            &settings,
+        )
+        .unwrap();
+        let services = MockServices::answering(R::Allowed, "");
+        let f = fixture_with_policy(crate::policy::files::PolicyFiles::fixed(approved), services);
+        let p = f.pending(10, None, "r", None);
+        // An unhardened agent runs gate 2 once the policy is approved.
+        assert!(p.gate2(false));
+        assert_eq!(
+            p.sts_target().endpoint,
+            "https://sts.eu-west-1.amazonaws.com"
+        );
+        let unapproved = crate::policy::files::Effective::build(
+            false,
+            &crate::policy::files::Content::Absent,
+            &settings,
+        )
+        .unwrap();
+        let f = fixture_with_policy(
+            crate::policy::files::PolicyFiles::fixed(unapproved),
+            MockServices::answering(R::Allowed, ""),
+        );
+        let p = f.pending(10, None, "r", None);
+        assert!(!p.gate2(false));
+        assert_eq!(p.sts_target(), crate::caller_identity::StsTarget::default());
     }
 }
