@@ -223,8 +223,12 @@ impl Sts {
                     .operation_timeout(STS_OPERATION_TIMEOUT)
                     .build(),
             );
-        if let Some(http_client) = &self.http_client {
-            config = config.http_client(http_client.clone());
+        if let Some(http_client) = self
+            .http_client
+            .clone()
+            .or_else(crate::network::sdk_http_client)
+        {
+            config = config.http_client(http_client);
         }
         aws_sdk_sts::Client::from_conf(config.build())
     }

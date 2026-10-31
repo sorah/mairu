@@ -72,6 +72,8 @@ pub mod caller_identity;
 #[cfg(feature = "cli")]
 pub mod ecs_server;
 #[cfg(feature = "cli")]
+pub mod network;
+#[cfg(feature = "cli")]
 pub mod policy;
 #[cfg(feature = "cli")]
 pub mod polkit_tty_agent;

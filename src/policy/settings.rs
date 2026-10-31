@@ -41,11 +41,12 @@ pub struct StsServerSettings {
     pub region: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy: Option<url::Url>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_roots: Vec<String>,
 }
 
@@ -200,6 +201,9 @@ pub struct EffectiveSettings {
     /// How gate 2 reaches STS; only set from an approved file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sts: Option<StsSettings>,
+    /// The agent's proxy and extra TLS roots; only set from an approved file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkSettings>,
 }
 
 impl Default for EffectiveSettings {
@@ -211,6 +215,7 @@ impl Default for EffectiveSettings {
             tool_detection: Default::default(),
             grant_retention_secs: DEFAULT_GRANT_RETENTION_SECS,
             sts: None,
+            network: None,
         }
     }
 }
@@ -241,6 +246,7 @@ impl EffectiveSettings {
                     settings.grant_retention_secs = secs;
                 }
                 settings.sts = file.sts.clone();
+                settings.network = file.network.clone();
             }
             PolicyState::Unapproved | PolicyState::Tampered => {
                 if let Some(tool_detection) = &file.tool_detection {
@@ -442,11 +448,16 @@ XLz4KNOFkg==
         assert_eq!(s.sts.as_ref().unwrap().region.as_deref(), Some("us-east-1"));
         let json: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
         assert_eq!(json["sts"]["servers"]["cn"]["region"], "cn-north-1");
+        assert_eq!(
+            s.network.as_ref().unwrap().proxy.as_ref().unwrap().as_str(),
+            "http://proxy.corp.example:3128/"
+        );
 
         // Lockdown takes only what tightens, as unapproved files do.
         let s = EffectiveSettings::effective(PolicyState::Tampered, Some(&file));
         assert_eq!(s.grant_retention_secs, DEFAULT_GRANT_RETENTION_SECS);
         assert!(s.sts.is_none());
+        assert!(s.network.is_none());
         assert!(s.approval_methods.is_empty());
         assert_eq!(s.tool_detection.len(), 3);
     }

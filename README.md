@@ -378,8 +378,7 @@ Settings that are not policies live in `~/.config/mairu/authorization.json`. Unk
 
 - `tool_detection` adds labels, or names to the built-in `ai-agent` label, for `context.tools`.
 - `grant_retention_secs` bounds how long an approval is kept at all; the default is 43200, which is also the maximum until the file is approved.
-- `methods`, `approval_methods` (who may approve the next change; `["platform"]` for now) and `sts` (the region and endpoint of `sts:GetCallerIdentity`, also per server) apply once the file is approved.
-- `network` (`proxy` and `extra_roots`) is accepted and validated, but not supported yet.
+- `methods`, `approval_methods` (who may approve the next change; `["platform"]` for now), `sts` (the region and endpoint of `sts:GetCallerIdentity`, also per server) and `network` (a `proxy` for every outbound connection of the agent, and PEM `extra_roots` trusted beside the system roots) apply once the file is approved.
 
 ### Tmux over SSH
 

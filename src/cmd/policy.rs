@@ -183,6 +183,7 @@ fn check() -> Result<(), anyhow::Error> {
                         ("methods", s.methods.is_some()),
                         ("approval_methods", s.approval_methods.is_some()),
                         ("sts", s.sts.is_some()),
+                        ("network", s.network.is_some()),
                     ]
                     .into_iter()
                     .filter_map(|(name, set)| set.then_some(name))
@@ -191,12 +192,6 @@ fn check() -> Result<(), anyhow::Error> {
                         warnings.push(format!(
                             "{} in {} apply only once approved",
                             relaxing.join(", "),
-                            crate::policy::files::SETTINGS_FILE_NAME
-                        ));
-                    }
-                    if s.network.is_some() {
-                        warnings.push(format!(
-                            "network in {} is not supported by this mairu yet and is ignored",
                             crate::policy::files::SETTINGS_FILE_NAME
                         ));
                     }

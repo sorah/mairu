@@ -124,12 +124,7 @@ impl Effective {
                 }
             }
         };
-        let mut notes = vec![];
-        if file_settings.as_ref().is_some_and(|s| s.network.is_some()) {
-            notes.push(format!(
-                "ignored network of {SETTINGS_FILE_NAME}: this mairu does not support it yet"
-            ));
-        }
+        let notes = vec![];
         let settings = super::settings::EffectiveSettings::effective(
             PolicyState::Approved,
             file_settings.as_ref(),
@@ -537,6 +532,7 @@ impl PolicyFiles {
         }
         if let Ok(v) = &verified {
             *self.last.lock() = Some(v.clone());
+            crate::network::apply(v.effective.settings.network.as_ref());
         }
         *cache = Some(Cached {
             keys: [policy_key, settings_key],
