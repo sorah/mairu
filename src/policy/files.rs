@@ -15,6 +15,8 @@ pub struct Effective {
     pub labels: Vec<crate::tool_detection::ToolLabel>,
     /// `settings.ssh_agent_keys`, parsed.
     pub ssh_agent_keys: Vec<crate::ssh_agent_presence::RegisteredKey>,
+    /// `settings.windows_hello_keys`, parsed.
+    pub windows_hello_keys: Vec<crate::windows_hello::RegisteredKey>,
     pub state: super::settings::PolicyState,
     /// Content that is ignored, such as dropped policies.
     pub notes: Vec<String>,
@@ -40,10 +42,45 @@ impl Effective {
             engine,
             labels: settings.labels(),
             ssh_agent_keys: settings.registered_keys(),
+            windows_hello_keys: settings.windows_hello_registered_keys(),
             settings,
             state: super::settings::PolicyState::Absent,
             notes: vec![],
         }
+    }
+
+    /// What a client computes for the files in `dir`: in the state the agent reports, or as if no store held a
+    /// record without an agent. Returns the reported state too.
+    pub fn for_status(
+        dir: &std::path::Path,
+        hardened: bool,
+        status: Option<&crate::proto::GetAgentStatusResponse>,
+    ) -> (
+        Option<super::settings::PolicyState>,
+        Result<Self, super::PolicyError>,
+    ) {
+        use super::settings::PolicyState;
+        let (policy, settings) = PolicyFiles::read_contents(dir);
+        let state = match status.map(|s| s.policy_integrity()) {
+            Some(crate::proto::PolicyIntegrity::Approved) => Some(PolicyState::Approved),
+            Some(crate::proto::PolicyIntegrity::Unapproved) => Some(PolicyState::Unapproved),
+            Some(crate::proto::PolicyIntegrity::Tampered) => Some(PolicyState::Tampered),
+            Some(crate::proto::PolicyIntegrity::Absent) => Some(PolicyState::Absent),
+            _ => None,
+        };
+        let built = match state {
+            Some(state) => Self::build_for(
+                state,
+                hardened,
+                &policy,
+                &settings,
+                &status
+                    .and_then(|s| s.approval_anchor.clone())
+                    .unwrap_or_else(super::integrity_state::default_anchor),
+            ),
+            None => Self::build(hardened, &policy, &settings),
+        };
+        (state, built)
     }
 
     /// The files as if no store held a record: `ABSENT` or `UNAPPROVED`.
@@ -149,6 +186,7 @@ impl Effective {
             engine,
             labels: settings.labels(),
             ssh_agent_keys: settings.registered_keys(),
+            windows_hello_keys: settings.windows_hello_registered_keys(),
             settings,
             state: PolicyState::Approved,
             notes,
@@ -202,6 +240,11 @@ impl Effective {
                 ("methods", s.methods.is_some()),
                 ("approval_methods", s.approval_methods.is_some()),
                 ("ssh_agent_keys", s.ssh_agent_keys.is_some()),
+                ("windows_hello_keys", s.windows_hello_keys.is_some()),
+                (
+                    "windows_hello_helper_sha256",
+                    s.windows_hello_helper_sha256.is_some(),
+                ),
                 ("sts", s.sts.is_some()),
                 ("network", s.network.is_some()),
             ]
@@ -225,6 +268,7 @@ impl Effective {
             engine: super::Engine::with_user_policies(base, &forbids)?,
             labels: settings.labels(),
             ssh_agent_keys: settings.registered_keys(),
+            windows_hello_keys: settings.windows_hello_registered_keys(),
             settings,
             state,
             notes,

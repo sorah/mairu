@@ -255,7 +255,7 @@ impl AuthorizationError {
             }
             Reason::PresenceRequired => "a fresh approval is required",
             Reason::CheckPending => "another human check is pending",
-            Reason::Challenge => "a signature from your SSH agent is required",
+            Reason::Challenge => "a signature from your SSH agent or Windows Hello is required",
             Reason::InvalidResponse => "the signature was refused",
         };
         let mut message = summary.to_owned();

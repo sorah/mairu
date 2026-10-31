@@ -29,6 +29,12 @@ enum PolicyCommand {
     Explain(ExplainArgs),
     /// Print the Cedar schema policies are validated against
     Schema,
+    /// Create the Windows Hello key (WSL2 with interop) and print its windows_hello_keys entry
+    EnrollWindowsHello {
+        /// Name of the entry; defaults to the host name
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -77,7 +83,80 @@ pub fn run(args: &PolicyArgs) -> Result<(), anyhow::Error> {
             print!("{}", crate::policy::schema_text());
             Ok(())
         }
+        PolicyCommand::EnrollWindowsHello { name } => enroll_windows_hello(name.as_deref()),
     }
+}
+
+#[tokio::main]
+async fn enroll_windows_hello(name: Option<&str>) -> Result<(), anyhow::Error> {
+    if !crate::windows_hello::interop_available() {
+        anyhow::bail!("Windows Hello needs WSL2 with interop enabled");
+    }
+    let config = crate::config::UserConfig::load().await?;
+    let Some(path) = crate::windows_hello::Helper::locate(&config) else {
+        anyhow::bail!(
+            "no {} next to mairu; set windows_hello_helper in {} to the helper from the release",
+            crate::windows_hello::HELPER_FILE_NAME,
+            crate::config::UserConfig::path().display()
+        );
+    };
+    // The agent's settings in force carry the approved pin and keys.
+    let settings: serde_json::Value = match get_policy("").await {
+        Ok(resp) => serde_json::from_str(&resp.effective_settings_json).unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!(err = %e, "Failed to read the settings in force from the agent");
+            Default::default()
+        }
+    };
+    let helper = crate::windows_hello::Helper {
+        path,
+        pin: crate::windows_hello::Pin::resolve(
+            settings
+                .get("windows_hello_helper_sha256")
+                .and_then(|v| v.as_str()),
+        ),
+        hardened: crate::hardening::Hardening::marker().is_some(),
+    };
+    helper.check().map_err(anyhow::Error::msg)?;
+    println!(
+        ":: mairu :: Approve in the Windows Hello dialog to create the mairu key, if it does not exist yet"
+    );
+    let spki = helper
+        .create()
+        .await
+        .map_err(|e| anyhow::anyhow!("{} failed: {e}", helper.path.display()))?;
+    let name = match name {
+        Some(name) => name.to_owned(),
+        None => nix::unistd::gethostname()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "windows-hello".to_owned()),
+    };
+    let key = crate::windows_hello::RegisteredKey::from_der(&name, &spki)
+        .map_err(|e| anyhow::anyhow!("the helper returned an unusable key: {e}"))?;
+    println!("Windows Hello key  {}", key.fingerprint());
+    let registered = settings
+        .get("windows_hello_keys")
+        .and_then(|v| v.as_array())
+        .is_some_and(|keys| {
+            keys.iter().any(|k| {
+                k.get("public_key").and_then(|p| p.as_str()) == Some(key.to_base64().as_str())
+            })
+        });
+    if registered {
+        println!("It is already registered in the settings in force.");
+        return Ok(());
+    }
+    let entry = crate::policy::settings::WindowsHelloKeyEntry {
+        name,
+        public_key: key.to_base64(),
+    };
+    println!(
+        "Add this entry to windows_hello_keys in {}, then run `mairu policy approve`:\n\n  {}\n",
+        crate::policy::files::PolicyFiles::settings_path(&crate::config::config_dir()).display(),
+        serde_json::to_string(&entry)?
+    );
+    Ok(())
 }
 
 fn init(force: bool) -> Result<(), anyhow::Error> {
@@ -183,6 +262,11 @@ fn check() -> Result<(), anyhow::Error> {
                         ("methods", s.methods.is_some()),
                         ("approval_methods", s.approval_methods.is_some()),
                         ("ssh_agent_keys", s.ssh_agent_keys.is_some()),
+                        ("windows_hello_keys", s.windows_hello_keys.is_some()),
+                        (
+                            "windows_hello_helper_sha256",
+                            s.windows_hello_helper_sha256.is_some(),
+                        ),
                         ("sts", s.sts.is_some()),
                         ("network", s.network.is_some()),
                     ]
@@ -201,6 +285,9 @@ fn check() -> Result<(), anyhow::Error> {
                             key.public.comment(),
                             key.public.algorithm().as_str()
                         );
+                    }
+                    for key in s.windows_hello_registered_keys() {
+                        println!("  windows-hello key  {} {}", key.fingerprint(), key.name);
                     }
                     if !relaxing.is_empty() {
                         warnings.push(format!(
@@ -432,11 +519,13 @@ async fn approve(confirm: Option<&str>) -> Result<(), anyhow::Error> {
         )
     };
     let relay = crate::ssh_agent_presence::Relay::from_env();
-    let signature_notice = |_: &crate::proto::AuthorizationError, comment: &str| {
-        format!(
-            ":: {product} :: Policy approval required: {approval_digest}\n:: {product} :: Approve the signature on your SSH agent ({comment}) to approve this policy (not for AWS credentials)\n"
-        )
-    };
+    let signature_notice =
+        |_: &crate::proto::AuthorizationError, signer: crate::ssh_agent_presence::Signer<'_>| {
+            format!(
+                ":: {product} :: Policy approval required: {approval_digest}\n:: {product} :: {} to approve this policy (not for AWS credentials)\n",
+                signer.instruction()
+            )
+        };
     let resp = crate::polkit_tty_agent::with_fallback(notice, |attempt| {
         let agent = agent.clone();
         let req = req.clone();

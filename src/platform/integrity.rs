@@ -89,6 +89,8 @@ struct AnchorJson {
     methods: Vec<String>,
     ssh_agent_keys: Vec<String>,
     windows_hello_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    windows_hello_helper_sha256: String,
 }
 
 impl crate::proto::platform::IntegrityRecord {
@@ -113,6 +115,7 @@ impl crate::proto::platform::IntegrityRecord {
                     .iter()
                     .map(|k| base64::engine::general_purpose::STANDARD.encode(k))
                     .collect(),
+                windows_hello_helper_sha256: approval.windows_hello_helper_sha256,
             },
         };
         serde_json::to_string(&json).unwrap_or_default()
@@ -149,6 +152,7 @@ impl crate::proto::platform::IntegrityRecord {
                             .map_err(|e| e.to_string())
                     })
                     .collect::<Result<_, _>>()?,
+                windows_hello_helper_sha256: json.approval.windows_hello_helper_sha256,
             }),
             generation: json.generation,
             server_digests: json
@@ -171,6 +175,7 @@ mod tests {
                 methods: vec!["platform".to_owned()],
                 ssh_agent_keys: vec!["ssh-ed25519 AAAA alice".to_owned()],
                 windows_hello_keys: vec![vec![0x30, 0x01]],
+                windows_hello_helper_sha256: "ab".repeat(32),
             }),
             generation: 7,
             server_digests: [("contoso".to_owned(), vec![0x01; 32])].into(),

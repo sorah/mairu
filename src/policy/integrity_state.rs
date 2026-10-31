@@ -116,6 +116,7 @@ pub fn default_anchor() -> crate::proto::platform::ApprovalAnchor {
         methods: vec![crate::authorization::METHOD_PLATFORM.to_owned()],
         ssh_agent_keys: vec![],
         windows_hello_keys: vec![],
+        windows_hello_helper_sha256: String::new(),
     }
 }
 

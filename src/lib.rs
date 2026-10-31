@@ -1,3 +1,5 @@
+// Windows builds only mairu-windows-hello, which uses none of the library.
+#![cfg(unix)]
 // async_trait and async_recursion expansions trip this lint on code we do not write.
 #![allow(clippy::double_must_use)]
 
@@ -83,6 +85,8 @@ pub mod polkit_tty_agent;
 pub mod ssh_agent_presence;
 #[cfg(feature = "cli")]
 pub mod tool_detection;
+#[cfg(feature = "cli")]
+pub mod windows_hello;
 
 #[cfg(any(feature = "cli", feature = "platform-services"))]
 pub mod cmd;
