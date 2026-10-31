@@ -28,6 +28,27 @@ pub trait ProcessPlatform: Send + Sync + std::fmt::Debug {
     fn session_identity(&self, peer: &PeerIdentity) -> Option<SessionIdentity>;
     /// The peer's controlling terminal, such as `/dev/pts/3`.
     fn controlling_tty(&self, peer: &PeerIdentity) -> Option<String>;
+    /// The process `pid` and its ancestors through `ppid`, nearest first. Stops before pid 1, at the first process
+    /// not running as `uid`, after [`ANCESTRY_LIMIT`] processes, or at a process that exits while being read.
+    /// `start_time` of 0 skips checking that `pid` is still the expected process.
+    fn ancestry(&self, pid: u32, start_time: u64, uid: u32) -> Vec<Ancestor>;
+    /// Whether the process a session identity is keyed to still runs with the recorded start time.
+    fn session_alive(&self, session: &SessionIdentity) -> bool;
+}
+
+/// How many processes [`ProcessPlatform::ancestry`] walks at most.
+pub const ANCESTRY_LIMIT: usize = 64;
+
+/// A process in an ancestry, for tool detection. Every field except `session` is chosen by the process itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ancestor {
+    pub pid: u32,
+    pub comm: Option<String>,
+    pub exe: Option<std::path::PathBuf>,
+    /// `argv[0]` and `argv[1]`, as far as present.
+    pub argv: Vec<std::ffi::OsString>,
+    /// The process's session, as [`SessionIdentity::Tty`], while its leader lives.
+    pub session: Option<SessionIdentity>,
 }
 
 /// A terminal session, or the parent of a caller without one. Ids are paired with start times so that a reused

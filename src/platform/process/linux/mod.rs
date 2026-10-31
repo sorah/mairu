@@ -130,6 +130,44 @@ impl LinuxProcess {
     }
 }
 
+/// One ancestor's facts, read while its pidfd pins it. `None` when it runs as another uid or exits meanwhile.
+fn read_ancestor(
+    pid: u32,
+    uid: u32,
+) -> Option<(
+    crate::platform::Ancestor,
+    procfs::Stat,
+    std::os::fd::OwnedFd,
+)> {
+    use std::os::fd::AsFd;
+    let pidfd = peer::pidfd_open(pid).ok()?;
+    let stat = procfs::Stat::read(pid).ok()?;
+    let (ruid, euid) = procfs::read_uids(pid).ok()?;
+    if ruid != uid || euid != uid {
+        return None;
+    }
+    let mut argv = procfs::read_cmdline(pid).unwrap_or_default();
+    argv.truncate(2);
+    let session = u32::try_from(stat.session)
+        .ok()
+        .filter(|sid| *sid > 0)
+        .and_then(|sid| procfs::Stat::read(sid).ok())
+        .filter(|leader| leader.session == stat.session)
+        .map(|leader| crate::platform::SessionIdentity::Tty {
+            sid: stat.session,
+            leader_start_time: leader.start_time,
+        });
+    let ancestor = crate::platform::Ancestor {
+        pid,
+        comm: procfs::read_comm(pid).ok(),
+        // Unreadable for a non-dumpable process; the other names still count.
+        exe: procfs::read_exe(pid).ok(),
+        argv,
+        session,
+    };
+    peer::pidfd_alive(pidfd.as_fd()).then_some((ancestor, stat, pidfd))
+}
+
 /// The session rule over `/proc/<pid>/stat` contents; `read` looks up another pid.
 fn session_identity_from(
     stat: &procfs::Stat,
@@ -237,6 +275,53 @@ impl crate::platform::ProcessPlatform for LinuxProcess {
 
     fn controlling_tty(&self, peer: &crate::platform::PeerIdentity) -> Option<String> {
         procfs::tty_path(Self::peer_stat(peer)?.tty_nr)
+    }
+
+    fn ancestry(&self, pid: u32, start_time: u64, uid: u32) -> Vec<crate::platform::Ancestor> {
+        use std::os::fd::AsFd;
+        let mut ancestry = vec![];
+        let mut child: Option<(u32, std::os::fd::OwnedFd)> = None;
+        let (mut pid, mut expected_start) = (pid, start_time);
+        while ancestry.len() < crate::platform::ANCESTRY_LIMIT && pid > 1 {
+            let Some((ancestor, stat, pidfd)) = read_ancestor(pid, uid) else {
+                break;
+            };
+            if expected_start != 0 && stat.start_time != expected_start {
+                break;
+            }
+            // A child still parented to this pid shows that the pid was not reused while it was read.
+            if let Some((child_pid, child_pidfd)) = &child {
+                let still_parent = procfs::Stat::read(*child_pid)
+                    .is_ok_and(|s| i64::from(s.ppid) == i64::from(pid))
+                    && peer::pidfd_alive(child_pidfd.as_fd());
+                if !still_parent {
+                    break;
+                }
+            }
+            ancestry.push(ancestor);
+            let Ok(ppid) = u32::try_from(stat.ppid) else {
+                break;
+            };
+            child = Some((pid, pidfd));
+            (pid, expected_start) = (ppid, 0);
+        }
+        ancestry
+    }
+
+    fn session_alive(&self, session: &crate::platform::SessionIdentity) -> bool {
+        let (pid, start_time, is_leader) = match *session {
+            crate::platform::SessionIdentity::Tty {
+                sid,
+                leader_start_time,
+            } => (sid, leader_start_time, true),
+            crate::platform::SessionIdentity::Parent { ppid, start_time } => {
+                (ppid, start_time, false)
+            }
+        };
+        u32::try_from(pid)
+            .ok()
+            .and_then(|p| procfs::Stat::read(p).ok())
+            .is_some_and(|s| s.start_time == start_time && (!is_leader || s.session == pid))
     }
 
     fn notes(&self) -> Vec<String> {
@@ -400,6 +485,57 @@ mod tests {
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
         let peer = LinuxProcess::inspect(a.as_fd(), &unhardened(), euid()).unwrap();
         assert!(LinuxProcess.session_identity(&peer).is_some());
+    }
+
+    #[test]
+    fn test_ancestry_self() {
+        let uid = euid();
+        let stat = procfs::Stat::read(std::process::id()).unwrap();
+        let ancestry = LinuxProcess.ancestry(std::process::id(), stat.start_time, uid);
+        assert_eq!(ancestry[0].pid, std::process::id());
+        assert!(ancestry[0].comm.is_some());
+        assert!(!ancestry[0].argv.is_empty() && ancestry[0].argv.len() <= 2);
+        assert!(ancestry.len() <= crate::platform::ANCESTRY_LIMIT);
+        assert!(ancestry.iter().all(|a| a.pid > 1));
+        // The parent follows unless it runs as another uid.
+        if let Some(parent) = ancestry.get(1) {
+            assert_eq!(i64::from(parent.pid), i64::from(stat.ppid));
+        }
+    }
+
+    #[test]
+    fn test_ancestry_stops_at_uid_change() {
+        assert!(
+            LinuxProcess
+                .ancestry(std::process::id(), 0, euid() + 1)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_ancestry_wrong_start_time() {
+        let stat = procfs::Stat::read(std::process::id()).unwrap();
+        assert!(
+            LinuxProcess
+                .ancestry(std::process::id(), stat.start_time + 1, euid())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_session_alive() {
+        let stat = procfs::Stat::read(std::process::id()).unwrap();
+        let parent = procfs::Stat::read(u32::try_from(stat.ppid).unwrap()).unwrap();
+        let alive = crate::platform::SessionIdentity::Parent {
+            ppid: stat.ppid,
+            start_time: parent.start_time,
+        };
+        assert!(LinuxProcess.session_alive(&alive));
+        let reused = crate::platform::SessionIdentity::Parent {
+            ppid: stat.ppid,
+            start_time: parent.start_time + 1,
+        };
+        assert!(!LinuxProcess.session_alive(&reused));
     }
 
     #[test]

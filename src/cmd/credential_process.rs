@@ -59,6 +59,7 @@ pub async fn run(args: &CredentialProcessArgs) -> Result<(), anyhow::Error> {
             )),
             cwd: crate::cmd::authorization::cwd(),
             auto_config_path: vec![],
+            env_names: crate::tool_detection::env_names(),
         }),
     };
     // Context lines only on a terminal: stderr of a credential process usually goes to the SDK.

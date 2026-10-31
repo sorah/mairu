@@ -3,6 +3,7 @@
 
 const SCHEMA: &str = include_str!("mairu.cedarschema");
 const BUILTIN_HUMAN: &str = include_str!("builtin/human.cedar");
+const BUILTIN_AI_AGENT: &str = include_str!("builtin/ai_agent.cedar");
 const BUILTIN_UNHARDENED: &str = include_str!("builtin/unhardened.cedar");
 const BUILTIN_ALWAYS_ON: &str = include_str!("builtin/always_on.cedar");
 
@@ -51,13 +52,13 @@ impl std::fmt::Debug for Engine {
 }
 
 impl Engine {
-    /// `builtin-human` for a hardened agent, `builtin-unhardened` otherwise.
+    /// `builtin-human` and `builtin-ai-agent-per-request` for a hardened agent, `builtin-unhardened` otherwise.
     pub fn builtin(hardened: bool) -> Result<Self, PolicyError> {
-        Self::new(if hardened {
-            BUILTIN_HUMAN
+        if hardened {
+            Self::new(&format!("{BUILTIN_HUMAN}\n{BUILTIN_AI_AGENT}"))
         } else {
-            BUILTIN_UNHARDENED
-        })
+            Self::new(BUILTIN_UNHARDENED)
+        }
     }
 
     /// Parses policies whose ids come from their `@id` annotations, joins the always-on built-ins, and validates
@@ -172,6 +173,19 @@ impl Engine {
         context.insert("session".to_owned(), facts.session.into());
         context.insert("hardened".to_owned(), facts.hardened.into());
         context.insert("intent".to_owned(), facts.intent.into());
+        context.insert(
+            "tools".to_owned(),
+            facts.tools.iter().cloned().collect::<Vec<_>>().into(),
+        );
+        context.insert(
+            "tool_matches".to_owned(),
+            facts
+                .tool_matches
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
+        );
         for (key, value) in [
             ("tty", &facts.tty),
             ("exec_command", &facts.exec_command),
@@ -306,6 +320,8 @@ pub struct Facts {
     pub exec_command_line: Option<String>,
     pub cwd: Option<String>,
     pub chained_role_arn: Option<String>,
+    pub tools: std::collections::BTreeSet<String>,
+    pub tool_matches: std::collections::BTreeSet<String>,
 }
 
 /// A request's entities and the context apart from `presence`.
@@ -439,6 +455,16 @@ mod tests {
             exec_command_line: Some("terraform apply".to_owned()),
             cwd: Some("/home/alice/src".to_owned()),
             chained_role_arn: None,
+            tools: Default::default(),
+            tool_matches: Default::default(),
+        }
+    }
+
+    fn ai_agent_facts() -> Facts {
+        Facts {
+            tools: ["ai-agent".to_owned()].into(),
+            tool_matches: ["process:claude".to_owned()].into(),
+            ..facts()
         }
     }
 
@@ -459,6 +485,7 @@ mod tests {
         assert_eq!(
             sorted(Engine::builtin(true).unwrap()),
             vec![
+                "builtin-ai-agent-per-request",
                 "builtin-caller-account-mismatch",
                 "builtin-human",
                 "builtin-use-credentials"
@@ -505,6 +532,69 @@ mod tests {
             &engine,
             Presence::remembered(Scope::Process, "platform", 60, 3601)
         ));
+    }
+
+    #[test]
+    fn test_builtin_ai_agent() {
+        let engine = Engine::builtin(true).unwrap();
+        let prepared = engine
+            .prepare(&ai_agent_facts(), Action::AssumeRole)
+            .unwrap();
+        let allowed = |presence: Presence| {
+            let eval = engine.evaluate(&prepared, &presence);
+            assert!(eval.errors.is_empty(), "{:?}", eval.errors);
+            eval.allowed
+        };
+        assert!(!allowed(Presence::none()));
+        assert!(allowed(Presence::fresh("platform")));
+        // A terminal-session grant, however fresh, never covers an AI agent.
+        assert!(!allowed(Presence::remembered(
+            Scope::Session,
+            "platform",
+            0,
+            0
+        )));
+        // A running `mairu exec`'s lease does, until 1 h idle.
+        assert!(allowed(Presence::remembered(
+            Scope::Process,
+            "platform",
+            86400,
+            3600
+        )));
+        assert!(!allowed(Presence::remembered(
+            Scope::Process,
+            "platform",
+            60,
+            3601
+        )));
+    }
+
+    #[test]
+    fn test_spec_examples_validate() {
+        let engine = Engine::new(
+            r#"
+            @id("allow") permit (principal, action, resource);
+            // Never hand production to AI agents, on any server.
+            @id("no-ai-prod")
+            forbid (principal, action, resource in Mairu::Account::"999999999999")
+            when { context.tools.contains("ai-agent") };
+            @id("no-claude-env")
+            forbid (principal, action, resource)
+            when { context.tool_matches.contains("env:CLAUDECODE") };
+            "#,
+        )
+        .unwrap();
+        let mut f = ai_agent_facts();
+        f.role = "999999999999/Admin".to_owned();
+        let prepared = engine.prepare(&f, Action::AssumeRole).unwrap();
+        assert_eq!(
+            engine.evaluate(&prepared, &Presence::none()).forbids,
+            vec!["no-ai-prod"]
+        );
+        let prepared = engine.prepare(&facts(), Action::AssumeRole).unwrap();
+        assert!(engine.evaluate(&prepared, &Presence::none()).allowed);
+        let eval = evaluate_at_gate2(&engine, &f, "999999999999", Presence::none());
+        assert_eq!(eval.forbids, vec!["no-ai-prod"]);
     }
 
     #[test]

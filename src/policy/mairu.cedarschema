@@ -65,6 +65,10 @@ namespace Mairu {
       exec_command_line?: String,
       cwd?: String,
       chained_role_arn?: String,
+      // Tool labels, such as "ai-agent", and what matched ("process:claude", "env:CLAUDECODE",
+      // "mark:ai-agent"). A guardrail: same-user code can produce or avoid them.
+      tools: Set<String>,
+      tool_matches: Set<String>,
       // Present exactly at gate 2.
       caller?: Caller
     }

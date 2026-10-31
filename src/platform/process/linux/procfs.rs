@@ -66,6 +66,21 @@ pub fn parse_real_gid(status: &str) -> Option<u32> {
         .ok()
 }
 
+/// The real and effective uids from the `Uid:` line of `/proc/<pid>/status`.
+pub fn read_uids(pid: u32) -> std::io::Result<(u32, u32)> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+    parse_uids(&content).ok_or_else(|| malformed(pid, "status"))
+}
+
+pub fn parse_uids(status: &str) -> Option<(u32, u32)> {
+    let mut ids = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .map(str::parse);
+    Some((ids.next()?.ok()?, ids.next()?.ok()?))
+}
+
 pub fn read_comm(pid: u32) -> std::io::Result<String> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))?;
     Ok(comm.trim_end_matches('\n').to_owned())
@@ -154,6 +169,13 @@ mod tests {
         let status = "Name:\tmairu\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t973\t973\t1000\nGroups:\t1000\n";
         assert_eq!(parse_real_gid(status), Some(1000));
         assert_eq!(parse_real_gid("Name:\tmairu\n"), None);
+    }
+
+    #[test]
+    fn test_parse_uids() {
+        let status = "Name:\tsudo\nUid:\t1000\t0\t0\t0\nGid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(parse_uids(status), Some((1000, 0)));
+        assert_eq!(parse_uids("Name:\tx\n"), None);
     }
 
     #[test]

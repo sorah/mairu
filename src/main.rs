@@ -55,6 +55,9 @@ enum Commands {
     /// Make the agent forget remembered approvals, so the next request asks again
     Lock(mairu::cmd::lock::LockArgs),
 
+    /// Remove tool marks from this terminal session (asks for approval)
+    Unlock(mairu::cmd::lock::UnlockArgs),
+
     /// Serve platform services to the parent agent; started only by the agent
     #[command(hide = true)]
     PlatformHelper {
@@ -102,6 +105,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::Doctor(_) => enable_log(LogType::Custom),
         Commands::Harden(_) => enable_log(LogType::Custom),
         Commands::Lock(_) => enable_log(LogType::Custom),
+        Commands::Unlock(_) => enable_log(LogType::Custom),
         _ => enable_log(LogType::Default),
     }
     #[cfg(target_os = "linux")]
@@ -122,6 +126,7 @@ fn main() -> Result<std::process::ExitCode, anyhow::Error> {
         Commands::Doctor(args) => mairu::cmd::doctor::run(args),
         Commands::Harden(args) => mairu::cmd::harden::run(args),
         Commands::Lock(args) => mairu::cmd::lock::run(args),
+        Commands::Unlock(args) => mairu::cmd::lock::run_unlock(args),
         Commands::PlatformHelper { .. } => unreachable!(),
     };
     match retval {

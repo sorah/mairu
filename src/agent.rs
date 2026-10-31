@@ -62,14 +62,26 @@ impl crate::proto::agent_server::Agent for Agent {
         &self,
         request: tonic::Request<GetAgentStatusRequest>,
     ) -> Result<tonic::Response<GetAgentStatusResponse>, tonic::Status> {
+        let env_names = request
+            .get_ref()
+            .client_context
+            .as_ref()
+            .map(|c| c.env_names.as_slice())
+            .unwrap_or_default();
         let caller = request
             .extensions()
             .get::<std::sync::Arc<crate::platform::PeerIdentity>>()
-            .map(|peer| PeerView {
-                verified: peer.trust == crate::platform::PeerTrust::Verified,
-                pid: peer.pid,
-                start_time: peer.start_time,
-                session: describe_session(peer),
+            .map(|peer| {
+                let (detection, marks) = self.authorizer.tools_of(peer, env_names);
+                PeerView {
+                    verified: peer.trust == crate::platform::PeerTrust::Verified,
+                    pid: peer.pid,
+                    start_time: peer.start_time,
+                    session: describe_session(peer),
+                    tools: detection.tools.into_iter().collect(),
+                    tool_matches: detection.tool_matches.into_iter().collect(),
+                    marks,
+                }
             });
         let (grants, leases) = self.authorizer.counts();
         let agent_hardening = match crate::hardening::Hardening::state() {
@@ -572,24 +584,71 @@ impl crate::proto::agent_server::Agent for Agent {
     ) -> Result<tonic::Response<RevokeAuthorizationsResponse>, tonic::Status> {
         Self::require_trusted(&request)?;
         let req = request.get_ref();
-        let session = match req.scope() {
-            revoke_authorizations_request::Scope::All => None,
-            revoke_authorizations_request::Scope::CallerSession => Some(
-                request
-                    .extensions()
-                    .get::<std::sync::Arc<crate::platform::PeerIdentity>>()
-                    .and_then(|peer| crate::platform::process().session_identity(peer)),
-            ),
-            revoke_authorizations_request::Scope::Unspecified => {
+        let peer = request
+            .extensions()
+            .get::<std::sync::Arc<crate::platform::PeerIdentity>>();
+        let caller_session = || peer.and_then(|p| crate::platform::process().session_identity(p));
+        if let Some(label) = req
+            .mark_tools
+            .iter()
+            .find(|l| !crate::tool_detection::ToolLabel::is_valid_name(l))
+        {
+            return Err(tonic::Status::invalid_argument(format!(
+                "invalid tool label {label:?}: use lowercase letters, digits and '-'"
+            )));
+        }
+        let mark_session = if req.mark_tools.is_empty() {
+            None
+        } else {
+            match caller_session() {
+                Some(s @ crate::platform::SessionIdentity::Tty { .. }) => Some(s),
+                _ => {
+                    return Err(tonic::Status::failed_precondition(
+                        crate::authorization::NO_TERMINAL_SESSION,
+                    ));
+                }
+            }
+        };
+        let session = match (req.scope(), mark_session) {
+            // Marking drops the grants of the marked session, as `--session` does.
+            (_, Some(s)) => Some(Some(s)),
+            (revoke_authorizations_request::Scope::All, None) => None,
+            (revoke_authorizations_request::Scope::CallerSession, None) => Some(caller_session()),
+            (revoke_authorizations_request::Scope::Unspecified, None) => {
                 return Err(tonic::Status::invalid_argument("scope is required"));
             }
         };
         let (revoked_grants, revoked_leases) = self.authorizer.revoke(session, req.include_leases);
         tracing::info!(scope = ?req.scope(), session = ?session, include_leases = req.include_leases, revoked_grants, revoked_leases, "Revoked authorizations");
+        if let Some(s) = mark_session {
+            self.authorizer.mark_tools(s, &req.mark_tools);
+            tracing::info!(session = ?s, tools = ?req.mark_tools, "Marked a terminal session with tool labels");
+        }
         Ok(tonic::Response::new(RevokeAuthorizationsResponse {
             revoked_grants,
             revoked_leases,
         }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn unmark_tools(
+        &self,
+        request: tonic::Request<UnmarkToolsRequest>,
+    ) -> Result<tonic::Response<UnmarkToolsResponse>, tonic::Status> {
+        Self::require_trusted(&request)?;
+        let labels = &request.get_ref().tools;
+        if labels.is_empty() {
+            return Err(tonic::Status::invalid_argument("no tool label given"));
+        }
+        let peer = request
+            .extensions()
+            .get::<std::sync::Arc<crate::platform::PeerIdentity>>()
+            .cloned();
+        let remaining = self
+            .authorizer
+            .unmark_tools(peer.as_deref(), labels)
+            .await?;
+        Ok(tonic::Response::new(UnmarkToolsResponse { remaining }))
     }
 }
 

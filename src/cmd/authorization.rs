@@ -30,6 +30,7 @@ pub fn context_lines(
     context: &crate::proto::ClientContext,
     prompt: Prompt,
     caller_arn: Option<&str>,
+    tools: Option<&str>,
 ) -> String {
     let product = env!("CARGO_PKG_NAME");
     let command = match &context.intent {
@@ -59,8 +60,13 @@ pub fn context_lines(
             String::from_utf8_lossy(&context.cwd)
         ));
     }
-    if let Some(from) = terminal_origin() {
-        lines.push_str(&format!(":: {product} ::   from:    {from}\n"));
+    match (terminal_origin(), tools) {
+        (Some(from), Some(tools)) => lines.push_str(&format!(
+            ":: {product} ::   from:    {from}   tools: {tools}\n"
+        )),
+        (Some(from), None) => lines.push_str(&format!(":: {product} ::   from:    {from}\n")),
+        (None, Some(tools)) => lines.push_str(&format!(":: {product} ::   tools:   {tools}\n")),
+        (None, None) => {}
     }
     let instruction = match prompt {
         Prompt::MaybeDialog => "Approve in the system dialog if one appears.",
@@ -68,6 +74,18 @@ pub fn context_lines(
     };
     lines.push_str(&format!(":: {product} :: {instruction}\n"));
     lines
+}
+
+/// `/dev/pts/3`: this process's controlling terminal.
+#[cfg(target_os = "linux")]
+pub fn terminal_path() -> Option<String> {
+    let stat = crate::platform::process::linux::procfs::Stat::read(std::process::id()).ok()?;
+    crate::platform::process::linux::procfs::tty_path(stat.tty_nr)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn terminal_path() -> Option<String> {
+    None
 }
 
 /// `/dev/pts/3 (zsh, tmux pane)`: this process's controlling terminal and its session leader.
@@ -148,7 +166,15 @@ fn password_notice(
         &req.client_context.clone().unwrap_or_default(),
         Prompt::Password,
         Some(&refusal.caller_arn),
+        tools_summary(&refusal.tools).as_deref(),
     )
+}
+
+/// The tool labels of this request: what this process can see of itself, plus the labels the agent reported.
+pub fn tools_summary(agent_tools: &[String]) -> Option<String> {
+    let mut detection = crate::tool_detection::Detection::of_current_process();
+    detection.tools.extend(agent_tools.iter().cloned());
+    (!detection.is_empty()).then(|| detection.summary())
 }
 
 async fn notify_while_waiting(
@@ -170,7 +196,8 @@ async fn notify_while_waiting(
             retval = &mut resp => return retval,
             _ = &mut prompt_notice, if !prompt_noticed => {
                 prompt_noticed = true;
-                crate::terminal::send(&context_lines(&server, &role, &context, Prompt::MaybeDialog, None)).await;
+                let tools = tools_summary(&[]);
+                crate::terminal::send(&context_lines(&server, &role, &context, Prompt::MaybeDialog, None, tools.as_deref())).await;
             }
             _ = &mut long_attempt, if !long_noticed => {
                 long_noticed = true;
@@ -208,6 +235,7 @@ mod tests {
             )),
             cwd: b"/home/u/src/infra".to_vec(),
             auto_config_path: vec![],
+            env_names: vec![],
         };
         let lines = context_lines(
             "contoso",
@@ -215,8 +243,10 @@ mod tests {
             &context,
             Prompt::MaybeDialog,
             None,
+            Some("ai-agent (process:claude)"),
         );
         assert!(!lines.contains("identity:"));
+        assert!(lines.contains("ai-agent (process:claude)\n"), "{lines}");
         assert!(
             lines.starts_with(
                 ":: mairu :: Authorization may be required: 123456789012/Admin on contoso\n"
@@ -232,6 +262,7 @@ mod tests {
             &context,
             Prompt::Password,
             Some("arn:aws:sts::999999999999:assumed-role/Admin/alice"),
+            None,
         );
         assert!(
             lines.starts_with(

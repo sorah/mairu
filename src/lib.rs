@@ -75,6 +75,8 @@ pub mod ecs_server;
 pub mod policy;
 #[cfg(feature = "cli")]
 pub mod polkit_tty_agent;
+#[cfg(feature = "cli")]
+pub mod tool_detection;
 
 #[cfg(any(feature = "cli", feature = "platform-services"))]
 pub mod cmd;

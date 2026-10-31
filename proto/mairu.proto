@@ -43,6 +43,8 @@ service Agent {
   rpc GetAgentStatus(GetAgentStatusRequest) returns (GetAgentStatusResponse);
 
   rpc RevokeAuthorizations(RevokeAuthorizationsRequest) returns (RevokeAuthorizationsResponse);
+  // Always asks the human.
+  rpc UnmarkTools(UnmarkToolsRequest) returns (UnmarkToolsResponse);
 }
 
 message PingAgentRequest {
@@ -96,6 +98,7 @@ message ClientContext {
   }
   bytes cwd = 3;
   bytes auto_config_path = 4;      // .mairu.json path when role = auto
+  repeated string env_names = 5;   // names only, never values; used for tool detection
 }
 
 message ExecIntent {
@@ -114,10 +117,19 @@ message RevokeAuthorizationsRequest {
   }
   Scope scope = 1;
   bool include_leases = 2;
+  repeated string mark_tools = 3;  // mark the caller's terminal session with these labels
 }
 message RevokeAuthorizationsResponse {
   uint32 revoked_grants = 1;
   uint32 revoked_leases = 2;
+}
+
+message UnmarkToolsRequest {
+  repeated string tools = 1;
+  ClientContext client_context = 2;
+}
+message UnmarkToolsResponse {
+  repeated string remaining = 1;   // labels still marked on the caller's session
 }
 
 message ListSessionsRequest {
@@ -210,6 +222,7 @@ enum HardeningState {
 }
 
 message GetAgentStatusRequest {
+  ClientContext client_context = 1;  // env_names, for the caller's tool labels
 }
 message GetAgentStatusResponse {
   string version = 1;
@@ -229,6 +242,9 @@ message PeerView {
   uint32 pid = 2;
   uint64 start_time = 3;
   string session = 4;  // e.g. "tty sid=4242 /dev/pts/3", "parent pid=777", "none"
+  repeated string tools = 5;         // tool labels, e.g. "ai-agent"
+  repeated string tool_matches = 6;  // e.g. "process:claude", "env:AI_AGENT", "mark:ai-agent"
+  repeated string marks = 7;         // labels marked on the caller's own terminal session
 }
 
 // Carried as the binary details of a non-OK tonic::Status (grpc-status-details-bin).
@@ -246,6 +262,7 @@ message AuthorizationError {
   Reason reason = 1;
   string detail = 2;
   repeated string policy_ids = 4;        // @id of the determining forbid policies, for REASON_FORBIDDEN
+  repeated string tools = 5;             // tool labels detected
   string gate = 6;                       // "assume-role" (gate 1) or "use-credentials" (gate 2)
   string caller_arn = 7;                 // gate 2: the identity the credentials carry
 }
